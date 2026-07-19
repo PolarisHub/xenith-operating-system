@@ -1,0 +1,24 @@
+[package]
+name = "xenith-stage1-builder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Deterministic builder for the Xenith 512-byte BIOS boot sector"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-stage1"
+path = "src/main.rs"
+
+[workspace]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "warn"
+
+[lints.clippy]
+todo = "warn"
+unimplemented = "warn"
+

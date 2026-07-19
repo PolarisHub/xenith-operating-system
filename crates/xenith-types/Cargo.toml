@@ -1,0 +1,21 @@
+[package]
+name = "xenith-types"
+version = "0.1.0"
+edition = "2021"
+authors = ["Xenith OS Contributors"]
+description = "Shared address, page, and memory-size types for the Xenith kernel."
+license = "MIT OR Apache-2.0"
+
+# Foundation-layer crate: dependency-free so every other workspace crate
+# (kernel, boot, bitflags, ...) can depend on it without pulling anything
+# else in. The crate is no_std in all real builds; the `cfg(test)` gate on
+# `#![no_std]` in lib.rs only exists so `cargo test` can link the host std
+# test harness.
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]

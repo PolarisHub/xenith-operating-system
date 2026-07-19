@@ -1,0 +1,12 @@
+[package]
+name = "limine"
+version = "0.3.2"
+edition = "2021"
+publish = false
+description = "Minimal legacy Limine handoff compatibility types for Xenith"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

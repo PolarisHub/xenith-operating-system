@@ -1,0 +1,19 @@
+[package]
+name = "xenith-asm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Xenith's self-contained x86 assembler"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-asm"
+path = "src/main.rs"
+
+[dependencies]
+xenith-x86 = { path = "../../crates/xenith-x86" }
+
+[lints]
+workspace = true

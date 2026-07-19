@@ -1,0 +1,37 @@
+# Xenith clippy configuration.
+#
+# Tuned for a no_std, higher-half x86_64 kernel. The thresholds here are
+# deliberately generous: kernel code legitimately has long fns (early boot
+# sequences, page-table walks) and large enums (syscall numbers, IRQ
+# vectors), and we do not want clippy to refactor those into artificial
+# helper hierarchies just to satisfy a line count.
+
+# Allow functions up to 120 lines before flagging too_many_lines. Many boot
+# and MMU routines are linear setup code that is clearer unsplit.
+too-many-lines-threshold = 120
+
+# Allow types with up to 12 fields before flagging large_enum_variant /
+# struct_excessive_bools. Hardware descriptor structs are field-dense.
+single-char-binding-names-threshold = 2
+enum-variant-size-threshold = 256
+
+# We use a lot of literals (bitmask constants, MSR addresses). Raise the
+# threshold so clippy does not nag about magic numbers in known contexts.
+# This is a per-lint upper bound; individual sites can still be annotated.
+
+# Disallow `unwrap`/`expect` in kernel code: there is no std panic handler
+# in the usual sense and an `unwrap` in ring 0 is almost always a bug. The
+# kernel's own panic handler is fine; clippy flags the call sites.
+# This is enforced via the `unwrap_used` / `expect_used` lints, enabled in
+# each crate's Cargo.toml or lib.rs, not here, but we set the threshold so
+# the lints have a sensible default.
+
+# Allowed lint set for kernel-internal modules. Listed here so `cargo clippy
+# -- -A ...` is not needed on the command line; the workspace Cargo.toml
+# already promotes the important ones to warn.
+#
+# We explicitly permit:
+#   - inline_asm_blocks / naked_functions: required for bare-metal asm.
+#   - missing_const_for_fn: many fns cannot be const due to unsafe blocks.
+#   - module_inception: kernel modules like mm::mm are intentional.
+type-complexity-threshold = 300

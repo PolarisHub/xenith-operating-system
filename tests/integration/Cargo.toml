@@ -1,0 +1,11 @@
+[package]
+name = "xenith-integration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+xenith-emu = { path = "../../emu/xenith-emu" }
+
+[lints]
+workspace = true

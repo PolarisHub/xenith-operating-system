@@ -1,0 +1,73 @@
+# Xenith OS .gitignore
+#
+# Ignore all build artifacts and editor-local state. Keep the repository
+# clean so `git status` only shows source changes.
+
+# ---- Rust / cargo -----------------------------------------------------------
+
+# Build output for all targets. The kernel uses a custom target
+# (kernel/x86_64-xenith.json) so the output lands under
+# target/x86_64-xenith/ but we ignore the whole target/ tree uniformly.
+/target/
+
+# Cargo lockfile: we DO keep Cargo.lock for the workspace because this is
+# an application (a kernel image), not a library published to crates.io.
+# So Cargo.lock is intentionally NOT ignored.
+
+# ---- Xenith build artifacts -------------------------------------------------
+
+# The ISO build tree and final image produced by `make iso`.
+/build/
+
+# Generated documentation (cargo doc).
+/doc/
+/target/*/doc/
+
+# ---- Editor / IDE state ------------------------------------------------------
+
+# VS Code workspace settings and tasks (keep launch.json in VCS so
+# contributors share the GDB/QEMU config, but ignore local-only settings).
+.vscode/settings.json
+.vscode/*.log
+
+# JetBrains IDEs.
+.idea/
+
+# Vim swap/backup files.
+*.swp
+*.swo
+*~
+
+# Emacs.
+*~
+\#*\#
+.\#*
+
+# ---- OS cruft ---------------------------------------------------------------
+
+# Windows.
+Thumbs.db
+Desktop.ini
+
+# macOS.
+.DS_Store
+
+# Linux.
+*~
+
+# ---- Tooling caches ---------------------------------------------------------
+
+# rust-analyzer session files.
+/.ra/
+
+# clippy / rustfmt caches.
+/.cache/
+
+# ---- Limine / QEMU runtime --------------------------------------------------
+
+# QEMU monitor / dump output during local runs.
+/qemu-dump-*.bin
+/serial-*.log
+
+# Limine deploy backups.
+*.iso.bak

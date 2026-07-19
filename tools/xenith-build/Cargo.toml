@@ -1,0 +1,21 @@
+[package]
+name = "xenith-build"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Self-contained Xenith build and image orchestrator"
+
+[lib]
+name = "xenith_build"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-build"
+path = "src/main.rs"
+
+[dependencies]
+xenith-cc = { path = "../xenith-cc" }
+xenith-iso = { path = "../xenith-iso" }
+
+[lints]
+workspace = true

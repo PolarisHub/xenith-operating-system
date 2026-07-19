@@ -1,0 +1,21 @@
+[package]
+name = "xenith-emu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Self-contained x86-64 system emulator for Xenith"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-emu"
+path = "src/main.rs"
+
+[dependencies]
+limine = { path = "../../crates/limine-compat" }
+xenith-boot-common = { path = "../../bootloader/common" }
+xenith-x86 = { path = "../../crates/xenith-x86" }
+
+[lints]
+workspace = true

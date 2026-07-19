@@ -1,0 +1,19 @@
+[package]
+name = "xenith-cc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-cc"
+path = "src/main.rs"
+
+[dependencies]
+xenith-asm = { path = "../xenith-asm" }
+xenith-ld = { path = "../xenith-ld" }
+
+[lints]
+workspace = true

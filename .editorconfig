@@ -1,0 +1,57 @@
+# EditorConfig helps editors apply consistent formatting per file type.
+# https://editorconfig.org
+#
+# This mirrors the rustfmt.toml settings (4-space indent, 100-col target,
+# trailing newline) so that non-Rust files in the repo (Makefile, limine
+# configs, linker scripts, JSON target specs) stay consistent too.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# Rust files: rustfmt is authoritative, but these match it.
+[*.rs]
+indent_size = 4
+max_line_length = 100
+
+# TOML files (Cargo manifests, config): same indent as Rust.
+[*.toml]
+indent_size = 4
+max_line_length = 100
+
+# Makefiles MUST use tabs for recipe lines; make rejects spaces.
+[Makefile]
+indent_style = tab
+indent_size = 8
+
+# Makefile variants (*.mk).
+[*.mk]
+indent_style = tab
+indent_size = 8
+
+# Linker scripts: tab-free, 4-space indent.
+[*.ld]
+indent_size = 4
+
+# JSON target specs: 2-space indent is conventional and keeps the file
+# readable in editors that default to 2 for JSON.
+[*.json]
+indent_size = 2
+max_line_length = 120
+
+# Limine config files: simple key=value, 4-space indent for nested blocks.
+[limine.conf]
+indent_size = 4
+
+# Markdown: trim trailing whitespace but do not hard-wrap lines; the
+# renderer handles wrapping.
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off

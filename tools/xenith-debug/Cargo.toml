@@ -1,0 +1,22 @@
+[package]
+name = "xenith-debug"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Symbol-aware debugger for the Xenith emulator remote protocol"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-debug"
+path = "src/main.rs"
+
+[dependencies]
+addr2line = { version = "0.25.1", default-features = false, features = ["loader", "rustc-demangle"] }
+
+[dev-dependencies]
+xenith-emu = { path = "../../emu/xenith-emu" }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+# Xenith requires the nightly Rust toolchain: the kernel uses several
+# unstable features (inline asm with sym operands, naked_functions,
+# core_intrinsics, panic_info_message, and per-crate linker_args) that are
+# not available on stable.
+#
+# The date is pinned so that every contributor and CI runner builds against
+# the exact same compiler revision. Bumping the date is a deliberate act
+# that should be paired with a full build + test pass.
+#
+# rust-src is required because we build core/alloc/compiler_builtins from
+# source via build-std (see .cargo/config.toml). clippy and rustfmt are
+# listed explicitly so `rustup show` installs them alongside the toolchain
+# and `cargo clippy` / `cargo fmt` work without a separate component add.
+
+[toolchain]
+channel = "nightly-2026-07-01"
+components = ["rust-src", "clippy", "rustfmt"]
+targets = ["x86_64-unknown-none", "x86_64-unknown-uefi"]
+profile = "minimal"

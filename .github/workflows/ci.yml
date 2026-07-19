@@ -1,0 +1,65 @@
+name: Xenith CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  self-hosted-stack:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-01
+          components: rust-src, clippy, rustfmt
+          targets: x86_64-unknown-none,x86_64-unknown-uefi
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Bootloader formatting
+        shell: pwsh
+        run: |
+          @(
+            "bootloader/common/Cargo.toml",
+            "bootloader/stage1/Cargo.toml",
+            "bootloader/stage2/Cargo.toml",
+            "bootloader/uefi/Cargo.toml"
+          ) | ForEach-Object {
+            cargo fmt --manifest-path $_ --all -- --check
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Native tests
+        run: cargo test --target x86_64-pc-windows-msvc -p limine -p xenith-types -p xenith-bitflags -p xenith-boot -p xenith-abi -p xenith-fs-format -p xenith-x86 -p xenith-emu -p xenith-vmm -p xenith-asm -p xenith-disasm -p xenith-iso -p xenith-build -p xenith-mkfs -p xenith-fsck -p xenith-mount -p xenith-ld -p xenith-cc -p xenith-debug -p xenith-integration
+      - name: Native Clippy
+        run: cargo clippy --workspace --target x86_64-pc-windows-msvc --exclude xenith-kernel --exclude xenith-init --exclude xenith-sh --exclude xenith-coreutils --exclude xenith-editor --exclude xenith-net --exclude xenith-examples --exclude xenith-libc --all-targets -- -D warnings
+      - name: Kernel Clippy
+        run: cargo clippy -p xenith-kernel --lib --bin xenith --target kernel/x86_64-xenith.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
+      - name: Userspace Clippy
+        run: cargo clippy -p xenith-init -p xenith-sh -p xenith-coreutils -p xenith-editor -p xenith-net -p xenith-examples -p xenith-libc --target user/x86_64-xenith-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
+      - name: Bootloader tests and Clippy
+        shell: pwsh
+        run: |
+          cargo test --manifest-path bootloader/common/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path bootloader/common/Cargo.toml --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --manifest-path bootloader/stage1/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path bootloader/stage1/Cargo.toml --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --manifest-path bootloader/stage2/Cargo.toml --target x86_64-pc-windows-msvc --features host-tool
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path bootloader/stage2/Cargo.toml --release --target x86_64-unknown-none --features bios-bin --lib --bin xenith-stage2 -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --manifest-path bootloader/uefi/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo clippy --manifest-path bootloader/uefi/Cargo.toml --release --target x86_64-unknown-uefi --features uefi-app --lib --bin xenith-bootx64 -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build complete image with Xenith tools
+        run: cargo run -p xenith-build -- all
+      - name: Debugger DWARF artifact gate
+        run: cargo test -p xenith-debug --target x86_64-pc-windows-msvc --test dwarf_artifact built_kernel_supports_bidirectional_dwarf_line_lookup -- --ignored --exact
+      - name: Emulator boot gate
+        run: cargo test -p xenith-integration --test boot kernel_reaches_userspace_shell -- --ignored --exact
+      - name: Emulator shell and coreutils gate
+        run: cargo test -p xenith-integration --test shell shell_executes_builtins_and_coreutils_via_ps2 -- --ignored --exact

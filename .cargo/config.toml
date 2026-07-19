@@ -1,0 +1,74 @@
+# Cargo configuration for Xenith's freestanding targets.
+#
+# This file is loaded automatically by cargo for any invocation inside the
+# workspace. Kernel and userspace deliberately use different custom target
+# names so Cargo cannot apply the higher-half kernel linker script to a
+# ring-3 executable.
+
+[unstable]
+json-target-spec = true
+
+# Use rust-lld as the linker. It understands the freestanding ELF layout we
+# need and is bundled with the toolchain, so no external linker dependency.
+[target.x86_64-xenith]
+linker = "rust-lld"
+rustflags = [
+    # The kernel runs in the higher half and must not emit code that assumes
+    # a near-zero RIP-relative range. code-model=kernel tells LLVM to use
+    # the kernel code model (addresses are in the upper 2 GiB of the
+    # canonical address space), which matches Xenith's higher-half load.
+    "-C", "code-model=kernel",
+
+    # Static relocation model: the kernel is linked once at its final
+    # virtual addresses and is not loaded by a dynamic loader, so there is
+    # no need for PIC/GOT indirection. This also keeps relocations out of
+    # the .rela sections that a strict bootloader might reject.
+    "-C", "relocation-model=static",
+
+    # Keep frame pointers where useful for early boot backtraces. We do not
+    # enable full unwind tables because panic = abort.
+    "-C", "force-frame-pointers=yes",
+    "-C", "force-unwind-tables=no",
+
+    # Pass flags straight through to rust-lld. -nostdlib prevents lld from
+    # linking any default system libraries (there are none to link against
+    # on bare metal). -static produces a fully static image. -n prevents
+    # lld from inserting a PT_GNU_STACK note that would mark the stack
+    # executable on some loaders.
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-n",
+    "-C", "link-arg=-Tkernel/linker.ld",
+
+    # Use a large code model-friendly data layout for the kernel. The
+    # relocation-model=static above already handles the addressing; this
+    # flag is belt-and-braces for LLVM's pass ordering.
+    "-C", "no-redzone",
+]
+
+# Ring-3 programs use a small code model and an explicit low-half linker
+# layout. This table is keyed by the userspace target JSON filename, keeping
+# its link flags disjoint from the kernel target above.
+[target.x86_64-xenith-user]
+linker = "rust-lld"
+rustflags = [
+    "-C", "code-model=small",
+    "-C", "relocation-model=static",
+    "-C", "force-frame-pointers=yes",
+    "-C", "force-unwind-tables=no",
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-n",
+    "-C", "link-arg=-Tuser/linker.ld",
+    "-C", "no-redzone",
+]
+
+# Human-friendly aliases for common dev loops. These keep the Makefile
+# short and let contributors run the same commands cargo-side.
+[alias]
+kbuild = "build --target kernel/x86_64-xenith.json -p xenith-kernel -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem"
+kimage = "build --target kernel/x86_64-xenith.json -p xenith-kernel --release -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem"
+kclippy = "clippy --target kernel/x86_64-xenith.json -p xenith-kernel -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings"
+kfmt = "fmt --all"
+kdoc = "doc --target kernel/x86_64-xenith.json --no-deps -p xenith-kernel"
+ubuild = "build --target user/x86_64-xenith-user.json -p xenith-init -p xenith-sh -p xenith-coreutils -p xenith-editor -p xenith-net -p xenith-examples -p xenith-libc -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem"

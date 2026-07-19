@@ -1,0 +1,15 @@
+[package]
+name = "xenith-boot-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Wire-format, ELF, and memory-map logic shared by Xenith loaders"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+xenith-abi = { path = "../../crates/xenith-abi" }
+
+[lints]
+workspace = true

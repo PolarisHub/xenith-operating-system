@@ -1,0 +1,23 @@
+[package]
+name = "xenith-fsck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "xenith_fsck"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-fsck"
+path = "src/main.rs"
+
+[dependencies]
+xenith-mkfs = { path = "../xenith-mkfs" }
+xenith-fs-format = { path = "../../crates/xenith-fs-format" }
+
+[dev-dependencies]
+xenith-mount = { path = "../xenith-mount" }
+
+[lints]
+workspace = true

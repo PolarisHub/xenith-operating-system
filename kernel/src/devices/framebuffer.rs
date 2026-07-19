@@ -1,0 +1,445 @@
+//! Linear framebuffer console: 32 bpp, 8x16 cell, software cursor.
+//!
+//! [`FramebufferConsole`] renders text into a Limine-provided linear
+//! framebuffer by drawing each glyph from an 8x16 font one pixel at a time.
+//! It supports `\n`, `\r`, `\t`, line wrap, and scrolling by copying pixel
+//! rows upward in video memory. The cursor is a steady block drawn in the
+//! current foreground colour at the next write position.
+//!
+//! # Layout
+//!
+//! The backend is a `static` singleton (`FB_CONSOLE`) initialised in place
+//! by [`init_in_place`] before [`static_ref`] hands out the `&'static` borrow
+//! that [`console::set_console`] stores. Mutable state (cursor position and
+//! colours) lives behind a `spin::Mutex` so the shared reference is enough
+//! for the [`Console`](crate::console::Console) impl.
+//!
+//! # Font
+//!
+//! Printable ASCII uses Xenith's complete IBM VGA 8x16 bitmap table. Bytes
+//! outside the table render as an outlined replacement cell.
+
+use core::ptr;
+
+use crate::console::{Color, Console};
+use crate::devices::fb_font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::devices::gfx::Framebuffer as GfxFramebuffer;
+use crate::devices::term::{FramebufferRenderer, Terminal};
+
+// --- Geometry --------------------------------------------------------------
+
+/// Cell dimensions in pixels. The font is 8 pixels wide and 16 tall, so each
+/// character occupies an 8x16 block of the framebuffer.
+const CHAR_W: usize = GLYPH_WIDTH;
+const CHAR_H: usize = GLYPH_HEIGHT;
+
+/// Immutable framebuffer geometry, written once by [`init_in_place`].
+///
+/// All fields are set before any `&'static` reference escapes, so they are
+/// read-only for the lifetime of the console and need no synchronisation.
+struct FramebufferGeom {
+    /// Base of the pixel buffer, already translated through the HHDM.
+    buffer: *mut u8,
+    /// Bytes per scanline.
+    pitch: usize,
+    /// Visible width in pixels.
+    width: u16,
+    /// Visible height in pixels.
+    height: u16,
+    /// Text columns that fit in `width`.
+    cols: usize,
+    /// Text rows that fit in `height`.
+    rows: usize,
+}
+
+/// Mutable per-cursor state, guarded by `state`.
+struct FbState {
+    col: usize,
+    row: usize,
+    fg: Color,
+    bg: Color,
+}
+
+/// 32 bpp linear framebuffer text console.
+///
+/// Holds the geometry by value and the mutable cursor state behind a lock.
+/// The raw buffer pointer makes this `!Send`/`!Sync` by default; the unsafe
+/// impls below assert the access discipline (single BSP init, then
+/// lock-serialised mutation of state and write-only pixel stores).
+pub struct FramebufferConsole {
+    geom: FramebufferGeom,
+    state: spin::Mutex<FbState>,
+    terminal: spin::Mutex<Option<Terminal<FramebufferRenderer>>>,
+}
+
+// SAFETY: `FramebufferConsole` is only ever mutated in two ways: (1) the
+// geometry fields are written once, single-threaded, by `init_in_place`
+// before any reference escapes; (2) `state` is a `spin::Mutex` that
+// serialises all cursor/colour changes. Pixel stores go through the raw
+// buffer pointer but are gated by the same lock, so no two writers race on
+// the same pixel. After init the struct is effectively shared-read with
+// interior mutability through the mutex, which is the `Send + Sync` contract.
+unsafe impl Send for FramebufferConsole {}
+unsafe impl Sync for FramebufferConsole {}
+
+impl FramebufferConsole {
+    /// Const constructor for the `static` singleton.
+    ///
+    /// Produces a console with a null buffer and zero geometry; [`init_in_place`]
+    /// fills the real values before the first use. The default colours match
+    /// the conventional light-gray-on-black text console.
+    const fn uninit() -> Self {
+        Self {
+            geom: FramebufferGeom {
+                buffer: ptr::null_mut(),
+                pitch: 0,
+                width: 0,
+                height: 0,
+                cols: 0,
+                rows: 0,
+            },
+            state: spin::Mutex::new(FbState {
+                col: 0,
+                row: 0,
+                fg: Color::LightGray,
+                bg: Color::Black,
+            }),
+            terminal: spin::Mutex::new(None),
+        }
+    }
+}
+
+// The singleton. `static mut` because the geometry is written once in place
+// at init; thereafter only shared `&'static` references are handed out and
+// all mutation goes through the interior `spin::Mutex`.
+static mut FB_CONSOLE: FramebufferConsole = FramebufferConsole::uninit();
+
+/// Initialise the singleton's geometry from the Limine framebuffer.
+///
+/// # Safety
+///
+/// Must be called exactly once, on the BSP, before [`static_ref`] returns a
+/// reference and before any `Console` method is invoked. The caller guarantees
+/// `buffer` points at a writable 32 bpp framebuffer of `width`x`height`
+/// pixels with `pitch` bytes per row, mapped writable for the kernel's
+/// lifetime.
+pub unsafe fn init_in_place(buffer: *mut u8, pitch: u16, width: u16, height: u16) {
+    let pitch = pitch as usize;
+    let cols = (width as usize) / CHAR_W;
+    let rows = (height as usize) / CHAR_H;
+
+    // SAFETY: `FB_CONSOLE` is a `static mut` whose geometry we write exactly
+    // once here, on the BSP, before any other code observes it. No reference
+    // has escaped yet (the console is not installed until `static_ref` is
+    // called, which happens after this returns), so the write is race-free.
+    unsafe {
+        let g = &raw mut FB_CONSOLE;
+        (*g).geom = FramebufferGeom {
+            buffer,
+            pitch,
+            width,
+            height,
+            cols,
+            rows,
+        };
+    }
+
+    // Start with a clean screen and the cursor at the home position.
+    // SAFETY: `static_ref` only requires that `init_in_place` has run, which
+    // is exactly the invariant this function establishes above.
+    let console = unsafe { static_ref() };
+    console.clear();
+}
+
+/// Borrow the singleton as a `&'static dyn Console`.
+///
+/// # Safety
+///
+/// The caller must have first invoked [`init_in_place`]. After init the
+/// reference is valid for the kernel's lifetime.
+pub unsafe fn static_ref() -> &'static dyn Console {
+    // SAFETY: `init_in_place` has run, so the geometry is populated. We only
+    // ever hand out shared references; all mutation is through the interior
+    // `spin::Mutex` on `state` or was the one-time geometry write in init.
+    unsafe { &*core::ptr::addr_of!(FB_CONSOLE) }
+}
+
+/// Replace the allocation-free early console with Xenith's stateful VT100
+/// renderer after the kernel heap is online.
+///
+/// Early boot deliberately uses the inline text grid because console setup
+/// precedes memory allocation. The init path calls this once after filesystem
+/// setup and before starting userspace, at which point the terminal can own
+/// primary and alternate screen buffers and interpret CSI/SGR sequences.
+#[must_use]
+pub fn upgrade_terminal() -> bool {
+    // SAFETY: the console singleton was initialized by `console::init` before
+    // memory bring-up. A null/zero geometry below detects the VGA path where
+    // no framebuffer console was installed.
+    let console = unsafe { &*core::ptr::addr_of!(FB_CONSOLE) };
+    let geom = &console.geom;
+    if geom.buffer.is_null() || geom.cols == 0 || geom.rows == 0 {
+        return false;
+    }
+    let surface = GfxFramebuffer::new(geom.buffer, geom.pitch, geom.width, geom.height);
+    let Ok(terminal) = Terminal::new(FramebufferRenderer::new(surface)) else {
+        return false;
+    };
+    *console.terminal.lock() = Some(terminal);
+    true
+}
+
+// --- Pixel drawing ---------------------------------------------------------
+
+impl FramebufferConsole {
+    /// Write a 32 bpp pixel at column `x`, row `y` (pixel coordinates).
+    ///
+    /// # Safety
+    ///
+    /// Caller ensures `(x, y)` is within the visible geometry and `buffer` is
+    /// a valid writable 32 bpp framebuffer base. All callers are inside this
+    /// module and pass coordinates derived from the text grid, so this is
+    /// always satisfied.
+    #[inline]
+    unsafe fn put_pixel(geom: &FramebufferGeom, x: usize, y: usize, rgb: u32) {
+        let off = y * geom.pitch + x * 4;
+        // SAFETY: `off` is within `pitch * height` (callers bound x/y to the
+        // visible area), the buffer is 32 bpp and writable, and the store is
+        // naturally aligned (pitch and x are such that off is 4-aligned).
+        unsafe {
+            ptr::write_volatile(geom.buffer.add(off) as *mut u32, rgb);
+        }
+    }
+
+    /// Fill the cell at text column `col`, row `row` with `rgb`.
+    #[inline]
+    fn fill_cell(geom: &FramebufferGeom, col: usize, row: usize, rgb: u32) {
+        let x0 = col * CHAR_W;
+        let y0 = row * CHAR_H;
+        // Bounds-check against the visible geometry: cells that fall outside
+        // the framebuffer (e.g. a partial last column) are skipped silently
+        // rather than writing off the end of video memory.
+        if x0 + CHAR_W > geom.width as usize || y0 + CHAR_H > geom.height as usize {
+            return;
+        }
+        for dy in 0..CHAR_H {
+            for dx in 0..CHAR_W {
+                // SAFETY: bounded above against width/height.
+                unsafe { Self::put_pixel(geom, x0 + dx, y0 + dy, rgb) };
+            }
+        }
+    }
+
+    /// Draw `byte`'s glyph at text column `col`, row `row` using `fg`/`bg`.
+    fn draw_glyph(geom: &FramebufferGeom, col: usize, row: usize, byte: u8, fg: Color, bg: Color) {
+        let x0 = col * CHAR_W;
+        let y0 = row * CHAR_H;
+        if x0 + CHAR_W > geom.width as usize || y0 + CHAR_H > geom.height as usize {
+            return;
+        }
+        let (fr, fg_, fb) = fg.rgb();
+        let fg_rgb = u32::from(fr) << 16 | u32::from(fg_) << 8 | u32::from(fb);
+        let (br, bg_, bb) = bg.rgb();
+        let bg_rgb = u32::from(br) << 16 | u32::from(bg_) << 8 | u32::from(bb);
+        let glyph = fb_font::glyph(byte);
+        for (gy, bits) in glyph.into_iter().enumerate() {
+            for gx in 0..CHAR_W {
+                let on = (bits >> (7 - gx)) & 1 == 1;
+                let rgb = if on { fg_rgb } else { bg_rgb };
+                // SAFETY: bounded above against width/height.
+                unsafe { Self::put_pixel(geom, x0 + gx, y0 + gy, rgb) };
+            }
+        }
+    }
+
+    /// Scroll the text grid up by one row, clearing the last row with `bg`.
+    ///
+    /// `bg` is the caller's current background colour; passing it in keeps
+    /// scroll self-contained instead of re-locking `state` to read it.
+    fn scroll_up(geom: &FramebufferGeom, bg: Color) {
+        // Copy each pixel row from row y into row y-1. Rows are disjoint
+        // `pitch`-sized spans and destination < source, so a forward copy is
+        // safe; `ptr::copy` (memmove) is used for robustness regardless of
+        // overlap direction.
+        let row_bytes = geom.cols * CHAR_W * 4;
+        for y in 1..geom.rows {
+            let dst = y0_pixel(geom, y - 1);
+            let src = y0_pixel(geom, y);
+            // SAFETY: both pointers are within the framebuffer for
+            // `row_bytes` bytes; dst < src so the forward copy never clobbers
+            // source data before it is read. `row_bytes` is `cols*CHAR_W*4`,
+            // which is `<= width*4 <= pitch`, so each span stays in-bounds.
+            unsafe {
+                ptr::copy(src, dst, row_bytes);
+            }
+        }
+        clear_row_pixels(geom, geom.rows - 1, bg_rgb_of(bg));
+    }
+}
+
+/// Pixel pointer at the start of text `row`'s first column.
+#[inline]
+fn y0_pixel(geom: &FramebufferGeom, row: usize) -> *mut u8 {
+    let y0 = row * CHAR_H;
+    // SAFETY: caller (scroll_up) bounds row against geom.rows; the pointer
+    // arithmetic is within the framebuffer.
+    unsafe { geom.buffer.add(y0 * geom.pitch) }
+}
+
+/// Fill a text row's pixels with a solid `rgb` colour.
+fn clear_row_pixels(geom: &FramebufferGeom, row: usize, rgb: u32) {
+    let y0 = row * CHAR_H;
+    if y0 + CHAR_H > geom.height as usize {
+        return;
+    }
+    for dy in 0..CHAR_H {
+        let y = y0 + dy;
+        for dx in 0..(geom.cols * CHAR_W) {
+            if dx >= geom.width as usize {
+                break;
+            }
+            // SAFETY: bounded against width/height above.
+            unsafe { FramebufferConsole::put_pixel(geom, dx, y, rgb) };
+        }
+    }
+}
+
+// --- Console impl ----------------------------------------------------------
+
+impl Console for FramebufferConsole {
+    fn write_str(&self, text: &str) {
+        let mut terminal = self.terminal.lock();
+        if let Some(active) = terminal.as_mut() {
+            active.write(text.as_bytes());
+            return;
+        }
+        drop(terminal);
+        for character in text.chars() {
+            self.write_char(character);
+        }
+    }
+
+    fn write_char(&self, ch: char) {
+        let byte = if ch.is_ascii() { ch as u8 } else { b'?' };
+        let mut terminal = self.terminal.lock();
+        if let Some(active) = terminal.as_mut() {
+            active.write(core::slice::from_ref(&byte));
+            return;
+        }
+        drop(terminal);
+
+        let geom = &self.geom;
+        // A degenerate (uninitialised) console would have cols == 0; bail out
+        // rather than dividing by zero or writing to a null buffer.
+        if geom.cols == 0 || geom.buffer.is_null() {
+            return;
+        }
+
+        // Hold the state lock across the whole write so the cursor position
+        // and colours cannot change mid-character (e.g. from another CPU).
+        let mut st = self.state.lock();
+        match ch {
+            '\n' => {
+                // Clear the cursor block at the current cell (it sits on the
+                // empty next-write position), then advance to the next row.
+                let bg = st.bg;
+                Self::fill_cell(geom, st.col, st.row, bg_rgb_of(bg));
+                st.col = 0;
+                st.row += 1;
+                if st.row >= geom.rows {
+                    st.row = geom.rows - 1;
+                    let bg = st.bg;
+                    drop(st);
+                    Self::scroll_up(geom, bg);
+                    st = self.state.lock();
+                }
+                draw_cursor(geom, &st);
+            },
+            '\r' => {
+                let bg = st.bg;
+                Self::fill_cell(geom, st.col, st.row, bg_rgb_of(bg));
+                st.col = 0;
+                draw_cursor(geom, &st);
+            },
+            '\t' => {
+                // Advance to the next 8-column tab stop.
+                let bg = st.bg;
+                Self::fill_cell(geom, st.col, st.row, bg_rgb_of(bg));
+                let next = (st.col + 8) & !7;
+                st.col = if next >= geom.cols {
+                    geom.cols - 1
+                } else {
+                    next
+                };
+                draw_cursor(geom, &st);
+            },
+            c => {
+                let byte = if c.is_ascii() { c as u8 } else { b'?' };
+                Self::draw_glyph(geom, st.col, st.row, byte, st.fg, st.bg);
+                st.col += 1;
+                if st.col >= geom.cols {
+                    st.col = 0;
+                    st.row += 1;
+                    if st.row >= geom.rows {
+                        st.row = geom.rows - 1;
+                        let bg = st.bg;
+                        drop(st);
+                        Self::scroll_up(geom, bg);
+                        st = self.state.lock();
+                    }
+                }
+                draw_cursor(geom, &st);
+            },
+        }
+    }
+
+    fn clear(&self) {
+        let mut terminal = self.terminal.lock();
+        if let Some(active) = terminal.as_mut() {
+            active.reset();
+            return;
+        }
+        drop(terminal);
+
+        let geom = &self.geom;
+        if geom.cols == 0 || geom.buffer.is_null() {
+            return;
+        }
+        let bg = self.state.lock().bg;
+        let bg_rgb = bg_rgb_of(bg);
+        // Fill the whole visible area with the background colour.
+        let h = geom.height as usize;
+        let w = geom.width as usize;
+        for y in 0..h {
+            for x in 0..w {
+                // SAFETY: bounded by width/height.
+                unsafe { Self::put_pixel(geom, x, y, bg_rgb) };
+            }
+        }
+        let mut st = self.state.lock();
+        st.col = 0;
+        st.row = 0;
+        draw_cursor(geom, &st);
+    }
+
+    fn set_color(&self, fg: Color, bg: Color) {
+        let mut st = self.state.lock();
+        st.fg = fg;
+        st.bg = bg;
+    }
+}
+
+/// Pack a [`Color`] into a 32 bpp RGB value (`0xRRGGBB`).
+#[inline]
+fn bg_rgb_of(c: Color) -> u32 {
+    let (r, g, b) = c.rgb();
+    u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+}
+
+/// Draw the steady block cursor at the current position in the foreground
+/// colour. The cell under the cursor is the next write position, so it is
+/// empty (background) and the block does not hide any typed character.
+fn draw_cursor(geom: &FramebufferGeom, st: &FbState) {
+    let fg_rgb = bg_rgb_of(st.fg);
+    FramebufferConsole::fill_cell(geom, st.col, st.row, fg_rgb);
+}

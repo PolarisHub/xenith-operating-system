@@ -1,0 +1,55 @@
+# Xenith rustfmt configuration.
+#
+# We use the nightly-only style options (this file is only read by the
+# nightly rustfmt pinned in rust-toolchain.toml). The goal is a compact,
+# readable style that works well for no_std kernel code: short-ish lines
+# but not aggressively wrapped, imports grouped by source, and stable
+# field ordering for structs.
+
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+
+# Group imports: std/core first, then external crates, then local modules.
+# This keeps the no_std `core`/`alloc` imports visually distinct from the
+# kernel-internal modules, which matters because the crate root uses
+# `#![no_std]` and the std-vs-core distinction is load-bearing.
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+reorder_imports = true
+reorder_modules = true
+
+# Keep `use` statements sorted and merged where it does not change meaning.
+
+# Format `fn` and closure args on the same line where they fit, rather than
+# always block-wrapping. Kernel code has many small fns; this keeps them
+# readable without overflowing.
+fn_single_line = false
+fn_params_layout = "Tall"
+where_single_line = false
+
+# Struct literals: keep multi-field literals block-formatted so diffs stay
+# small when a field is added.
+struct_field_align_threshold = 0
+
+# Match arms: keep the `=>` on the same line as the pattern for short arms,
+# block-format for long ones.
+match_arm_blocks = true
+match_block_trailing_comma = true
+
+# Trailing commas everywhere for smaller diffs.
+trailing_comma = "Vertical"
+overflow_delimited_expr = true
+
+# Comments: normalize the formatting of doc and regular comments.
+normalize_comments = true
+normalize_doc_attributes = true
+wrap_comments = false
+comment_width = 90
+
+# Misc style.
+use_field_init_shorthand = true
+use_try_shorthand = true
+empty_item_single_line = true
+force_multiline_blocks = false

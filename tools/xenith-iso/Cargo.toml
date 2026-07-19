@@ -1,0 +1,19 @@
+[package]
+name = "xenith-iso"
+version = "0.1.0"
+edition = "2021"
+description = "Dependency-free ISO9660 and raw boot disk image builder for Xenith"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "xenith_iso"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-iso"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

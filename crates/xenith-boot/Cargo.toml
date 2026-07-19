@@ -1,0 +1,20 @@
+[package]
+name = "xenith-boot"
+version = "0.1.0"
+edition = "2021"
+authors = ["Xenith OS Contributors"]
+license = "MIT OR Apache-2.0"
+description = "Safe boot info wrapper around the Limine boot structures for Xenith"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Limine bootloader bindings. The crate exposes the `BootInfo` struct handed
+# to the kernel entry point together with the `MemmapEntry`, `Module`, and
+# `Framebuffer` companions. We wrap these in safe accessors.
+limine = { path = "../limine-compat" }
+
+# Xenith shared address / page types. PhysAddr and VirtAddr live here.
+xenith-types = { path = "../xenith-types" }

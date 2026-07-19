@@ -1,0 +1,12 @@
+[package]
+name = "xenith-vmm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Accelerated Xenith virtual machine runner with interpreter fallback"
+
+[dependencies]
+xenith-emu = { path = "../xenith-emu" }
+
+[lints]
+workspace = true

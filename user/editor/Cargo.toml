@@ -1,0 +1,18 @@
+[package]
+name = "xenith-editor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "xenith-editor"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libuser = { path = "../libuser" }
+xenith-abi = { path = "../../crates/xenith-abi" }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "xenith-x86"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Allocation-free x86-64 instruction decoder and encoder for Xenith"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

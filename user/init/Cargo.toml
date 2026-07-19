@@ -1,0 +1,17 @@
+[package]
+name = "xenith-init"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libuser = { path = "../libuser" }
+
+[lints]
+workspace = true

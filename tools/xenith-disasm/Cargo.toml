@@ -1,0 +1,12 @@
+[package]
+name = "xenith-disasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Xenith x86-64 disassembler"
+
+[dependencies]
+xenith-x86 = { path = "../../crates/xenith-x86" }
+
+[lints]
+workspace = true

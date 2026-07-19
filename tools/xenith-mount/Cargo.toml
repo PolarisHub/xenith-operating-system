@@ -1,0 +1,13 @@
+[package]
+name = "xenith-mount"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only XenithFS and FAT32 image explorer"
+license = "MIT OR Apache-2.0"
+
+[dev-dependencies]
+xenith-mkfs = { path = "../xenith-mkfs" }
+
+[lints]
+workspace = true
+

@@ -1,0 +1,55 @@
+[package]
+name = "xenith-stage2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Xenith BIOS protected/long-mode loader"
+build = "build.rs"
+
+[features]
+default = []
+bios-bin = []
+host-tool = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-stage2"
+path = "src/main.rs"
+required-features = ["bios-bin"]
+test = false
+bench = false
+
+[[bin]]
+name = "xenith-stage2-pack"
+path = "src/bin/pack.rs"
+required-features = ["host-tool"]
+test = false
+bench = false
+
+[dependencies]
+xenith-boot-common = { path = "../common" }
+
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = "none"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "warn"
+
+[lints.clippy]
+todo = "warn"
+unimplemented = "warn"
+missing_safety_doc = "warn"
+inline_asm_x86_att_syntax = "allow"
+

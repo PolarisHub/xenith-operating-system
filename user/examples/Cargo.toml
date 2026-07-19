@@ -1,0 +1,18 @@
+[package]
+name = "xenith-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "xenith-hello"
+path = "src/hello.rs"
+test = false
+bench = false
+
+[dependencies]
+libuser = { path = "../libuser" }
+xenith-abi = { path = "../../crates/xenith-abi" }
+
+[lints]
+workspace = true

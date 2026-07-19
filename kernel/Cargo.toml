@@ -1,0 +1,60 @@
+[package]
+name = "xenith-kernel"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "Xenith bare-metal x86_64 kernel"
+# no_std kernel crate. Built as a staticlib for the Limine loader and as an
+# rlib so other workspace members (future test/example crates) can reuse it.
+publish = false
+
+[lib]
+name = "xenith_kernel"
+crate-type = ["rlib"]
+
+# Limine loads the kernel as a freestanding ELF executable. The binary target
+# owns only the _start entry symbol and the panic handler; all real work lives
+# in the library above.
+[[bin]]
+name = "xenith"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# Limine v8.x boot protocol bindings. Provides BootInfo and the request/response
+# model used to discover memory maps, framebuffers, RSDP, modules, and the HHDM.
+limine = { path = "../crates/limine-compat" }
+
+# Kernel-side synchronisation. default-features off so we don't pull std-only
+# machinery; we keep the spin mutex, rwlock, and once primitives.
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock", "once"] }
+
+# The log facade. default-features off because the default "std" feature pulls
+# std::sync machinery we cannot use in ring 0. Our `log` module installs the
+# backend that receives these macro calls.
+log = { version = "0.4", default-features = false }
+
+# Bitflag macro used by xenith-bitflags (and directly where convenient).
+bitflags = "2"
+
+# Shared workspace crates: address/page/size types, the bitflag macro wrapper,
+# and boot-protocol helpers. Path deps so a single `cargo build` builds all.
+xenith-types = { path = "../crates/xenith-types" }
+xenith-bitflags = { path = "../crates/xenith-bitflags" }
+xenith-boot = { path = "../crates/xenith-boot" }
+xenith-abi = { path = "../crates/xenith-abi" }
+xenith-fs-format = { path = "../crates/xenith-fs-format" }
+
+[features]
+default = []
+# Local APIC support: timer, IPIs, interrupt routing. Wired up by the arch
+# and devices phases; gate new apic-only code behind this.
+apic = []
+# HPET timer driver. Falls back to the PIT when HPET is absent or disabled.
+hpet = []
+# ACPI table parsing for platform discovery (IOAPIC, HPET, DSDT, FADT, ...).
+acpi = []
+
+# Build with the custom target spec:
+#   cargo build --target kernel/x86_64-xenith.json -Z build-std=core,alloc,compiler_builtins

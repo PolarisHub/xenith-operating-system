@@ -1,0 +1,45 @@
+[package]
+name = "xenith-uefi-loader"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dependency-free Xenith x86_64 UEFI loader"
+
+[features]
+default = []
+uefi-app = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-bootx64"
+path = "src/main.rs"
+required-features = ["uefi-app"]
+test = false
+bench = false
+
+[dependencies]
+xenith-boot-common = { path = "../common" }
+
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = "symbols"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "warn"
+
+[lints.clippy]
+todo = "warn"
+unimplemented = "warn"
+missing_safety_doc = "warn"
+

@@ -1,0 +1,28 @@
+# Build
+
+## Required Rust components
+
+- pinned `nightly-2026-07-01`;
+- `rust-src`, `clippy`, and `rustfmt`;
+- `x86_64-unknown-none` for BIOS stage2;
+- `x86_64-unknown-uefi` for `BOOTX64.EFI`.
+
+No QEMU, xorriso, Limine deploy tool, NASM, system C compiler, or GDB is invoked by the primary path.
+
+## Commands
+
+```text
+cargo run -p xenith-build -- all
+cargo run -p xenith-build -- bootloader
+cargo run -p xenith-build -- kernel
+cargo run -p xenith-build -- userspace
+cargo run -p xenith-build -- image
+```
+
+`all` rebuilds and validates bootloader formats, builds the kernel and Rust userspace with their separate custom targets and build-std, compiles `user/c/xenith-c-demo.c` using the workspace's own C compiler, assembler, and static linker, packs every program into a newc initramfs, and calls `xenith-iso`. `/bin/c-demo` is therefore a genuine shipped Xenith-toolchain artifact, not a `.byte` copy of externally generated machine code. Artifacts and byte sizes are recorded in `build/ARTIFACTS.txt`.
+
+The raw image contains the stage1 sector with its `0x55AA` BIOS boot signature, manifest, sector-aligned stage2, kernel ELF, and initramfs. The ISO writer emits ISO9660/El Torito structures without an external image program. Its x86 catalog entry uses hard-disk emulation over a complete copy of the manifest image, while its platform-`0xEF` entry exposes a 16 MiB FAT16 EFI System Partition containing `EFI/BOOT/BOOTX64.EFI`, `EFI/XENITH/kernel.elf`, and `EFI/XENITH/initrd.cpio`. The builder validates the embedded manifest, catalog media/platform fields, FAT geometry/paths, and exact payload bytes. This is structural validation, not a recorded firmware boot.
+
+Host tools use the native Cargo target. Kernel validation passes `--target kernel/x86_64-xenith.json`; userspace validation passes `--target user/x86_64-xenith-user.json`. Both custom targets require `-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem`. The kernel linker script places the image in the higher half, while `user/linker.ld` places ring-3 ELFs at low virtual addresses.
+
+The host-side Xenith toolchain remains Rust-only: it has no host assembler, C compiler, linker, libc, or binary-utility dependency. See [TOOLCHAIN](TOOLCHAIN.md) for accepted source constructs and exact residual limits.

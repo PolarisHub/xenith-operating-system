@@ -1,0 +1,15 @@
+[package]
+name = "xenith-ld"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-ld"
+path = "src/main.rs"
+
+[lints]
+workspace = true

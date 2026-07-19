@@ -1,0 +1,121 @@
+# Xenith OS workspace manifest.
+#
+# Top-level workspace for the bare-metal x86_64 kernel and its supporting
+# crates, plus the ring-3 userspace programs. The kernel and kernel-facing
+# crates are no_std; the userspace programs use libuser and are compiled as
+# freestanding ELF binaries that the kernel loads as modules.
+#
+# resolver = "2" is required so that dev-dependencies and feature
+# unification behave correctly across the mixed no_std/std-free members.
+
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "crates/xenith-types",
+    "crates/xenith-bitflags",
+    "crates/xenith-boot",
+    "crates/xenith-abi",
+    "crates/xenith-fs-format",
+    "crates/limine-compat",
+    "crates/xenith-x86",
+    "bootloader/common",
+    "emu/xenith-emu",
+    "emu/xenith-vmm",
+    "tools/xenith-asm",
+    "tools/xenith-disasm",
+    "tools/xenith-iso",
+    "tools/xenith-build",
+    "tools/xenith-mkfs",
+    "tools/xenith-fsck",
+    "tools/xenith-mount",
+    "tools/xenith-ld",
+    "tools/xenith-cc",
+    "tools/xenith-debug",
+    "user/libuser",
+    "user/init",
+    "user/shell",
+    "user/coreutils",
+    "user/libc/xenith-libc",
+    "user/editor",
+    "user/net",
+    "user/examples",
+    "tests/integration",
+]
+
+# Shared dependencies pulled from crates.io. Pinning versions in one place
+# keeps the kernel and userspace crates on the same revisions and avoids
+# silent feature drift between members. Each member references these via
+# `dep.workspace = true` in its own Cargo.toml.
+[workspace.dependencies]
+# Lightweight logging facade. The kernel supplies its own implementation of
+# the log trait (a `Log` adapter wired to the framebuffer/console), so every
+# crate can use log::info! etc. without pulling in an env-logger backend.
+log = { version = "0.4", default-features = false }
+
+# Spinlock primitives used in no_std code paths where real scheduling is not
+# yet available (early boot, interrupt handlers, MMU setup). default-features
+# disabled to keep the dependency tree off std.
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock", "once"] }
+
+# bitflags is used directly only where a hand-rolled macro is not desired.
+# Xenith's own xenith-bitflags crate is preferred for kernel-internal flags,
+# but a few external-facing structs reuse the upstream crate for familiarity.
+bitflags = { version = "2.6", default-features = false }
+
+# Limine bootloader protocol bindings. v8.x is the line we target; the boot
+# info structures are ABI-stable for a given major version. We use the
+# `default-features = false` build so the crate does not pull in an
+# allocator-backed string helper we do not need in the kernel.
+limine = { path = "crates/limine-compat" }
+
+# Workspace-wide lints. These are enforced as warnings (not deny) so that
+# individual crates can promote the ones that matter to them via
+# `#![deny(...)]` in their crate roots. Keeping the set here ensures every
+# member gets at least a warning for the common footguns.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+# Catch common no_std pitfalls and kernel-style mistakes early.
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+missing_safety_doc = "warn"
+mutex_atomic = "warn"
+
+# Release profile tuned for a kernel: no stack unwinding (panic = abort is
+# set per-crate, but we also drop the unwind tables), LTO for a smaller
+# image, and a single codegen unit so the linker sees the whole kernel.
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+debug = false
+# Keep the ELF symbol table in release artifacts so xenith-debug can resolve
+# kernel functions without relying on an external, toolchain-specific sidecar.
+strip = false
+overflow-checks = false
+
+# Keep only address-to-source line tables for the production kernel package.
+# Host tools, userspace, and boot artifacts stay at `debug = false`, while
+# `build/kernel.elf` remains directly usable by xenith-debug without carrying
+# full variable/type DWARF.
+[profile.release.package.xenith-kernel]
+debug = "line-tables-only"
+
+# Dev profile keeps symbols and stack frames for easier GDB debugging under
+# QEMU. We still abort on panic (unwinding in ring 0 is not supported).
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+overflow-checks = true
+lto = false
+codegen-units = 256
+
+# The userspace programs are built as separate artifacts and packaged into
+# the ISO as Limine modules; they are not part of the kernel link. We still
+# keep them in the workspace so `cargo fmt` and `cargo clippy` cover them.
