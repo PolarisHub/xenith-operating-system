@@ -3,9 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use xenith_abi::{
-    GRND_NONBLOCK, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE,
-};
+use xenith_abi::{GRND_NONBLOCK, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 
 const PAGE_SIZE: usize = 4096;
 

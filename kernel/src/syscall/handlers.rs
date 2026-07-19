@@ -1488,6 +1488,69 @@ pub fn sys_sigprocmask(ctx: &SyscallContext) -> i64 {
     0
 }
 
+/// Decode the padding-free shared `stack_t` wire representation.
+fn decode_alt_stack(bytes: [u8; 24]) -> xenith_abi::SigAltStack {
+    xenith_abi::SigAltStack {
+        sp: u64::from_ne_bytes(bytes[..8].try_into().expect("stack pointer bytes")),
+        size: u64::from_ne_bytes(bytes[8..16].try_into().expect("stack size bytes")),
+        flags: u32::from_ne_bytes(bytes[16..20].try_into().expect("stack flags bytes")),
+        reserved: u32::from_ne_bytes(bytes[20..].try_into().expect("stack padding bytes")),
+    }
+}
+
+fn encode_alt_stack(stack: xenith_abi::SigAltStack) -> [u8; 24] {
+    let mut bytes = [0u8; 24];
+    bytes[..8].copy_from_slice(&stack.sp.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&stack.size.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&stack.flags.to_ne_bytes());
+    bytes[20..].copy_from_slice(&stack.reserved.to_ne_bytes());
+    bytes
+}
+
+/// `sigaltstack(new, old)` installs, disables, or queries the bounded
+/// alternate signal stack. Fork inherits the setting; exec disables it.
+pub fn sys_sigaltstack(ctx: &SyscallContext) -> i64 {
+    let new_pointer = ctx.arg(0);
+    let old_pointer = ctx.arg(1);
+    let new_stack = if new_pointer == 0 {
+        None
+    } else {
+        let mut bytes = [0u8; 24];
+        let length = bytes.len();
+        if let Err(error) = copy_from_user(new_pointer, &mut bytes, length) {
+            return error.as_ret();
+        }
+        Some(decode_alt_stack(bytes))
+    };
+
+    let Some(old_stack) = crate::user::process::with_current_process(|process| {
+        process.signals.sigaltstack(ctx.user_sp, None)
+    }) else {
+        return Errno::Esrch.as_ret();
+    };
+    let Ok(old_stack) = old_stack else {
+        return Errno::Einval.as_ret();
+    };
+    if old_pointer != 0 {
+        let bytes = encode_alt_stack(old_stack);
+        if let Err(error) = copy_to_user(old_pointer, &bytes, bytes.len()) {
+            return error.as_ret();
+        }
+    }
+    let Some(new_stack) = new_stack else { return 0 };
+    match crate::user::process::with_current_process(|process| {
+        process.signals.sigaltstack(ctx.user_sp, Some(new_stack))
+    }) {
+        Some(Ok(_)) => 0,
+        Some(Err(crate::user::signal::AltStackError::AlreadyOnStack)) => Errno::Eperm.as_ret(),
+        Some(Err(
+            crate::user::signal::AltStackError::InvalidFlags
+            | crate::user::signal::AltStackError::InvalidRange,
+        )) => Errno::Einval.as_ret(),
+        None => Errno::Esrch.as_ret(),
+    }
+}
+
 /// `chdir(path)` — change the calling process's working directory.
 pub fn sys_chdir(ctx: &SyscallContext) -> i64 {
     let path_ptr = ctx.arg(0);
@@ -1772,8 +1835,16 @@ pub fn sys_kill(ctx: &SyscallContext) -> i64 {
     let Some(signal) = crate::user::signal::Signal::from_number(number) else {
         return Errno::Einval.as_ret();
     };
+    let sender = crate::user::process::try_current_pid().unwrap_or(crate::user::ProcessId(0));
+    let info = xenith_abi::SigInfo {
+        signo: number,
+        code: xenith_abi::SI_USER,
+        sender_pid: sender.as_u64(),
+        ..xenith_abi::SigInfo::default()
+    };
     let result = if target > 0 {
-        crate::user::process::signal(crate::user::ProcessId(target as u64), signal).map(|_| 1)
+        crate::user::process::signal_with_info(crate::user::ProcessId(target as u64), signal, info)
+            .map(|_| 1)
     } else {
         let process_group = if target == 0 {
             crate::user::process::current_process_group()
@@ -1789,7 +1860,7 @@ pub fn sys_kill(ctx: &SyscallContext) -> i64 {
         if process_group.is_kernel() {
             return Errno::Esrch.as_ret();
         }
-        crate::user::process::signal_group(process_group, signal)
+        crate::user::process::signal_group_with_info(process_group, signal, info)
     };
     match result {
         Ok(_) => 0,

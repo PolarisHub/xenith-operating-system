@@ -1,8 +1,8 @@
 use std::process::ExitCode;
-use std::{env, fs};
 use std::time::Duration;
+use std::{env, fs};
 
-use xenith_emu::{ExitReason, Machine, MachineConfig};
+use xenith_emu::{ExitReason, Machine, MachineConfig, MAX_EMULATED_CPUS};
 use xenith_vmm::{preferred_backend, Backend, WhpPartition, WhpRunReason};
 
 fn main() -> ExitCode {
@@ -20,6 +20,7 @@ fn run() -> Result<(), String> {
     let mut initrd_path = None;
     let mut config = MachineConfig::default();
     let mut force_interpreter = false;
+    let mut probe = false;
     let mut timeout = Duration::from_secs(30);
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -48,33 +49,42 @@ fn run() -> Result<(), String> {
                 }
                 timeout = Duration::from_millis(milliseconds);
             },
-            "--probe" => {
-                println!("preferred backend: {:?}", preferred_backend());
-                if WhpPartition::is_available() {
-                    let mut partition = WhpPartition::create(config.cpu_count as u32)
-                        .map_err(|error| error.to_string())?;
-                    println!(
-                        "created WHP partition with {} virtual processor(s)",
-                        partition.processor_count()
-                    );
-                    let proof = partition
-                        .run_execution_probe()
-                        .map_err(|error| error.to_string())?;
-                    println!(
-                        "executed WHP guest code: {} exits, OUT {:#06x} <- {:#04x}, then HLT",
-                        proof.exits, proof.port, proof.value
-                    );
-                } else {
-                    println!("WHP unavailable; interpreter fallback selected");
-                }
-                return Ok(());
-            },
+            "--probe" => probe = true,
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
             },
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if !(1..=MAX_EMULATED_CPUS).contains(&config.cpu_count) {
+        return Err(format!("CPU count must be in 1..={MAX_EMULATED_CPUS}"));
+    }
+    if probe {
+        if config.cpu_count != 1 {
+            return Err(
+                "--probe is a one-VP instruction proof and requires --smp 1; use --kernel for multi-VP execution"
+                    .to_owned(),
+            );
+        }
+        println!("preferred backend: {:?}", preferred_backend());
+        if WhpPartition::is_available() {
+            let mut partition = WhpPartition::create(1).map_err(|error| error.to_string())?;
+            println!(
+                "created WHP partition with {} virtual processor(s)",
+                partition.processor_count()
+            );
+            let proof = partition
+                .run_execution_probe()
+                .map_err(|error| error.to_string())?;
+            println!(
+                "executed WHP guest code: {} exits, OUT {:#06x} <- {:#04x}, then HLT",
+                proof.exits, proof.port, proof.value
+            );
+        } else {
+            println!("WHP unavailable; interpreter fallback selected");
+        }
+        return Ok(());
     }
     let backend = if force_interpreter {
         Backend::Interpreter
@@ -96,8 +106,8 @@ fn run() -> Result<(), String> {
         .load_kernel(&kernel, initrd.as_deref())
         .map_err(|error| error.to_string())?;
     if backend == Backend::WindowsHypervisorPlatform {
-        let mut partition = WhpPartition::create_machine(processor_count)
-            .map_err(|error| error.to_string())?;
+        let mut partition =
+            WhpPartition::create_machine(processor_count).map_err(|error| error.to_string())?;
         let summary = partition
             .run_machine(&mut machine, timeout, execution_limit)
             .map_err(|error| error.to_string())?;
@@ -107,7 +117,9 @@ fn run() -> Result<(), String> {
         );
         match summary.reason {
             WhpRunReason::Halted | WhpRunReason::ShellReady => Ok(()),
-            other => Err(format!("WHP guest did not reach the shell prompt: {other:?}")),
+            other => Err(format!(
+                "WHP guest did not reach the shell prompt: {other:?}"
+            )),
         }
     } else {
         let summary = machine.run();

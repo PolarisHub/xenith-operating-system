@@ -669,7 +669,11 @@ fn detect_mxcsr_mask() -> u32 {
     // destination is a writable, 16-byte-aligned 512-byte area.
     unsafe { fxsave(area.0.as_mut_ptr()) };
     let mask = u32::from_le_bytes(area.0[28..32].try_into().expect("four-byte MXCSR mask"));
-    if mask == 0 { 0x0000_ffbf } else { mask }
+    if mask == 0 {
+        0x0000_ffbf
+    } else {
+        mask
+    }
 }
 
 /// Apply the BSP-selected XSAVE policy to an application processor.
@@ -793,13 +797,21 @@ impl FpuSaveArea {
         let ptr =
             crate::mm::kmalloc::kmalloc_zeroed(layout).map_err(|_| FpuAreaError::OutOfMemory)?;
 
-        Ok(Self {
+        let mut area = Self {
             ptr,
             layout,
             mask: info.xcr0.bits(),
             xsave: info.xsave_supported,
             xsaveopt: info.instructions.contains(XsaveInstructions::XSAVEOPT),
-        })
+        };
+        // A trusted fresh image must also be valid for the legacy FXRSTOR
+        // fallback, where XSTATE_BV=0 is unavailable. Seed architectural
+        // initial values while leaving all register payloads zero.
+        let bytes = area.as_bytes_mut();
+        bytes[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&info.mxcsr_mask.to_le_bytes());
+        Ok(area)
     }
 
     /// The area size in bytes (matches `FpuInfo::area_size`).
@@ -856,25 +868,8 @@ impl FpuSaveArea {
     #[must_use]
     pub fn validate_user_image(&self) -> bool {
         let bytes = self.as_bytes();
-        if bytes.len() < 32 {
-            return false;
-        }
-        let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().expect("four-byte MXCSR"));
         let Some(info) = info() else { return false };
-        if mxcsr & !info.mxcsr_mask != 0 {
-            return false;
-        }
-        if !self.xsave {
-            return bytes.len() == 512;
-        }
-        if bytes.len() < 576 {
-            return false;
-        }
-        let xstate_bv = u64::from_le_bytes(bytes[512..520].try_into().expect("XSAVE bitmap"));
-        let xcomp_bv = u64::from_le_bytes(bytes[520..528].try_into().expect("XSAVE format"));
-        xstate_bv & !self.mask == 0
-            && xcomp_bv == 0
-            && bytes[528..576].iter().all(|byte| *byte == 0)
+        valid_user_image(bytes, self.xsave, self.mask, info.mxcsr_mask)
     }
 
     /// Restore a validated signal image into the hardware register file.
@@ -888,6 +883,16 @@ impl FpuSaveArea {
         // area has the boot-time size/alignment, and TS is clear.
         unsafe { self.restore() };
         true
+    }
+
+    /// Restore a kernel-owned image used by the scheduler. Unlike the signal
+    /// path this needs no hostile-input validation: the area was initialized
+    /// here and is subsequently written only by XSAVE/FXSAVE.
+    pub fn restore_trusted(&self) {
+        clear_task_switched();
+        // SAFETY: the image is kernel-owned, correctly aligned/sized, and TS
+        // was cleared immediately above.
+        unsafe { self.restore() };
     }
 
     /// Save the current FPU/SIMD state into this area.
@@ -939,6 +944,25 @@ impl FpuSaveArea {
             unsafe { fxrstor(self.ptr.as_ptr()) };
         }
     }
+}
+
+fn valid_user_image(bytes: &[u8], xsave_image: bool, mask: u64, mxcsr_mask: u32) -> bool {
+    if bytes.len() < 32 {
+        return false;
+    }
+    let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().expect("four-byte MXCSR"));
+    if mxcsr & !mxcsr_mask != 0 {
+        return false;
+    }
+    if !xsave_image {
+        return bytes.len() == 512;
+    }
+    if bytes.len() < 576 {
+        return false;
+    }
+    let xstate_bv = u64::from_le_bytes(bytes[512..520].try_into().expect("XSAVE bitmap"));
+    let xcomp_bv = u64::from_le_bytes(bytes[520..528].try_into().expect("XSAVE format"));
+    xstate_bv & !mask == 0 && xcomp_bv == 0 && bytes[528..576].iter().all(|byte| *byte == 0)
 }
 
 impl Drop for FpuSaveArea {
@@ -1147,4 +1171,46 @@ impl FpuContext {
 #[inline]
 pub unsafe fn handle_device_not_available(ctx: &FpuContext) {
     unsafe { ctx.handle_device_not_available() };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_xsave() -> [u8; 832] {
+        let mut image = [0u8; 832];
+        image[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        image[512..520].copy_from_slice(&7u64.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn hostile_signal_xstate_headers_are_rejected_before_xrstor() {
+        let image = valid_xsave();
+        assert!(valid_user_image(&image, true, 7, 0x0000_ffbf));
+
+        let mut bad_mxcsr = image;
+        bad_mxcsr[24..28].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        assert!(!valid_user_image(&bad_mxcsr, true, 7, 0x0000_ffbf));
+
+        let mut bad_feature = image;
+        bad_feature[512..520].copy_from_slice(&8u64.to_le_bytes());
+        assert!(!valid_user_image(&bad_feature, true, 7, 0x0000_ffbf));
+
+        let mut compacted = image;
+        compacted[520..528].copy_from_slice(&(1u64 << 63).to_le_bytes());
+        assert!(!valid_user_image(&compacted, true, 7, 0x0000_ffbf));
+
+        let mut reserved = image;
+        reserved[575] = 1;
+        assert!(!valid_user_image(&reserved, true, 7, 0x0000_ffbf));
+    }
+
+    #[test]
+    fn legacy_fxsave_image_has_an_exact_512_byte_bound() {
+        let mut image = [0u8; 512];
+        image[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        assert!(valid_user_image(&image, false, 3, 0x0000_ffbf));
+        assert!(!valid_user_image(&image[..511], false, 3, 0x0000_ffbf));
+    }
 }

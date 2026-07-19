@@ -9,11 +9,20 @@ pub enum WhpError {
     SetProcessorCount(i32),
     SetLocalApicMode(i32),
     SetupPartition(i32),
-    CreateProcessor { index: u32, result: i32 },
+    CreateProcessor {
+        index: u32,
+        result: i32,
+    },
     AllocateGuestMemory,
     MapGuestMemory(i32),
     SetRegisters(i32),
     RunProcessor(i32),
+    TopologyMismatch {
+        machine: usize,
+        partition: u32,
+    },
+    ProcessorWorkerDisconnected,
+    RequestInterrupt(i32),
     InvalidIoExit,
     UnexpectedExit(u32),
     UnexpectedMachineExit {
@@ -37,7 +46,10 @@ pub enum WhpError {
     ExecutionLimit,
     GetRegisters(i32),
     CreateInstructionEmulator(i32),
-    InstructionEmulation { result: i32, status: u32 },
+    InstructionEmulation {
+        result: i32,
+        status: u32,
+    },
     GuestMemoryAccess,
     CancelProcessor(i32),
 }
@@ -359,7 +371,6 @@ mod platform {
                 if !succeeded(result) {
                     return Err(WhpError::SetLocalApicMode(result));
                 }
-
             }
             // SAFETY: all required pre-setup properties have been installed.
             let result = unsafe { WHvSetupPartition(partition.handle) };
@@ -554,6 +565,7 @@ mod tests {
 
     #[test]
     fn whp_executes_guest_code_and_services_exits_when_available() {
+        let _guard = crate::WHP_TEST_LOCK.lock().expect("lock WHP unit tests");
         if !WhpPartition::is_available() {
             return;
         }

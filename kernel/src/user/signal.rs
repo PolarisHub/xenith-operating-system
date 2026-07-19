@@ -40,11 +40,11 @@
 use core::mem::size_of;
 use core::slice;
 
+pub use xenith_abi::SignalFrame;
+
 use crate::arch::x86_64::gdt;
 use crate::arch::x86_64::interrupts::exceptions::ExceptionContext;
 use crate::sync::{SpinLock, SpinLockIRQ, SpinLockIRQGuard};
-
-pub use xenith_abi::SignalFrame;
 
 // ---------------------------------------------------------------------------
 // Numbering constants
@@ -624,7 +624,7 @@ pub struct SignalState {
 /// Internal: the pending set plus the per-real-time-signal counts, guarded
 /// together by `pending` so that a real-time delivery is atomic with respect
 /// to a concurrent dispatch.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PendingState {
     /// The pending bitmask.
     set: SignalSet,
@@ -633,6 +633,16 @@ struct PendingState {
     rt_counts: [u16; RT_COUNT],
     /// Stable payload retained for the next delivery of each signal number.
     info: [xenith_abi::SigInfo; NSIG as usize],
+}
+
+impl Default for PendingState {
+    fn default() -> Self {
+        Self {
+            set: SignalSet::empty(),
+            rt_counts: [0; RT_COUNT],
+            info: [EMPTY_SIGINFO; NSIG as usize],
+        }
+    }
 }
 
 impl SignalState {
@@ -810,15 +820,11 @@ pub enum DeliverOutcome {
 /// IRQ-safe spinlock, and the function performs no allocation and touches no
 /// per-CPU state beyond the lock.
 pub fn deliver_signal(state: &SignalState, sig: Signal) -> DeliverOutcome {
-    deliver_signal_with_info(
-        state,
-        sig,
-        xenith_abi::SigInfo {
-            signo: sig.as_number(),
-            code: xenith_abi::SI_KERNEL,
-            ..EMPTY_SIGINFO
-        },
-    )
+    deliver_signal_with_info(state, sig, xenith_abi::SigInfo {
+        signo: sig.as_number(),
+        code: xenith_abi::SI_KERNEL,
+        ..EMPTY_SIGINFO
+    })
 }
 
 /// Mark `sig` pending together with a stable source/fault payload.
@@ -1074,6 +1080,11 @@ pub enum FrameError {
     /// The user-memory write failed because the stack range was not mapped,
     /// user-accessible, or writable.
     WriteFailed,
+    /// The per-CPU XSAVE policy was unavailable or hardware state was not
+    /// live, so delivering a handler would lose FP/SIMD registers.
+    XstateUnavailable,
+    /// The CPU reported an XSAVE layout outside Xenith's signal ABI bound.
+    XstateTooLarge,
 }
 
 /// Build the signal frame on the user stack and rewrite `ctx` so `iretq`
@@ -1092,8 +1103,10 @@ fn build_signal_frame(
     state: &SignalState,
     ctx: &mut ExceptionContext,
     sig: Signal,
+    info: xenith_abi::SigInfo,
     handler_mask: SignalMask,
     action_flags: u64,
+    restart: Option<RestartContext>,
 ) -> Result<(), FrameError> {
     // Reject an obviously-broken user stack. A non-canonical rsp would #GP on
     // the next memory access; a zero rsp means the process has no user stack
@@ -1103,15 +1116,53 @@ fn build_signal_frame(
         return Err(FrameError::BadStack);
     }
 
-    let frame = SignalFrame {
+    let mut xstate =
+        crate::arch::x86_64::fpu::FpuSaveArea::new().map_err(|_| FrameError::XstateUnavailable)?;
+    if xstate.size() > xenith_abi::SIGNAL_XSTATE_MAX {
+        return Err(FrameError::XstateTooLarge);
+    }
+    let first_capture = xstate.capture_current();
+    if !retry_capture_after_materialize(
+        first_capture,
+        crate::sched::scheduler::materialize_current_fpu,
+        || xstate.capture_current(),
+    ) {
+        return Err(FrameError::XstateUnavailable);
+    }
+
+    let alt_stack = *state.alt_stack.lock();
+    let already_on_altstack = alt_stack.contains(ctx.rsp);
+    let use_altstack =
+        action_flags & xenith_abi::SA_ONSTACK != 0 && alt_stack.enabled() && !already_on_altstack;
+    let stack_top = if use_altstack {
+        alt_stack
+            .sp
+            .checked_add(alt_stack.size)
+            .ok_or(FrameError::BadStack)?
+    } else {
+        ctx.rsp
+    };
+
+    let (saved_rip, saved_rax, restarted) = restart.map_or((ctx.rip, ctx.rax, false), |restart| {
+        (restart.syscall_ip, restart.syscall_number, true)
+    });
+    let mut frame_flags = xenith_abi::SIGNAL_FRAME_XSTATE;
+    if use_altstack || already_on_altstack {
+        frame_flags |= xenith_abi::SIGNAL_FRAME_ALTSTACK;
+    }
+    if restarted {
+        frame_flags |= xenith_abi::SIGNAL_FRAME_RESTART;
+    }
+
+    let mut frame = SignalFrame {
         signo: u64::from(sig.as_number()),
-        saved_mask: state.blocked_mask(),
-        rip: ctx.rip,
+        saved_mask: xenith_abi::SigSet(state.blocked_mask().bits()),
+        rip: saved_rip,
         cs: ctx.cs,
         rflags: ctx.rflags,
         rsp: ctx.rsp,
         ss: ctx.ss,
-        rax: ctx.rax,
+        rax: saved_rax,
         rbx: ctx.rbx,
         rcx: ctx.rcx,
         rdx: ctx.rdx,
@@ -1126,6 +1177,11 @@ fn build_signal_frame(
         r13: ctx.r13,
         r14: ctx.r14,
         r15: ctx.r15,
+        info,
+        xstate_ptr: 0,
+        xstate_size: xstate.size() as u64,
+        xstate_features: xstate.feature_mask(),
+        frame_flags,
     };
 
     // SysV AMD64 requires rsp to be 16-byte aligned *at the call site*, i.e.
@@ -1133,9 +1189,16 @@ fn build_signal_frame(
     // return address). We lay out: [trampoline_retaddr][SignalFrame]. Reserve
     // space for both, align the final rsp down to 16, then write.
     let frame_bytes = size_of::<SignalFrame>() as u64;
-    // 8 bytes for the trampoline return address pushed below the frame.
-    let need = frame_bytes + 8;
-    let Some(mut new_rsp) = ctx.rsp.checked_sub(need) else {
+    let xstate_bytes = xstate.size() as u64;
+    // Include the worst-case 63-byte XSAVE alignment gap and 15-byte stack
+    // alignment adjustment so every later checked addition stays below top.
+    let need = 8u64
+        .checked_add(frame_bytes)
+        .and_then(|value| value.checked_add(63))
+        .and_then(|value| value.checked_add(xstate_bytes))
+        .and_then(|value| value.checked_add(15))
+        .ok_or(FrameError::BadStack)?;
+    let Some(mut new_rsp) = stack_top.checked_sub(need) else {
         return Err(FrameError::BadStack);
     };
     // Align the *final* rsp (which points at the return address) down to 16.
@@ -1147,9 +1210,25 @@ fn build_signal_frame(
 
     let frame_addr = new_rsp + 8;
     let retaddr_addr = new_rsp;
+    let xstate_addr = frame_addr
+        .checked_add(frame_bytes)
+        .and_then(|address| address.checked_add(63))
+        .map(|address| address & !63)
+        .ok_or(FrameError::BadStack)?;
+    let xstate_end = xstate_addr
+        .checked_add(xstate_bytes)
+        .ok_or(FrameError::BadStack)?;
+    if xstate_end > stack_top || (use_altstack && new_rsp < alt_stack.sp) {
+        return Err(FrameError::BadStack);
+    }
+    frame.xstate_ptr = xstate_addr;
 
-    // Write the frame record, then the trampoline return address. Both use
+    // Write the aligned XSAVE payload, frame record, then trampoline return
+    // address. All use
     // the checked user-copy path and split COW stack pages when necessary.
+    if !crate::arch::x86_64::usercopy::copy_to_user_slice(xstate_addr, xstate.as_bytes()) {
+        return Err(FrameError::WriteFailed);
+    }
     if !copy_to_user(frame_addr, &frame) {
         return Err(FrameError::WriteFailed);
     }
@@ -1177,10 +1256,24 @@ fn build_signal_frame(
     // and rdi to the signal number (first argument).
     ctx.rsp = new_rsp;
     ctx.rdi = u64::from(sig.as_number());
-    ctx.rsi = frame_addr;
+    if action_flags & xenith_abi::SA_SIGINFO != 0 {
+        ctx.rsi = frame_addr + core::mem::offset_of!(SignalFrame, info) as u64;
+        ctx.rdx = frame_addr;
+    } else {
+        // Preserve Xenith's original two-argument caught-handler convention.
+        ctx.rsi = frame_addr;
+    }
     // The handler's user-stack return address is already at `new_rsp`; the
     // SysV ABI leaves the return slot in place, so no further stack fixup.
     Ok(())
+}
+
+fn retry_capture_after_materialize(
+    first_capture: bool,
+    materialize: impl FnOnce() -> bool,
+    retry: impl FnOnce() -> bool,
+) -> bool {
+    first_capture || (materialize() && retry())
 }
 
 /// Restore the saved frame on `sigreturn` and unblock the handler mask.
@@ -1203,7 +1296,7 @@ pub fn sigreturn(state: &SignalState, ctx: &mut ExceptionContext) -> bool {
 
     let mut frame = SignalFrame {
         signo: 0,
-        saved_mask: SignalMask::empty(),
+        saved_mask: xenith_abi::SigSet(0),
         rip: 0,
         cs: 0,
         rflags: 0,
@@ -1224,6 +1317,11 @@ pub fn sigreturn(state: &SignalState, ctx: &mut ExceptionContext) -> bool {
         r13: 0,
         r14: 0,
         r15: 0,
+        info: EMPTY_SIGINFO,
+        xstate_ptr: 0,
+        xstate_size: 0,
+        xstate_features: 0,
+        frame_flags: 0,
     };
     if !copy_from_user(frame_addr, &mut frame) {
         return false;
@@ -1233,10 +1331,24 @@ pub fn sigreturn(state: &SignalState, ctx: &mut ExceptionContext) -> bool {
         return false;
     }
     frame.rflags = sanitize_user_rflags(frame.rflags);
-    frame.saved_mask = SignalMask::from_bits_sanitized(frame.saved_mask.bits());
+    let restored_mask = SignalMask::from_bits_sanitized(frame.saved_mask.0);
+
+    // The variable xstate record is frame-owned: neither its pointer, size,
+    // feature mask, nor reserved metadata may be redirected by userspace.
+    let Ok(mut xstate) = crate::arch::x86_64::fpu::FpuSaveArea::new() else {
+        return false;
+    };
+    if !valid_xstate_metadata(frame_addr, &frame, xstate.size(), xstate.feature_mask()) {
+        return false;
+    }
+    if !crate::arch::x86_64::usercopy::copy_from_user_slice(xstate.as_bytes_mut(), frame.xstate_ptr)
+        || !xstate.restore_user_image()
+    {
+        return false;
+    }
 
     // Restore the blocked mask the handler saved, unwinding its sa_mask.
-    state.set_blocked(frame.saved_mask);
+    state.set_blocked(restored_mask);
 
     // Restore the interrupted register frame. `r11` is overwritten by
     // `syscall` with RFLAGS, but the saved value is what user code expects on
@@ -1264,6 +1376,31 @@ pub fn sigreturn(state: &SignalState, ctx: &mut ExceptionContext) -> bool {
     true
 }
 
+#[inline]
+fn valid_xstate_metadata(
+    frame_addr: u64,
+    frame: &SignalFrame,
+    expected_size: usize,
+    expected_features: u64,
+) -> bool {
+    let expected_pointer = frame_addr
+        .checked_add(size_of::<SignalFrame>() as u64)
+        .and_then(|address| address.checked_add(63))
+        .map(|address| address & !63);
+    let supported_frame_flags = xenith_abi::SIGNAL_FRAME_XSTATE
+        | xenith_abi::SIGNAL_FRAME_ALTSTACK
+        | xenith_abi::SIGNAL_FRAME_RESTART;
+    expected_pointer.is_some_and(|pointer| {
+        frame.frame_flags & xenith_abi::SIGNAL_FRAME_XSTATE != 0
+            && frame.frame_flags & !supported_frame_flags == 0
+            && frame.xstate_ptr == pointer
+            && frame.xstate_ptr & 63 == 0
+            && frame.xstate_size == expected_size as u64
+            && expected_size <= xenith_abi::SIGNAL_XSTATE_MAX
+            && frame.xstate_features == expected_features
+    })
+}
+
 /// Validate the privilege-sensitive portion of a user-supplied signal frame.
 /// Segment selectors are fixed by Xenith's 64-bit ring-3 ABI, while RIP and
 /// RSP must stay in the canonical low half.
@@ -1277,6 +1414,8 @@ fn valid_sigreturn_frame(frame: &SignalFrame) -> bool {
         && frame.ss == user_data_selector()
         && Signal::from_number(frame.signo as u32).is_some()
         && frame.signo <= u64::from(NSIG)
+        && frame.info.signo == frame.signo as u32
+        && frame.info.reserved == 0
 }
 
 /// Keep arithmetic/debug status that ring 3 may legitimately control, force
@@ -1406,6 +1545,41 @@ pub fn user_data_selector() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_frame() -> SignalFrame {
+        SignalFrame {
+            signo: u64::from(xenith_abi::SIGUSR1),
+            saved_mask: xenith_abi::SigSet(0),
+            rip: 0x401000,
+            cs: user_code_selector(),
+            rflags: 0x202,
+            rsp: 0x7fff_f000,
+            ss: user_data_selector(),
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            info: xenith_abi::SigInfo {
+                signo: xenith_abi::SIGUSR1,
+                ..xenith_abi::SigInfo::default()
+            },
+            xstate_ptr: 0,
+            xstate_size: 832,
+            xstate_features: 7,
+            frame_flags: xenith_abi::SIGNAL_FRAME_XSTATE,
+        }
+    }
 
     #[test]
     fn signal_round_trip_standard() {
@@ -1561,17 +1735,167 @@ mod tests {
             deliver_signal(&parent, Signal::Usr2),
             DeliverOutcome::NewlyPending
         );
+        parent
+            .sigaltstack(
+                0x400000,
+                Some(xenith_abi::SigAltStack {
+                    sp: 0x700000,
+                    size: xenith_abi::MINSIGSTKSZ,
+                    flags: 0,
+                    reserved: 0,
+                }),
+            )
+            .unwrap();
 
         let child = parent.clone_for_fork();
         assert!(child.blocked_mask().is_blocked(Signal::Usr1));
         assert_eq!(child.disposition(Signal::Int), catch);
         assert!(child.pending.lock().set.is_empty());
+        assert_eq!(child.sigaltstack(0x400000, None).unwrap().sp, 0x700000);
 
         let replaced = parent.clone_for_exec();
         assert!(replaced.blocked_mask().is_blocked(Signal::Usr1));
         assert_eq!(replaced.disposition(Signal::Int), SignalAction::Default);
         assert_eq!(replaced.disposition(Signal::Term), SignalAction::Ignore);
         assert!(replaced.pending.lock().set.is_empty());
+        assert_eq!(
+            replaced.sigaltstack(0x400000, None).unwrap().flags,
+            xenith_abi::SS_DISABLE
+        );
+    }
+
+    #[test]
+    fn alternate_stack_bounds_and_onstack_edges_are_exact() {
+        let state = SignalState::new();
+        let stack = xenith_abi::SigAltStack {
+            sp: 0x700000,
+            size: xenith_abi::MINSIGSTKSZ,
+            flags: 0,
+            reserved: 0,
+        };
+        assert_eq!(
+            state.sigaltstack(0x400000, None).unwrap().flags,
+            xenith_abi::SS_DISABLE
+        );
+        state.sigaltstack(0x400000, Some(stack)).unwrap();
+        assert_eq!(
+            state.sigaltstack(stack.sp, None).unwrap().flags,
+            xenith_abi::SS_ONSTACK
+        );
+        assert_eq!(
+            state
+                .sigaltstack(stack.sp + stack.size - 1, None)
+                .unwrap()
+                .flags,
+            xenith_abi::SS_ONSTACK
+        );
+        assert_eq!(
+            state
+                .sigaltstack(stack.sp + stack.size, None)
+                .unwrap()
+                .flags,
+            0
+        );
+        assert_eq!(
+            state.sigaltstack(stack.sp, Some(stack)),
+            Err(AltStackError::AlreadyOnStack)
+        );
+
+        let too_small = xenith_abi::SigAltStack {
+            size: xenith_abi::MINSIGSTKSZ - 1,
+            ..stack
+        };
+        assert_eq!(
+            SignalState::new().sigaltstack(0x400000, Some(too_small)),
+            Err(AltStackError::InvalidRange)
+        );
+        let overflowing = xenith_abi::SigAltStack {
+            sp: crate::mm::r#virtual::USER_MAX - 8,
+            ..stack
+        };
+        assert_eq!(
+            SignalState::new().sigaltstack(0x400000, Some(overflowing)),
+            Err(AltStackError::InvalidRange)
+        );
+        let query_only_flag = xenith_abi::SigAltStack {
+            flags: xenith_abi::SS_ONSTACK,
+            ..stack
+        };
+        assert_eq!(
+            SignalState::new().sigaltstack(0x400000, Some(query_only_flag)),
+            Err(AltStackError::InvalidFlags)
+        );
+    }
+
+    #[test]
+    fn siginfo_payload_survives_pending_delivery() {
+        let state = SignalState::new();
+        let info = xenith_abi::SigInfo {
+            signo: xenith_abi::SIGUSR1,
+            code: xenith_abi::SI_USER,
+            sender_pid: 42,
+            value: 0xfeed,
+            ..xenith_abi::SigInfo::default()
+        };
+        assert_eq!(
+            deliver_signal_with_info(&state, Signal::Usr1, info),
+            DeliverOutcome::NewlyPending
+        );
+        let (signal, retained, _guard) = select_deliverable(&state).unwrap();
+        assert_eq!(signal, Signal::Usr1);
+        assert_eq!(retained, info);
+    }
+
+    #[test]
+    fn hostile_sigreturn_xstate_metadata_cannot_redirect_restore() {
+        let frame_addr = 0x700008;
+        let mut frame = test_frame();
+        frame.xstate_ptr = (frame_addr + size_of::<SignalFrame>() as u64 + 63) & !63;
+        assert!(valid_xstate_metadata(frame_addr, &frame, 832, 7));
+
+        let mut redirected = frame;
+        redirected.xstate_ptr += 64;
+        assert!(!valid_xstate_metadata(frame_addr, &redirected, 832, 7));
+        let mut oversized = frame;
+        oversized.xstate_size = xenith_abi::SIGNAL_XSTATE_MAX as u64 + 1;
+        assert!(!valid_xstate_metadata(frame_addr, &oversized, 832, 7));
+        let mut features = frame;
+        features.xstate_features |= 1 << 9;
+        assert!(!valid_xstate_metadata(frame_addr, &features, 832, 7));
+        let mut flags = frame;
+        flags.frame_flags |= 1 << 63;
+        assert!(!valid_xstate_metadata(frame_addr, &flags, 832, 7));
+    }
+
+    #[test]
+    fn ts_set_signal_capture_materializes_then_retries_exactly_once() {
+        use core::cell::Cell;
+
+        let materialized = Cell::new(false);
+        let retries = Cell::new(0);
+        assert!(retry_capture_after_materialize(
+            false,
+            || {
+                materialized.set(true);
+                true
+            },
+            || {
+                retries.set(retries.get() + 1);
+                materialized.get()
+            },
+        ));
+        assert_eq!(retries.get(), 1);
+
+        let materialize_calls = Cell::new(0);
+        assert!(retry_capture_after_materialize(
+            true,
+            || {
+                materialize_calls.set(1);
+                false
+            },
+            || false,
+        ));
+        assert_eq!(materialize_calls.get(), 0);
     }
 
     #[test]

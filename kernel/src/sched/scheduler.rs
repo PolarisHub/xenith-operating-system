@@ -176,6 +176,10 @@ pub struct TaskNode {
     /// dispatched. Reset to zero on dispatch; bumped by [`tick`] for every
     /// queued task; drives the priority-bump aging in [`tick`].
     pub wait_ticks: u64,
+    /// Eager, feature-sized x87/SSE/AVX image. Keeping this on the live
+    /// scheduler node makes FP state follow task migration and lets signal
+    /// delivery materialize a CR0.TS-armed task before building its frame.
+    fpu: Option<crate::arch::x86_64::fpu::FpuSaveArea>,
     /// `true` once the node's `ctx` has been initialised for a first switch.
     /// Until then the node is a fresh spawn whose `ctx` was built by
     /// [`Context::new`] and whose trampoline has not yet run.
@@ -197,14 +201,24 @@ impl TaskNode {
     /// writable, mapped, 16-byte-aligned stack region that remains valid for
     /// the lifetime of this node. [`Task::new_kernel`] establishes that when
     /// it allocates the stack, so the public [`spawn`] path is safe.
-    pub unsafe fn new(task: Kbox<Task>, entry: unsafe extern "C" fn(u64) -> !, arg: u64) -> Self {
+    pub unsafe fn new(
+        task: Kbox<Task>,
+        entry: unsafe extern "C" fn(u64) -> !,
+        arg: u64,
+    ) -> Option<Self> {
         let stack_top = task.kernel_stack.top();
         // SAFETY: `stack_top` is the 16-aligned top of the task's owned kernel
         // stack; `task_trampoline` is a valid `unsafe extern "C" fn() -> !`.
         // `Context::new` writes the entry address to `stack_top - 16`, which
         // is inside the stack the `Task` owns and not concurrently touched.
         let ctx = unsafe { Context::new(stack_top, task_trampoline) };
-        Self {
+        #[cfg(not(test))]
+        let fpu = Some(crate::arch::x86_64::fpu::FpuSaveArea::new().ok()?);
+        // Host scheduler unit tests do not run privileged FPU bring-up or the
+        // assembly switch; retaining `None` keeps their metadata tests pure.
+        #[cfg(test)]
+        let fpu = crate::arch::x86_64::fpu::FpuSaveArea::new().ok();
+        Some(Self {
             task,
             ctx,
             links: crate::util::LinkEntry::new(),
@@ -212,8 +226,9 @@ impl TaskNode {
             arg,
             wake_deadline: None,
             wait_ticks: 0,
+            fpu,
             started: false,
-        }
+        })
     }
 
     /// The task's identity, for logging and lookup.
@@ -1296,7 +1311,7 @@ fn create_task_inner(
     let task = Task::new_kernel(name, entry, arg)?;
     // SAFETY: `task` owns a freshly-allocated, 16-aligned kernel stack whose
     // top is valid for the lifetime of the node we are about to build.
-    let mut node = Kbox::new(unsafe { TaskNode::new(Kbox::new(task), entry, arg) });
+    let mut node = Kbox::new(unsafe { TaskNode::new(Kbox::new(task), entry, arg) }?);
     let node_ptr = node.as_nonnull();
     // The node's task starts Ready; record that explicitly even though
     // `new_kernel` already sets it, so the transition is visible at the
@@ -1759,6 +1774,8 @@ fn do_switch(prev: Option<NonNull<TaskNode>>, next: NonNull<TaskNode>, flags: u6
         },
         None => unsafe { bootstrap_ctx() },
     };
+    exchange_fpu_state(prev, next);
+
     // The incoming context is read-only from the trampoline's perspective.
     // SAFETY: `next` is live; we borrow its `ctx` shared for the duration of
     // the switch. The lock is not held but per-CPU ownership plus the
@@ -1797,6 +1814,49 @@ fn do_switch(prev: Option<NonNull<TaskNode>>, next: NonNull<TaskNode>, flags: u6
     // sibling) call on this CPU before it was switched out; the stack
     // preservation of the trampoline guarantees it is the correct snapshot.
     unsafe { restore_flags(flags) };
+}
+
+/// Save the outgoing task's feature-sized FP/SIMD image and restore the
+/// incoming task before switching stacks. Interrupts are disabled and both
+/// nodes are off their queues, so their private save areas cannot race.
+fn exchange_fpu_state(prev: Option<NonNull<TaskNode>>, next: NonNull<TaskNode>) {
+    if let Some(mut previous) = prev {
+        // SAFETY: `previous` is the current, exclusively-owned task node.
+        if let Some(area) = unsafe { previous.as_mut() }.fpu.as_mut() {
+            if !area.capture_current() {
+                // A TS-armed task's authoritative image is already in its
+                // scheduler area. Materialize it, then take a normalized
+                // snapshot before ownership moves to the next task.
+                area.restore_trusted();
+                let captured = area.capture_current();
+                debug_assert!(captured);
+            }
+        }
+    }
+    // SAFETY: `next` was removed from its run queue and is exclusively owned
+    // by this dispatch until the context switch publishes it as current.
+    if let Some(area) = unsafe { &mut *next.as_ptr() }.fpu.as_ref() {
+        area.restore_trusted();
+    }
+}
+
+/// Materialize the current task's scheduler-owned FP/SIMD image after a
+/// CR0.TS trap or before signal-frame capture. This is the live bridge the
+/// architecture-level save area cannot discover on its own.
+pub fn materialize_current_fpu() -> bool {
+    let flags = save_flags_and_cli();
+    let restored = current_node().is_some_and(|node| {
+        // SAFETY: interrupts are disabled and `node` is current on this CPU,
+        // so no scheduler entry can move or mutate its private FPU area.
+        let node = unsafe { &*node.as_ptr() };
+        node.fpu.as_ref().is_some_and(|area| {
+            area.restore_trusted();
+            true
+        })
+    });
+    // SAFETY: paired with the same-CPU flag snapshot above.
+    unsafe { restore_flags(flags) };
+    restored
 }
 
 /// Install the incoming task's architecture state before changing `rsp`.

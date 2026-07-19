@@ -422,7 +422,7 @@ fn configure_msi(
     command.insert(crate::devices::pci::PciCommand::INTERRUPT_DISABLE);
     address.write_command(command.bits());
     irq_device.enable();
-    msi.program_single(address, destination, NIC_VECTOR);
+    msi.program_single(address, destination, NIC_VECTOR)?;
     ::log::debug!("net: single-vector MSI selected for {}", device.address);
     Ok(true)
 }

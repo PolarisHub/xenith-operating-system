@@ -100,9 +100,19 @@ impl MemoryBus {
         self.apic_events.clear();
     }
 
-    pub(crate) fn select_processor(&mut self, processor: usize) {
+    /// Select the processor whose local APIC/MMIO view is exposed to the
+    /// next device operation. Accelerated backends use this while servicing
+    /// a stopped virtual processor's serialized exits.
+    pub fn select_processor(&mut self, processor: usize) {
         assert!(processor < self.local_apics.len());
         self.active_processor = processor;
+    }
+
+    /// Complete the current processor's bus-side interrupt routing token.
+    /// Hardware-accelerated backends keep the architectural ISR in the host
+    /// hypervisor and use this only to release the shared device router.
+    pub fn end_of_interrupt(&mut self) {
+        self.local_apics[self.active_processor].end_of_interrupt();
     }
 
     pub(crate) fn take_apic_event(&mut self) -> Option<ApicEvent> {

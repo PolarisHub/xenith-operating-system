@@ -19,6 +19,8 @@ pub enum WhpRunReason {
 pub struct WhpRunSummary {
     pub reason: WhpRunReason,
     pub exits: u64,
+    /// Bit `n` is set only after WHP returned a real exit from VP `n`.
+    pub active_processor_mask: u64,
 }
 
 #[cfg(windows)]
@@ -65,6 +67,7 @@ mod platform {
     const REGISTER_CR4: u32 = 0x1F;
     const REGISTER_EFER: u32 = 0x2001;
     const REGISTER_KERNEL_GS_BASE: u32 = 0x2002;
+    const REGISTER_INTERNAL_ACTIVITY_STATE: u32 = 0x8000_0005;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -152,6 +155,7 @@ mod platform {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     union ExitDetails {
         memory_access: MemoryAccessContext,
         io_port_access: IoPortAccessContext,
@@ -166,7 +170,7 @@ mod platform {
     }
 
     #[repr(C)]
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     struct RunVpExitContext {
         exit_reason: u32,
         reserved: u32,
@@ -236,14 +240,17 @@ mod platform {
     }
 
     impl RunWatchdog {
-        fn start(partition: PartitionHandle, timeout: Duration) -> Self {
+        fn start(partition: PartitionHandle, processor_count: u32, timeout: Duration) -> Self {
             let (finished, receiver) = mpsc::channel();
             let partition = partition as usize;
             let thread = thread::spawn(move || {
                 if receiver.recv_timeout(timeout).is_err() {
-                    // SAFETY: the owner joins this thread before it can drop the partition.
-                    let _ =
-                        unsafe { WHvCancelRunVirtualProcessor(partition as PartitionHandle, 0, 0) };
+                    for index in 0..processor_count {
+                        // SAFETY: the owner joins this thread before it can drop the partition.
+                        let _ = unsafe {
+                            WHvCancelRunVirtualProcessor(partition as PartitionHandle, index, 0)
+                        };
+                    }
                 }
             });
             Self {
@@ -260,6 +267,112 @@ mod platform {
             }
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
+            }
+        }
+    }
+
+    enum WorkerCommand {
+        Resume,
+        Stop,
+    }
+
+    struct ProcessorExit {
+        index: u32,
+        result: i32,
+        context: RunVpExitContext,
+    }
+
+    struct ProcessorWorker {
+        command: mpsc::Sender<WorkerCommand>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    /// Owns every concurrently runnable WHP VP while keeping all emulated
+    /// device access on the coordinator thread. Workers only cross WHP's
+    /// execution boundary and stop at each exit until explicitly resumed.
+    struct ProcessorWorkers {
+        partition: PartitionHandle,
+        workers: Vec<ProcessorWorker>,
+        exits: mpsc::Receiver<ProcessorExit>,
+    }
+
+    impl ProcessorWorkers {
+        fn start(partition: PartitionHandle, processor_count: u32) -> Self {
+            let (exit_sender, exits) = mpsc::channel();
+            let mut workers = Vec::with_capacity(processor_count as usize);
+            for index in 0..processor_count {
+                let (command, commands) = mpsc::channel();
+                let sender = exit_sender.clone();
+                let handle = partition as usize;
+                let worker = thread::spawn(move || loop {
+                    let mut context = RunVpExitContext::default();
+                    // SAFETY: this VP index remains live until the owner joins
+                    // every worker, and the output context has the exact ABI.
+                    let result = unsafe {
+                        WHvRunVirtualProcessor(
+                            handle as PartitionHandle,
+                            index,
+                            ptr::from_mut(&mut context).cast(),
+                            mem::size_of::<RunVpExitContext>() as u32,
+                        )
+                    };
+                    if sender
+                        .send(ProcessorExit {
+                            index,
+                            result,
+                            context,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    match commands.recv() {
+                        Ok(WorkerCommand::Resume) => {},
+                        Ok(WorkerCommand::Stop) | Err(_) => break,
+                    }
+                });
+                workers.push(ProcessorWorker {
+                    command,
+                    thread: Some(worker),
+                });
+            }
+            drop(exit_sender);
+            Self {
+                partition,
+                workers,
+                exits,
+            }
+        }
+
+        fn next_exit(&self) -> Result<ProcessorExit, WhpError> {
+            self.exits
+                .recv()
+                .map_err(|_| WhpError::ProcessorWorkerDisconnected)
+        }
+
+        fn resume(&self, index: u32) -> Result<(), WhpError> {
+            self.workers
+                .get(index as usize)
+                .ok_or(WhpError::ProcessorWorkerDisconnected)?
+                .command
+                .send(WorkerCommand::Resume)
+                .map_err(|_| WhpError::ProcessorWorkerDisconnected)
+        }
+    }
+
+    impl Drop for ProcessorWorkers {
+        fn drop(&mut self) {
+            for worker in &self.workers {
+                let _ = worker.command.send(WorkerCommand::Stop);
+            }
+            for index in 0..self.workers.len() as u32 {
+                // SAFETY: each index belongs to this still-live partition.
+                let _ = unsafe { WHvCancelRunVirtualProcessor(self.partition, index, 0) };
+            }
+            for worker in &mut self.workers {
+                if let Some(thread) = worker.thread.take() {
+                    let _ = thread.join();
+                }
             }
         }
     }
@@ -643,6 +756,7 @@ mod platform {
 
     fn install_machine_registers(
         partition: PartitionHandle,
+        vp_index: u32,
         machine: &Machine,
     ) -> Result<(), WhpError> {
         let state = &machine.cpu.state;
@@ -697,7 +811,7 @@ mod platform {
         let result = unsafe {
             WHvSetVirtualProcessorRegisters(
                 partition,
-                0,
+                vp_index,
                 names.as_ptr(),
                 names.len() as u32,
                 values.as_ptr(),
@@ -715,7 +829,7 @@ mod platform {
         let result = unsafe {
             WHvSetVirtualProcessorRegisters(
                 partition,
-                0,
+                vp_index,
                 extra_names.as_ptr(),
                 extra_names.len() as u32,
                 extra_values.as_ptr(),
@@ -727,23 +841,66 @@ mod platform {
         Ok(())
     }
 
-    fn request_interrupt(partition: PartitionHandle, bus: &mut MemoryBus) {
-        let Some(vector) = bus.next_interrupt() else {
-            return;
-        };
-        let interrupt = InterruptControl {
-            control: 0,
-            destination: 0,
-            vector: u32::from(vector),
-        };
-        // SAFETY: this is a fixed, physical, edge-triggered interrupt request.
-        let _ = unsafe {
-            WHvRequestInterrupt(
-                partition,
-                &interrupt,
-                mem::size_of::<InterruptControl>() as u32,
-            )
-        };
+    fn suspend_application_processors(
+        partition: PartitionHandle,
+        processor_count: u32,
+    ) -> Result<(), WhpError> {
+        let names = [REGISTER_INTERNAL_ACTIVITY_STATE];
+        // StartupSuspend is bit zero. Native INIT/SIPI delivery clears it
+        // and establishes the architectural real-mode startup vector.
+        let values = [RegisterValue::reg64(1)];
+        for index in 1..processor_count {
+            // SAFETY: every AP index was created with the partition and the
+            // internal-activity value has the documented one-bit layout.
+            let result = unsafe {
+                WHvSetVirtualProcessorRegisters(
+                    partition,
+                    index,
+                    names.as_ptr(),
+                    names.len() as u32,
+                    values.as_ptr(),
+                )
+            };
+            if result < 0 {
+                return Err(WhpError::SetRegisters(result));
+            }
+        }
+        Ok(())
+    }
+
+    fn request_interrupts(
+        partition: PartitionHandle,
+        processor_count: u32,
+        bus: &mut MemoryBus,
+    ) -> Result<(), WhpError> {
+        for processor in 0..processor_count {
+            bus.select_processor(processor as usize);
+            let Some(vector) = bus.next_interrupt() else {
+                continue;
+            };
+            let interrupt = InterruptControl {
+                control: 0,
+                destination: processor,
+                vector: u32::from(vector),
+            };
+            // SAFETY: this is a fixed, physical, edge-triggered interrupt request.
+            let result = unsafe {
+                WHvRequestInterrupt(
+                    partition,
+                    &interrupt,
+                    mem::size_of::<InterruptControl>() as u32,
+                )
+            };
+            // WHP owns the architectural ISR/EOI state. The bus-side APIC is
+            // only a serialized route latch for accelerated execution.
+            bus.end_of_interrupt();
+            if result < 0 {
+                bus.select_processor(0);
+                return Err(WhpError::RequestInterrupt(result));
+            }
+        }
+        bus.select_processor(0);
+        Ok(())
     }
 
     impl WhpPartition {
@@ -760,44 +917,50 @@ mod platform {
             if self.processor_count() == 0 || exit_limit == 0 {
                 return Err(WhpError::ExecutionLimit);
             }
+            if machine.cpu_count() != self.processor_count() as usize {
+                return Err(WhpError::TopologyMismatch {
+                    machine: machine.cpu_count(),
+                    partition: self.processor_count(),
+                });
+            }
             let handle = self.raw_handle();
             let memory = GuestMemory::map(handle, &mut machine.bus)?;
-            install_machine_registers(handle, machine)?;
+            install_machine_registers(handle, 0, machine)?;
+            suspend_application_processors(handle, self.processor_count())?;
             let emulator = InstructionEmulator::create()?;
-            let mut callbacks = CallbackContext {
-                partition: handle,
-                vp_index: 0,
-                bus: ptr::from_mut(&mut machine.bus),
-            };
-
-            let watchdog = RunWatchdog::start(handle, timeout);
+            let workers = ProcessorWorkers::start(handle, self.processor_count());
+            let watchdog = RunWatchdog::start(handle, self.processor_count(), timeout);
 
             let mut exits = 0u64;
+            let mut active_processor_mask = 0u64;
             let reason = loop {
                 if exits == exit_limit {
                     break WhpRunReason::ExitLimit;
                 }
-                let mut context = RunVpExitContext::default();
-                // SAFETY: output context exactly matches the WHP x64 ABI.
-                let result = unsafe {
-                    WHvRunVirtualProcessor(
-                        handle,
-                        0,
-                        ptr::from_mut(&mut context).cast(),
-                        mem::size_of::<RunVpExitContext>() as u32,
-                    )
-                };
-                if result < 0 {
-                    return Err(WhpError::RunProcessor(result));
+                let event = workers.next_exit()?;
+                if event.result < 0 {
+                    return Err(WhpError::RunProcessor(event.result));
                 }
                 exits += 1;
-                match context.exit_reason {
-                    EXIT_IO_PORT_ACCESS => emulator.emulate_io(&mut callbacks, &context)?,
-                    EXIT_MEMORY_ACCESS => emulator.emulate_mmio(&mut callbacks, &context)?,
+                if event.context.exit_reason != EXIT_CANCELED {
+                    active_processor_mask |= 1u64 << event.index;
+                }
+                machine.bus.select_processor(event.index as usize);
+                let mut callbacks = CallbackContext {
+                    partition: handle,
+                    vp_index: event.index,
+                    bus: ptr::from_mut(&mut machine.bus),
+                };
+                match event.context.exit_reason {
+                    EXIT_IO_PORT_ACCESS => {
+                        emulator.emulate_io(&mut callbacks, &event.context)?;
+                    },
+                    EXIT_MEMORY_ACCESS => {
+                        emulator.emulate_mmio(&mut callbacks, &event.context)?;
+                    },
                     EXIT_APIC_EOI => {},
                     EXIT_HALT => {
                         machine.bus.tick(DEVICE_TICK_PER_EXIT);
-                        request_interrupt(handle, &mut machine.bus);
                         if machine.serial_output().ends_with(b"xenith$ ") {
                             break WhpRunReason::Halted;
                         }
@@ -805,24 +968,30 @@ mod platform {
                     EXIT_CANCELED => break WhpRunReason::TimedOut,
                     EXIT_EXCEPTION => {
                         // SAFETY: the tagged exit selected the exception member.
-                        let exception = unsafe { context.details.exception };
+                        let exception = unsafe { event.context.details.exception };
                         return Err(WhpError::GuestException {
                             vector: exception.exception_type,
                             error_code: exception.error_code,
                             parameter: exception.exception_parameter,
-                            rip: context.vp_context.rip,
+                            rip: event.context.vp_context.rip,
                             instruction_bytes: exception.instruction_bytes,
                             instruction_len: exception.instruction_byte_count,
                         });
                     },
                     other => {
-                        let names = [4, REGISTER_CR2, REGISTER_CR3, REGISTER_GS, REGISTER_KERNEL_GS_BASE];
+                        let names = [
+                            4,
+                            REGISTER_CR2,
+                            REGISTER_CR3,
+                            REGISTER_GS,
+                            REGISTER_KERNEL_GS_BASE,
+                        ];
                         let mut values = [RegisterValue::default(); 5];
                         // SAFETY: each writable register value matches one valid name.
                         let result = unsafe {
                             WHvGetVirtualProcessorRegisters(
                                 handle,
-                                0,
+                                event.index,
                                 names.as_ptr(),
                                 names.len() as u32,
                                 values.as_mut_ptr(),
@@ -833,8 +1002,8 @@ mod platform {
                         }
                         return Err(WhpError::UnexpectedMachineExit {
                             reason: other,
-                            rip: context.vp_context.rip,
-                            rflags: context.vp_context.rflags,
+                            rip: event.context.vp_context.rip,
+                            rflags: event.context.vp_context.rflags,
                             rsp: values[0].words[0],
                             cr2: values[1].words[0],
                             cr3: values[2].words[0],
@@ -847,11 +1016,18 @@ mod platform {
                     break WhpRunReason::ShellReady;
                 }
                 machine.bus.tick(DEVICE_TICK_PER_EXIT);
-                request_interrupt(handle, &mut machine.bus);
+                request_interrupts(handle, self.processor_count(), &mut machine.bus)?;
+                workers.resume(event.index)?;
             };
             drop(watchdog);
+            drop(workers);
+            machine.bus.select_processor(0);
             memory.copy_back(&mut machine.bus)?;
-            Ok(WhpRunSummary { reason, exits })
+            Ok(WhpRunSummary {
+                reason,
+                exits,
+                active_processor_mask,
+            })
         }
     }
 }
@@ -878,10 +1054,11 @@ mod tests {
 
     use xenith_emu::{Machine, MachineConfig};
 
-    use super::{WhpPartition, WhpRunReason};
+    use super::{WhpError, WhpPartition, WhpRunReason};
 
     #[test]
     fn machine_runner_services_serial_io_and_watchdog_when_available() {
+        let _guard = crate::WHP_TEST_LOCK.lock().expect("lock WHP unit tests");
         if !WhpPartition::is_available() {
             return;
         }
@@ -905,6 +1082,60 @@ mod tests {
             .run_machine(&mut machine, Duration::from_millis(100), 32)
             .expect("execute shared-machine WHP loop");
         assert_eq!(summary.reason, WhpRunReason::TimedOut);
+        assert_eq!(summary.active_processor_mask, 1);
+        assert_eq!(machine.serial_output(), b"X");
+    }
+
+    #[test]
+    fn machine_runner_rejects_partition_topology_mismatch_when_available() {
+        let _guard = crate::WHP_TEST_LOCK.lock().expect("lock WHP unit tests");
+        if !WhpPartition::is_available() {
+            return;
+        }
+        let mut machine = Machine::new(MachineConfig {
+            memory_bytes: 2 * 1024 * 1024,
+            cpu_count: 2,
+            mirror_serial: false,
+            ..MachineConfig::default()
+        });
+        let mut partition = WhpPartition::create_machine(1).expect("create accelerated partition");
+        assert_eq!(
+            partition.run_machine(&mut machine, Duration::from_millis(10), 1),
+            Err(WhpError::TopologyMismatch {
+                machine: 2,
+                partition: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn suspended_ap_is_not_reported_active_without_a_sipi_when_available() {
+        let _guard = crate::WHP_TEST_LOCK.lock().expect("lock WHP unit tests");
+        if !WhpPartition::is_available() {
+            return;
+        }
+        let mut machine = Machine::new(MachineConfig {
+            memory_bytes: 2 * 1024 * 1024,
+            cpu_count: 2,
+            instruction_limit: 32,
+            mirror_serial: false,
+            ..MachineConfig::default()
+        });
+        machine
+            .load_flat(
+                0x1000,
+                &[0xBA, 0xF8, 0x03, 0xB0, b'X', 0xEE, 0xF4],
+                0x8_0000,
+            )
+            .expect("load flat WHP smoke program");
+        machine.cpu.state.cs = 0;
+        machine.cpu.state.ss = 0;
+        let mut partition = WhpPartition::create_machine(2).expect("create two-VP partition");
+        let summary = partition
+            .run_machine(&mut machine, Duration::from_millis(100), 32)
+            .expect("run BSP while AP remains startup-suspended");
+        assert_eq!(summary.reason, WhpRunReason::TimedOut);
+        assert_eq!(summary.active_processor_mask, 1);
         assert_eq!(machine.serial_output(), b"X");
     }
 }

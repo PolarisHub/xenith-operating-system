@@ -24,6 +24,7 @@ pub enum CapabilityError {
     WrongCapability,
     Truncated,
     InvalidBir(u8),
+    InvalidVector(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +41,6 @@ impl CapabilityList {
         }
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = PciCapability> + '_ {
         self.entries[..self.len].iter().copied()
     }
@@ -174,23 +174,37 @@ impl MsiCapability {
     }
 
     /// Program one fixed, edge-triggered message and enable exactly one vector.
-    pub fn program_single(self, address: PciAddress, destination: u8, vector: u8) {
+    pub fn program_single(
+        self,
+        address: PciAddress,
+        destination: u8,
+        vector: u8,
+    ) -> Result<(), CapabilityError> {
+        if vector < 0x20 {
+            return Err(CapabilityError::InvalidVector(vector));
+        }
         self.disable(address);
-        address.write32(
-            self.address_low,
-            0xfee0_0000 | (u32::from(destination) << 12),
-        );
+        address.write32(self.address_low, msi_message_address(destination));
         if let Some(high) = self.address_high {
             address.write32(high, 0);
         }
-        address.write16(self.message_data, u16::from(vector));
+        address.write16(self.message_data, msi_message_data(vector));
         if let Some(mask) = self.mask_bits {
             address.write32(mask, address.read32(mask) & !1);
         }
         // Clear Multiple Message Enable and set MSI Enable last, after every
         // message field and the driver's hard-IRQ binding are published.
         address.write16(self.offset + 2, (self.control & !(0b111 << 4)) | 1);
+        Ok(())
     }
+}
+
+const fn msi_message_address(destination: u8) -> u32 {
+    0xfee0_0000 | ((destination as u32) << 12)
+}
+
+const fn msi_message_data(vector: u8) -> u16 {
+    vector as u16
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +310,12 @@ mod tests {
         assert_eq!(msi64.address_high, Some(0x68));
         assert_eq!(msi64.message_data, 0x6c);
         assert_eq!(msi64.mask_bits, Some(0x70));
+    }
+
+    #[test]
+    fn msi_message_uses_physical_fixed_edge_delivery() {
+        assert_eq!(msi_message_address(0x2a), 0xfee2_a000);
+        assert_eq!(msi_message_data(0x40), 0x0040);
     }
 
     #[test]

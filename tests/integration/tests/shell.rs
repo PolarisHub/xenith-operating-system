@@ -104,13 +104,7 @@ fn shell_executes_builtins_and_coreutils_via_ps2() {
     .unwrap();
     assert!(cat.contains("hello from Xenith ring 3"));
 
-    let memory = run_command(
-        &mut machine,
-        "/bin/hello\n",
-        "XENITH_VM_RANDOM_OK",
-        1,
-    )
-    .unwrap();
+    let memory = run_command(&mut machine, "/bin/hello\n", "XENITH_VM_RANDOM_OK", 1).unwrap();
     assert!(
         !memory.contains("XENITH_VM_RANDOM_FAIL"),
         "userspace VM/RNG smoke failed: {memory:?}"

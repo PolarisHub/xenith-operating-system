@@ -151,6 +151,50 @@ pub extern "C" fn xenith_kill(pid: i64, signal: u32) -> c_int {
     libuser::syscall::kill(pid, signal).map_or_else(|error| -error.0, |()| 0)
 }
 
+/// # Safety
+/// Non-null action pointers must name readable/writable ABI records.
+#[no_mangle]
+pub unsafe extern "C" fn xenith_sigaction(
+    signal: u32,
+    action: *const xenith_abi::SigAction,
+    old_action: *mut xenith_abi::SigAction,
+) -> c_int {
+    // SAFETY: forwarded from the C pointer contract above.
+    let action = unsafe { action.as_ref() };
+    // SAFETY: forwarded from the C pointer contract above.
+    let old_action = unsafe { old_action.as_mut() };
+    libuser::syscall::sigaction(signal, action, old_action).map_or_else(|error| -error.0, |()| 0)
+}
+
+/// # Safety
+/// Non-null set pointers must name readable/writable ABI records.
+#[no_mangle]
+pub unsafe extern "C" fn xenith_sigprocmask(
+    how: u32,
+    set: *const xenith_abi::SigSet,
+    old_set: *mut xenith_abi::SigSet,
+) -> c_int {
+    // SAFETY: forwarded from the C pointer contract above.
+    let set = unsafe { set.as_ref() };
+    // SAFETY: forwarded from the C pointer contract above.
+    let old_set = unsafe { old_set.as_mut() };
+    libuser::syscall::sigprocmask(how, set, old_set).map_or_else(|error| -error.0, |()| 0)
+}
+
+/// # Safety
+/// Non-null stack pointers must name readable/writable ABI records.
+#[no_mangle]
+pub unsafe extern "C" fn xenith_sigaltstack(
+    new_stack: *const xenith_abi::SigAltStack,
+    old_stack: *mut xenith_abi::SigAltStack,
+) -> c_int {
+    // SAFETY: forwarded from the C pointer contract above.
+    let new_stack = unsafe { new_stack.as_ref() };
+    // SAFETY: forwarded from the C pointer contract above.
+    let old_stack = unsafe { old_stack.as_mut() };
+    libuser::syscall::sigaltstack(new_stack, old_stack).map_or_else(|error| -error.0, |()| 0)
+}
+
 #[no_mangle]
 pub extern "C" fn xenith_ioctl(fd: c_int, command: u32, argument: usize) -> isize {
     libuser::syscall::ioctl(fd, command, argument)
@@ -162,11 +206,7 @@ pub extern "C" fn xenith_ioctl(fd: c_int, command: u32, argument: usize) -> isiz
 /// # Safety
 /// `buffer` must be writable for `count` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn xenith_getrandom(
-    buffer: *mut c_void,
-    count: usize,
-    flags: u32,
-) -> isize {
+pub unsafe extern "C" fn xenith_getrandom(buffer: *mut c_void, count: usize, flags: u32) -> isize {
     if count == 0 {
         return libuser::syscall::getrandom(&mut [], flags)
             .map_or_else(|error| -(error.0 as isize), |value| value as isize);

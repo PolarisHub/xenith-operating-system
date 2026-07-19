@@ -704,10 +704,7 @@ pub fn sys_getrandom(ctx: &crate::syscall::SyscallContext) -> i64 {
             let mut rng = KERNEL_RNG.lock();
             rng.fill_bytes(&mut scratch[..n]);
         }
-        if crate::arch::x86_64::usercopy::copy_to_user_slice(
-            buf + written,
-            &scratch[..n],
-        ) {
+        if crate::arch::x86_64::usercopy::copy_to_user_slice(buf + written, &scratch[..n]) {
             written += n as u64;
         } else {
             if written == 0 {

@@ -3,7 +3,7 @@
 use core::arch::asm;
 
 use xenith_abi::{
-    DirectoryEntry, NetInterfaceInfo, OpenFlags, SigAction, SigSet, SockAddrV4, Stat,
+    DirectoryEntry, NetInterfaceInfo, OpenFlags, SigAction, SigAltStack, SigSet, SockAddrV4, Stat,
     SyscallNumber, Timespec, UtsName,
 };
 
@@ -527,6 +527,24 @@ pub fn getrandom(buffer: &mut [u8], flags: u32) -> Result<usize> {
         0,
         0,
     ])
+}
+
+/// Install, disable, or query the calling thread's alternate signal stack.
+pub fn sigaltstack(
+    new_stack: Option<&SigAltStack>,
+    old_stack: Option<&mut SigAltStack>,
+) -> Result<()> {
+    let new_pointer = new_stack.map_or(0, |value| core::ptr::from_ref(value) as usize);
+    let old_pointer = old_stack.map_or(0, |value| core::ptr::from_mut(value) as usize);
+    call(SyscallNumber::Sigaltstack, [
+        new_pointer,
+        old_pointer,
+        0,
+        0,
+        0,
+        0,
+    ])
+    .map(|_| ())
 }
 
 pub fn mount_ramfs(path: &[u8]) -> Result<()> {

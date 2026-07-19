@@ -125,6 +125,7 @@ pub enum SyscallNumber {
     Sigaction = 50,
     Sigprocmask = 51,
     GetRandom = 52,
+    Sigaltstack = 53,
 }
 
 /// `read` — read up to `count` bytes from `fd` into `buf`.
@@ -204,13 +205,14 @@ pub const SYS_SIGRETURN: u64 = SyscallNumber::Sigreturn as u64;
 pub const SYS_SIGACTION: u64 = SyscallNumber::Sigaction as u64;
 pub const SYS_SIGPROCMASK: u64 = SyscallNumber::Sigprocmask as u64;
 pub const SYS_GETRANDOM: u64 = SyscallNumber::GetRandom as u64;
+pub const SYS_SIGALTSTACK: u64 = SyscallNumber::Sigaltstack as u64;
 
 /// The number of slots in the [`SYSCALLS`] table.
 ///
 /// This is one past the highest assigned syscall number so that every assigned
 /// number is a valid in-bounds index. Growing the table means bumping this and
 /// extending the array initialiser in lockstep.
-pub const NUM_SYSCALLS: usize = 53;
+pub const NUM_SYSCALLS: usize = 54;
 
 // ---------------------------------------------------------------------------
 // The table
@@ -280,6 +282,7 @@ pub static SYSCALLS: [Option<SyscallFn>; NUM_SYSCALLS] = [
     Some(super::handlers::sys_sigaction),     // 50 sigaction
     Some(super::handlers::sys_sigprocmask),   // 51 sigprocmask
     Some(crate::devices::rng::sys_getrandom), // 52 getrandom
+    Some(super::handlers::sys_sigaltstack),   // 53 sigaltstack
 ];
 
 /// Look up the handler for syscall number `num`.
@@ -360,6 +363,7 @@ pub fn name_for(num: u64) -> &'static str {
         SYS_SIGACTION => "sigaction",
         SYS_SIGPROCMASK => "sigprocmask",
         SYS_GETRANDOM => "getrandom",
+        SYS_SIGALTSTACK => "sigaltstack",
         _ => "unknown",
     }
 }
@@ -371,7 +375,7 @@ pub fn name_for(num: u64) -> &'static str {
 // compiler.
 const _TABLE_SIZE_ASSERT: () = {
     const fn max_assigned() -> usize {
-        let n = SYS_GETRANDOM as usize;
+        let n = SYS_SIGALTSTACK as usize;
         // The table must be at least `n + 1` long so index `n` is in bounds.
         n + 1
     }
@@ -391,7 +395,7 @@ mod tests {
 
     #[test]
     fn extended_coreutils_syscalls_are_dense_and_named() {
-        assert_eq!(NUM_SYSCALLS, SYS_GETRANDOM as usize + 1);
+        assert_eq!(NUM_SYSCALLS, SYS_SIGALTSTACK as usize + 1);
         for (number, name) in [
             (SYS_KILL, "kill"),
             (SYS_MOUNT_RAMFS, "mount_ramfs"),
@@ -409,6 +413,7 @@ mod tests {
             (SYS_SIGACTION, "sigaction"),
             (SYS_SIGPROCMASK, "sigprocmask"),
             (SYS_GETRANDOM, "getrandom"),
+            (SYS_SIGALTSTACK, "sigaltstack"),
         ] {
             assert!(lookup(number).is_some());
             assert_eq!(name_for(number), name);

@@ -173,11 +173,29 @@ fn dispatch_synchronous_user_signal(
     ctx: &mut ExceptionContext,
     signal: crate::user::signal::Signal,
 ) -> bool {
+    dispatch_synchronous_user_signal_at(ctx, signal, ctx.rip)
+}
+
+fn dispatch_synchronous_user_signal_at(
+    ctx: &mut ExceptionContext,
+    signal: crate::user::signal::Signal,
+    fault_address: u64,
+) -> bool {
     if !ctx.came_from_user() {
         return false;
     }
     let outcome = crate::user::process::with_current_process(|process| {
-        let _ = crate::user::signal::deliver_signal(&process.signals, signal);
+        let _ = crate::user::signal::deliver_signal_with_info(
+            &process.signals,
+            signal,
+            xenith_abi::SigInfo {
+                signo: signal.as_number(),
+                code: xenith_abi::SI_KERNEL,
+                trapno: u32::from(ctx.vector_u8()),
+                address: fault_address,
+                ..xenith_abi::SigInfo::default()
+            },
+        );
         crate::user::signal::check_and_dispatch(&process.signals, ctx)
     });
     match outcome {
@@ -259,7 +277,12 @@ user_exc!(
     "#UD Invalid Opcode",
     crate::user::signal::Signal::Ill
 );
-exc!(device_not_available, "#NM Device Not Available");
+fn device_not_available(ctx: &ExceptionContext) {
+    if crate::sched::scheduler::materialize_current_fpu() {
+        return;
+    }
+    dump_and_panic(ctx, "#NM Device Not Available")
+}
 exc!(double_fault, "#DF Double Fault");
 exc!(
     coprocessor_overrun,
@@ -310,7 +333,11 @@ fn page_fault(ctx: &mut ExceptionContext) {
             "delivering SIGSEGV after user page fault at {fault_address:#018x} (error={:#x})",
             ctx.error_code
         );
-        if dispatch_synchronous_user_signal(ctx, crate::user::signal::Signal::Segv) {
+        if dispatch_synchronous_user_signal_at(
+            ctx,
+            crate::user::signal::Signal::Segv,
+            fault_address,
+        ) {
             return;
         }
     }

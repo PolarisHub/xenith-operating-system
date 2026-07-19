@@ -159,8 +159,13 @@ pub unsafe extern "sysv64" fn rust_syscall_dispatch(
     frame.set_normal_result(result);
 
     let mut return_context = frame.exception_context();
+    let restart = restart_context(number, result, context.user_ip);
     let outcome = crate::user::process::with_current_process(|process| {
-        crate::user::signal::check_and_dispatch(&process.signals, &mut return_context)
+        crate::user::signal::check_and_dispatch_with_restart(
+            &process.signals,
+            &mut return_context,
+            restart,
+        )
     });
     match outcome {
         Some(crate::user::signal::DispatchOutcome::HandlerEntered(_)) => {
@@ -175,6 +180,28 @@ pub unsafe extern "sysv64" fn rust_syscall_dispatch(
         }) => crate::user::process::exit_signal(sig),
         _ => RETURN_WITH_SYSRET,
     }
+}
+
+/// Construct a replay image only for operations whose implementation proves
+/// that `EINTR` means no data or state was transferred. Today that is the
+/// blocking `read` path; partial reads return their byte count and never enter
+/// this branch. `syscall` is exactly two bytes (`0f 05`), so replay resumes at
+/// `return_ip - 2` with RAX restored to the syscall number.
+fn restart_context(
+    number: u64,
+    result: i64,
+    return_ip: u64,
+) -> Option<crate::user::signal::RestartContext> {
+    if number != super::table::SYS_READ || result != Errno::Eintr.as_ret() {
+        return None;
+    }
+    let syscall_ip = return_ip.checked_sub(2)?;
+    (syscall_ip != 0 && syscall_ip <= crate::mm::r#virtual::USER_MAX).then_some(
+        crate::user::signal::RestartContext {
+            syscall_number: number,
+            syscall_ip,
+        },
+    )
 }
 
 const _: () = assert!(core::mem::size_of::<SyscallEntryFrame>() == 20 * 8);
@@ -235,5 +262,28 @@ mod tests {
         assert_eq!(frame.r11, 0x2222);
         assert_eq!(frame.return_ip, 0x401000);
         assert_eq!(frame.return_sp, 0x7fff_e000);
+    }
+
+    #[test]
+    fn only_empty_interrupted_reads_are_restartable() {
+        assert_eq!(
+            restart_context(
+                super::super::table::SYS_READ,
+                Errno::Eintr.as_ret(),
+                0x401002
+            ),
+            Some(crate::user::signal::RestartContext {
+                syscall_number: super::super::table::SYS_READ,
+                syscall_ip: 0x401000,
+            })
+        );
+        assert!(restart_context(
+            super::super::table::SYS_WRITE,
+            Errno::Eintr.as_ret(),
+            0x401002
+        )
+        .is_none());
+        assert!(restart_context(super::super::table::SYS_READ, 1, 0x401002).is_none());
+        assert!(restart_context(super::super::table::SYS_READ, Errno::Eintr.as_ret(), 1).is_none());
     }
 }

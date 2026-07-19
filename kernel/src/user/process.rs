@@ -18,7 +18,8 @@ use xenith_types::{Page, VirtAddr, PAGE_SIZE};
 use super::elf::{self, ElfError, UserPage};
 use super::ring3;
 use super::signal::{
-    deliver_signal, DefaultAction, DeliverOutcome, Signal, SignalAction, SignalState,
+    deliver_signal, deliver_signal_with_info, DefaultAction, DeliverOutcome, Signal, SignalAction,
+    SignalState,
 };
 use crate::arch::x86_64::instructions::read_cr3;
 use crate::fs::fd::FdTable;
@@ -903,15 +904,48 @@ pub fn signal(pid: ProcessId, signal: Signal) -> Result<DeliverOutcome, ProcessE
     Ok(apply_signal(process, signal))
 }
 
+/// Deliver a signal with an explicit stable `siginfo` source payload.
+pub fn signal_with_info(
+    pid: ProcessId,
+    signal: Signal,
+    info: xenith_abi::SigInfo,
+) -> Result<DeliverOutcome, ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(process) = table
+        .iter_mut()
+        .find(|process| process.pid == pid && !process.has_exited())
+    else {
+        return Err(ProcessError::NoSuchProcess(pid));
+    };
+    Ok(apply_signal_with_info(process, signal, Some(info)))
+}
+
 /// Deliver a signal to every live member of a process group.
 pub fn signal_group(process_group: ProcessId, signal: Signal) -> Result<usize, ProcessError> {
+    signal_group_inner(process_group, signal, None)
+}
+
+/// Group delivery variant used by `kill(2)` to preserve sender metadata.
+pub fn signal_group_with_info(
+    process_group: ProcessId,
+    signal: Signal,
+    info: xenith_abi::SigInfo,
+) -> Result<usize, ProcessError> {
+    signal_group_inner(process_group, signal, Some(info))
+}
+
+fn signal_group_inner(
+    process_group: ProcessId,
+    signal: Signal,
+    info: Option<xenith_abi::SigInfo>,
+) -> Result<usize, ProcessError> {
     let mut table = PROCESS_TABLE.lock();
     let mut delivered = 0usize;
     for process in table
         .iter_mut()
         .filter(|process| process.process_group == process_group && !process.has_exited())
     {
-        let _ = apply_signal(process, signal);
+        let _ = apply_signal_with_info(process, signal, info);
         delivered += 1;
     }
     if delivered == 0 {
@@ -922,6 +956,14 @@ pub fn signal_group(process_group: ProcessId, signal: Signal) -> Result<usize, P
 }
 
 fn apply_signal(process: &mut UserProcess, signal: Signal) -> DeliverOutcome {
+    apply_signal_with_info(process, signal, None)
+}
+
+fn apply_signal_with_info(
+    process: &mut UserProcess,
+    signal: Signal,
+    info: Option<xenith_abi::SigInfo>,
+) -> DeliverOutcome {
     let disposition = process.signals.disposition(signal);
     let uses_default = signal.is_uncatchable() || matches!(disposition, SignalAction::Default);
     if uses_default {
@@ -949,7 +991,10 @@ fn apply_signal(process: &mut UserProcess, signal: Signal) -> DeliverOutcome {
             DefaultAction::Ignore => {},
         }
     }
-    deliver_signal(&process.signals, signal)
+    info.map_or_else(
+        || deliver_signal(&process.signals, signal),
+        |info| deliver_signal_with_info(&process.signals, signal, info),
+    )
 }
 
 /// Park a stopped process at a syscall boundary and apply a pending default
@@ -1723,9 +1768,6 @@ mod vm_tests {
         assert!(valid_dynamic_range(MMAP_BASE, PAGE_SIZE));
         assert!(valid_dynamic_range(DYNAMIC_LIMIT - PAGE_SIZE, PAGE_SIZE));
         assert!(!valid_dynamic_range(DYNAMIC_LIMIT, PAGE_SIZE));
-        assert!(!valid_dynamic_range(
-            u64::MAX - (PAGE_SIZE - 1),
-            PAGE_SIZE
-        ));
+        assert!(!valid_dynamic_range(u64::MAX - (PAGE_SIZE - 1), PAGE_SIZE));
     }
 }

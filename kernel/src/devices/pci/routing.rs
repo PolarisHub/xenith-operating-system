@@ -31,6 +31,7 @@ struct ParentBridge {
 struct RoutingDatabase {
     routes: KVec<FirmwareRoute>,
     parents: [Option<ParentBridge>; 256],
+    ambiguous_parents: [bool; 256],
 }
 
 impl RoutingDatabase {
@@ -38,12 +39,14 @@ impl RoutingDatabase {
         Self {
             routes: KVec::new(),
             parents: [None; 256],
+            ambiguous_parents: [false; 256],
         }
     }
 
     fn clear(&mut self) {
         self.routes.clear();
         self.parents.fill(None);
+        self.ambiguous_parents.fill(false);
     }
 
     fn lookup(&self, bus: u8, device: u8, function: u8, pin: u8) -> Option<u32> {
@@ -154,13 +157,18 @@ fn discover_parent_bridges(database: &mut RoutingDatabase, devices: &[PciDevice]
             device: device.address.device(),
             function: device.address.function(),
         };
-        let slot = &mut database.parents[usize::from(secondary)];
+        let index = usize::from(secondary);
+        if database.ambiguous_parents[index] {
+            continue;
+        }
+        let slot = &mut database.parents[index];
         match *slot {
             None => *slot = Some(parent),
             Some(existing) if existing == parent => {},
             Some(_) => {
                 // Ambiguous firmware topology is unsafe to swizzle through.
                 *slot = None;
+                database.ambiguous_parents[index] = true;
             },
         }
     }
@@ -168,7 +176,10 @@ fn discover_parent_bridges(database: &mut RoutingDatabase, devices: &[PciDevice]
 
 fn secondary_bus(device: &PciDevice) -> Option<u8> {
     if device.base_class != PCI_BRIDGE_CLASS
-        || !matches!(device.header_kind, PciHeaderKind::Bridge)
+        || !matches!(
+            device.header_kind,
+            PciHeaderKind::Bridge | PciHeaderKind::CardBus
+        )
         || !matches!(device.subclass, 0x04 | 0x07 | 0x09)
     {
         return None;
@@ -194,10 +205,19 @@ enum TableError {
 
 fn table_bus(path: &str, devices: &[PciDevice]) -> Result<Option<u8>, TableError> {
     let prefixes = path_prefixes(path);
+    let mut root_index = None;
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if pci_root_bridge(prefix)? {
+            root_index = Some(index);
+        }
+    }
     let mut first_addressed = None;
     let mut addresses = KVec::new();
     for (index, prefix) in prefixes.iter().enumerate() {
         if let Some(address) = optional_integer(prefix, "_ADR")? {
+            if root_index.is_some_and(|root| index <= root) {
+                continue;
+            }
             first_addressed.get_or_insert(index);
             addresses.push((
                 index,
@@ -205,7 +225,9 @@ fn table_bus(path: &str, devices: &[PciDevice]) -> Result<Option<u8>, TableError
             ));
         }
     }
-    let anchor_end = first_addressed.unwrap_or(prefixes.len());
+    let anchor_end = root_index
+        .map(|index| index + 1)
+        .unwrap_or_else(|| first_addressed.unwrap_or(prefixes.len()));
     let mut segment = 0u16;
     let mut bus = 0u8;
     for prefix in &prefixes[..anchor_end] {
@@ -236,6 +258,28 @@ fn table_bus(path: &str, devices: &[PciDevice]) -> Result<Option<u8>, TableError
         bus = secondary;
     }
     Ok(Some(bus))
+}
+
+fn pci_root_bridge(prefix: &str) -> Result<bool, TableError> {
+    for name in ["_HID", "_CID"] {
+        let path = alloc::format!("{prefix}.{name}");
+        match crate::acpi::aml::evaluate(&path, &[]) {
+            Ok(value) if value_has_pci_root_id(&value) => return Ok(true),
+            Ok(_) | Err(AmlError::NotFound(_)) => {},
+            Err(error) => return Err(TableError::Aml(error)),
+        }
+    }
+    Ok(false)
+}
+
+fn value_has_pci_root_id(value: &AmlValue) -> bool {
+    match value {
+        AmlValue::String(value) => matches!(value.as_str(), "PNP0A03" | "PNP0A08"),
+        // AML EisaId encoding of PNP0A03 / PNP0A08 on little-endian hosts.
+        AmlValue::Integer(value) => matches!(*value, 0x030a_d041 | 0x080a_d041),
+        AmlValue::Package(values) => values.iter().any(value_has_pci_root_id),
+        _ => false,
+    }
 }
 
 fn path_prefixes(path: &str) -> KVec<String> {
@@ -394,6 +438,19 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn pci_root_ids_accept_strings_integers_and_compatible_packages() {
+        assert!(value_has_pci_root_id(&AmlValue::String(String::from(
+            "PNP0A08"
+        ))));
+        assert!(value_has_pci_root_id(&AmlValue::Integer(0x030a_d041)));
+        assert!(value_has_pci_root_id(&AmlValue::Package(alloc::vec![
+            AmlValue::String(String::from("PNP0C02")),
+            AmlValue::String(String::from("PNP0A03")),
+        ])));
+        assert!(!value_has_pci_root_id(&AmlValue::Integer(0)));
     }
 
     fn test_device(bus: u8, device: u8, function: u8, pin: u8) -> PciDevice {
