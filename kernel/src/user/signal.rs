@@ -810,7 +810,29 @@ pub enum DeliverOutcome {
 /// IRQ-safe spinlock, and the function performs no allocation and touches no
 /// per-CPU state beyond the lock.
 pub fn deliver_signal(state: &SignalState, sig: Signal) -> DeliverOutcome {
+    deliver_signal_with_info(
+        state,
+        sig,
+        xenith_abi::SigInfo {
+            signo: sig.as_number(),
+            code: xenith_abi::SI_KERNEL,
+            ..EMPTY_SIGINFO
+        },
+    )
+}
+
+/// Mark `sig` pending together with a stable source/fault payload.
+/// Standard signals retain the first payload until dispatch; real-time
+/// signals retain the most recent payload while their bounded count queues.
+pub fn deliver_signal_with_info(
+    state: &SignalState,
+    sig: Signal,
+    mut info: xenith_abi::SigInfo,
+) -> DeliverOutcome {
     let mut g = state.pending.lock();
+    info.signo = sig.as_number();
+    info.reserved = 0;
+    let info_index = (sig.as_number() - 1) as usize;
 
     if sig.is_realtime() {
         let idx = (sig.as_number() - RT_MIN) as usize;
@@ -823,12 +845,14 @@ pub fn deliver_signal(state: &SignalState, sig: Signal) -> DeliverOutcome {
             *slot
         };
         g.set.add(sig);
+        g.info[info_index] = info;
         DeliverOutcome::RealtimeQueued { count }
     } else {
         let was = g.set.add(sig);
         if was {
             DeliverOutcome::AlreadyPending
         } else {
+            g.info[info_index] = info;
             DeliverOutcome::NewlyPending
         }
     }
@@ -872,7 +896,11 @@ pub enum DispatchOutcome {
 /// recorded.
 fn select_deliverable<'a>(
     state: &'a SignalState,
-) -> Option<(Signal, SpinLockIRQGuard<'a, PendingState>)> {
+) -> Option<(
+    Signal,
+    xenith_abi::SigInfo,
+    SpinLockIRQGuard<'a, PendingState>,
+)> {
     let blocked = *state.blocked.lock();
     let g = state.pending.lock();
 
@@ -888,7 +916,8 @@ fn select_deliverable<'a>(
             // out if the disposition is `Ignore` and we want to clear rather
             // than re-pend. We hand back the guard; the caller consumes via
             // `consume_delivered`.
-            return Some((sig, g));
+            let info = g.info[(sig.as_number() - 1) as usize];
+            return Some((sig, info, g));
         }
     }
     None
@@ -909,6 +938,9 @@ fn consume_delivered(guard: &mut SpinLockIRQGuard<'_, PendingState>, sig: Signal
         }
     } else {
         guard.set.remove(sig);
+    }
+    if !guard.set.contains(sig) {
+        guard.info[(sig.as_number() - 1) as usize] = EMPTY_SIGINFO;
     }
 }
 
