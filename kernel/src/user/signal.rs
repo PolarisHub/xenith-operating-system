@@ -535,6 +535,54 @@ impl Default for SignalAction {
 // Per-process signal state
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct AltStack {
+    sp: u64,
+    size: u64,
+}
+
+impl AltStack {
+    #[inline]
+    const fn enabled(self) -> bool {
+        self.size != 0
+    }
+
+    #[inline]
+    fn contains(self, rsp: u64) -> bool {
+        self.enabled()
+            && self
+                .sp
+                .checked_add(self.size)
+                .is_some_and(|end| rsp >= self.sp && rsp < end)
+    }
+
+    fn wire(self, current_rsp: u64) -> xenith_abi::SigAltStack {
+        xenith_abi::SigAltStack {
+            sp: self.sp,
+            size: self.size,
+            flags: if !self.enabled() {
+                xenith_abi::SS_DISABLE
+            } else if self.contains(current_rsp) {
+                xenith_abi::SS_ONSTACK
+            } else {
+                0
+            },
+            reserved: 0,
+        }
+    }
+}
+
+/// Validation failure returned by [`SignalState::sigaltstack`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AltStackError {
+    /// Only zero and `SS_DISABLE` are accepted on install.
+    InvalidFlags,
+    /// The requested range was non-canonical, overflowed, or outside bounds.
+    InvalidRange,
+    /// POSIX forbids replacing/disabling the alternate stack while using it.
+    AlreadyOnStack,
+}
+
 /// The per-process signal state.
 ///
 /// Embedded in each `UserProcess` by composition. Three pieces of state are
@@ -567,6 +615,10 @@ pub struct SignalState {
     blocked: SpinLockIRQ<SignalMask>,
     /// One disposition per signal number, index `n - 1`.
     dispositions: SpinLock<[SignalAction; NSIG as usize]>,
+    /// Alternate signal stack. Xenith currently schedules one userspace
+    /// thread per process, so this process-owned slot is also the calling
+    /// thread's slot; fork copies it and exec disables it.
+    alt_stack: SpinLock<AltStack>,
 }
 
 /// Internal: the pending set plus the per-real-time-signal counts, guarded
@@ -579,6 +631,8 @@ struct PendingState {
     /// Queued delivery count for each real-time signal, indexed by
     /// `signal_number - RT_MIN`. Standard signals ignore this.
     rt_counts: [u16; RT_COUNT],
+    /// Stable payload retained for the next delivery of each signal number.
+    info: [xenith_abi::SigInfo; NSIG as usize],
 }
 
 impl SignalState {
@@ -591,9 +645,11 @@ impl SignalState {
             pending: SpinLockIRQ::new(PendingState {
                 set: SignalSet::empty(),
                 rt_counts: [0; RT_COUNT],
+                info: [EMPTY_SIGINFO; NSIG as usize],
             }),
             blocked: SpinLockIRQ::new(SignalMask::empty()),
             dispositions: SpinLock::new([SignalAction::Default; NSIG as usize]),
+            alt_stack: SpinLock::new(AltStack { sp: 0, size: 0 }),
         }
     }
 
@@ -630,6 +686,47 @@ impl SignalState {
         *self.blocked.lock()
     }
 
+    /// Install/disable/query the alternate stack for the calling userspace
+    /// thread. The old value is always computed before a successful update.
+    pub fn sigaltstack(
+        &self,
+        current_rsp: u64,
+        new: Option<xenith_abi::SigAltStack>,
+    ) -> Result<xenith_abi::SigAltStack, AltStackError> {
+        let mut slot = self.alt_stack.lock();
+        let old = slot.wire(current_rsp);
+        let Some(request) = new else { return Ok(old) };
+        if slot.contains(current_rsp) {
+            return Err(AltStackError::AlreadyOnStack);
+        }
+        if request.reserved != 0
+            || request.flags & !(xenith_abi::SS_DISABLE) != 0
+            || request.flags == xenith_abi::SS_ONSTACK
+        {
+            return Err(AltStackError::InvalidFlags);
+        }
+        if request.flags & xenith_abi::SS_DISABLE != 0 {
+            *slot = AltStack::default();
+            return Ok(old);
+        }
+        if request.size < xenith_abi::MINSIGSTKSZ
+            || request.size > xenith_abi::MAXSIGSTKSZ
+            || request.sp == 0
+            || request.sp > crate::mm::r#virtual::USER_MAX
+            || request
+                .sp
+                .checked_add(request.size)
+                .is_none_or(|end| end == 0 || end - 1 > crate::mm::r#virtual::USER_MAX)
+        {
+            return Err(AltStackError::InvalidRange);
+        }
+        *slot = AltStack {
+            sp: request.sp,
+            size: request.size,
+        };
+        Ok(old)
+    }
+
     /// Snapshot the state inherited across `fork`: dispositions and the
     /// blocked mask are copied, while pending deliveries start empty in the
     /// child as required by process creation semantics.
@@ -638,6 +735,7 @@ impl SignalState {
         let state = Self::new();
         *state.blocked.lock() = *self.blocked.lock();
         *state.dispositions.lock() = *self.dispositions.lock();
+        *state.alt_stack.lock() = *self.alt_stack.lock();
         state
     }
 
