@@ -16,9 +16,8 @@
 //! Xenith prefers x2APIC whenever the CPU advertises it: it removes the
 //! 255-CPU ceiling, avoids an early MMIO map, and is the only mode KVM and
 //! modern firmware expose by default. When x2APIC is unavailable the driver
-//! logs a warning and leaves the LAPIC disabled — the legacy xAPIC MMIO
-//! bring-up depends on the `mm` subsystem to map the `0xFEE0_0000` window
-//! and is wired up by a later phase.
+//! logs a warning and leaves the LAPIC disabled; legacy xAPIC MMIO mode is a
+//! deliberately unsupported boundary of this driver.
 //!
 //! # MSR address derivation
 //!
@@ -31,8 +30,8 @@
 //!
 //! # Bring-up sequence
 //!
-//! [`init`] runs once per CPU (the BSP via [`super::init`], APs via their
-//! own bring-up path in a later phase) and performs:
+//! [`init`] runs once per CPU (the BSP during normal boot and APs from the SMP
+//! entry path) and performs:
 //!
 //! 1. Detect x2APIC via CPUID.01H:ECX[21] and read `IA32_APIC_BASE`
 //!    (MSR `0x1B`) to confirm the APIC is present.
@@ -44,13 +43,13 @@
 //!    SVR is enabled the LAPIC silently drops every interrupt.
 //! 4. Mask and vector every LVT entry: the timer, LINT0, LINT1, and the
 //!    error register. Masking here prevents a spurious LVT interrupt from
-//!    firing before its handler is wired up; a later phase unmasks the
-//!    timer once the tick handler is installed.
+//!    firing before its handler is wired up; scheduler timer setup later
+//!    installs the gate and unmasks the timer.
 //! 5. Clear the Error Status Register (ESR) so any stale firmware error
 //!    bits do not trigger an immediate error interrupt once that LVT entry
 //!    is unmasked.
-//! 6. Park the timer (zero initial count, divide-by-1) so it does not run
-//!    until a later phase arms it.
+//! 6. Park the timer (zero initial count, divide-by-1) until the scheduler
+//!    timer setup arms it.
 //!
 //! After [`init`] returns, [`send_eoi`] and [`send_ipi`] are usable on the
 //! calling CPU. Maskable IRQs are still off at this point; `sti` happens
@@ -352,9 +351,8 @@ bitflags! {
 /// The LAPIC operating mode detected by [`LocalApic::init`].
 ///
 /// Stored as a `u8` inside an [`AtomicU8`] so the static [`LAPIC`] can be
-/// read without a lock; the BSP is the only writer during boot. When the
-/// SMP phase lands this becomes per-CPU state — each CPU enables its own
-/// x2APIC — at which point it migrates onto the `PerCpu` control block.
+/// read without a lock. Every online CPU runs the same capability check and
+/// publishes the selected backend while enabling its own x2APIC MSRs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ApicMode {
@@ -835,16 +833,15 @@ impl core::fmt::Debug for LocalApic {
 ///
 /// A single static serves the BSP and every AP: because x2APIC register
 /// access is through per-CPU MSRs, the same handle reached from any CPU
-/// drives *that* CPU's LAPIC. The `mode` field is the only shared state,
-/// and it migrates onto per-CPU storage when the SMP/PerCpu phase lands.
+/// drives *that* CPU's LAPIC. The shared `mode` records the driver backend;
+/// the register state itself remains CPU-local hardware state.
 pub static LAPIC: LocalApic = LocalApic::new();
 
 /// Bring up the local APIC on the current CPU.
 ///
-/// Thin wrapper around [`LAPIC.init`](LocalApic::init) so the boot sequence
-/// in [`super::init`] keeps calling `apic::init()` unchanged from the stub
-/// era. Runs with interrupts disabled (the caller has not executed `sti`
-/// yet) and is safe to call from any ring-0 CPU context.
+/// Thin wrapper around [`LAPIC.init`](LocalApic::init). Runs with interrupts
+/// disabled during BSP and AP bring-up and is safe to call from any ring-0
+/// CPU context.
 pub fn init() {
     LAPIC.init();
 }

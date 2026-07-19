@@ -255,6 +255,7 @@ version = "0.1.0"
 dependencies = [
  "limine",
  "xenith-boot-common",
+ "xenith-iso",
  "xenith-x86",
 ]
 

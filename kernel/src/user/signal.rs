@@ -54,9 +54,8 @@ use crate::sync::{SpinLock, SpinLockIRQ, SpinLockIRQGuard};
 /// 1..=31 range; numbers above this are real-time signals.
 pub const NSIG_STANDARD: u32 = 31;
 
-/// Lowest real-time signal number. Real-time signals carry a queued count
-/// rather than a single pending bit, so multiple deliveries are coalesced
-/// into a count rather than collapsed to "pending".
+/// Lowest real-time signal number. Unlike standard signals, every real-time
+/// delivery retains its own queued [`xenith_abi::SigInfo`] payload.
 pub const RT_MIN: u32 = 32;
 
 /// Highest real-time signal number. The full 1..=63 range occupies bits 1..63
@@ -66,8 +65,15 @@ pub const RT_MAX: u32 = 63;
 /// Total number of signals the kernel tracks, inclusive: 1..=63.
 pub const NSIG: u32 = RT_MAX;
 
-/// Number of real-time signal slots (for the per-signal queued-count array).
+/// Number of distinct real-time signal numbers.
 const RT_COUNT: usize = (RT_MAX - RT_MIN + 1) as usize;
+
+/// Hard per-process limit across all pending real-time signal deliveries.
+///
+/// The queue is embedded in [`SignalState`], so delivery remains allocation
+/// free and safe from interrupt context. Standard signals do not consume this
+/// capacity because they retain their existing one-bit coalescing semantics.
+pub const REALTIME_QUEUE_CAPACITY: usize = RT_COUNT * 4;
 
 /// The syscall number the signal trampoline issues to request
 /// [`sigreturn`]. This is derived from the canonical shared ABI enum so the
@@ -598,18 +604,16 @@ pub enum AltStackError {
 /// * `dispositions` — one [`SignalAction`] per signal number, indexed by
 ///   `signal_number - 1`. Guarded by a plain [`SpinLock`] because dispositions
 ///   are only ever touched in process context via the `sigaction` syscall.
-/// * `rt_counts` — per-real-time-signal queued count. A standard signal is
-///   either pending or not (one bit); a real-time signal carries a count so
-///   repeated deliveries are not collapsed. Lives under the `pending` lock so
-///   that `deliver_signal` atomically "increment count + set bit" and
-///   `check_and_dispatch` atomically "decrement count + maybe clear bit".
+/// * The bounded real-time queue lives under `pending`, so every accepted
+///   delivery retains its own payload and enqueue/select/consume are atomic
+///   with respect to one another.
 ///
 /// The lock splitting (three locks) keeps the hot delivery path — take
 /// `pending`, set a bit, release — from contending with `sigaction` calls
 /// that only touch `dispositions`.
 pub struct SignalState {
-    /// Pending signal set + real-time queued counts, taken together under one
-    /// IRQ-safe lock so the "set bit / bump count" pair is atomic.
+    /// Pending standard-signal set + bounded real-time queue, taken together
+    /// under one IRQ-safe lock.
     pending: SpinLockIRQ<PendingState>,
     /// The blocked-signal mask.
     blocked: SpinLockIRQ<SignalMask>,
@@ -621,26 +625,94 @@ pub struct SignalState {
     alt_stack: SpinLock<AltStack>,
 }
 
-/// Internal: the pending set plus the per-real-time-signal counts, guarded
-/// together by `pending` so that a real-time delivery is atomic with respect
-/// to a concurrent dispatch.
+/// One queued real-time delivery and its stable payload.
+#[derive(Debug, Clone, Copy)]
+struct RealtimePending {
+    signal: Signal,
+    info: xenith_abi::SigInfo,
+}
+
+/// Internal pending state, guarded as one unit so real-time enqueue, selection,
+/// and consumption are atomic with respect to concurrent dispatch.
 #[derive(Debug)]
 struct PendingState {
     /// The pending bitmask.
     set: SignalSet,
-    /// Queued delivery count for each real-time signal, indexed by
-    /// `signal_number - RT_MIN`. Standard signals ignore this.
-    rt_counts: [u16; RT_COUNT],
-    /// Stable payload retained for the next delivery of each signal number.
-    info: [xenith_abi::SigInfo; NSIG as usize],
+    /// Arrival-ordered real-time deliveries. Selection still prioritizes the
+    /// lowest deliverable signal number, then the oldest matching entry.
+    realtime: [Option<RealtimePending>; REALTIME_QUEUE_CAPACITY],
+    /// Number of occupied entries at the start of `realtime`.
+    realtime_len: usize,
+    /// Stable first payload retained for each coalesced standard signal.
+    standard_info: [xenith_abi::SigInfo; NSIG as usize],
 }
 
 impl Default for PendingState {
     fn default() -> Self {
         Self {
             set: SignalSet::empty(),
-            rt_counts: [0; RT_COUNT],
-            info: [EMPTY_SIGINFO; NSIG as usize],
+            realtime: [None; REALTIME_QUEUE_CAPACITY],
+            realtime_len: 0,
+            standard_info: [EMPTY_SIGINFO; NSIG as usize],
+        }
+    }
+}
+
+impl PendingState {
+    /// Append one real-time delivery, returning its per-signal queue depth.
+    fn enqueue_realtime(
+        &mut self,
+        signal: Signal,
+        info: xenith_abi::SigInfo,
+    ) -> Option<u16> {
+        debug_assert!(signal.is_realtime());
+        if self.realtime_len == REALTIME_QUEUE_CAPACITY {
+            return None;
+        }
+
+        let count = self.realtime[..self.realtime_len]
+            .iter()
+            .flatten()
+            .filter(|pending| pending.signal == signal)
+            .count()
+            + 1;
+        self.realtime[self.realtime_len] = Some(RealtimePending { signal, info });
+        self.realtime_len += 1;
+        self.set.add(signal);
+        Some(count as u16)
+    }
+
+    /// Oldest queued payload for one real-time signal.
+    fn first_realtime_info(&self, signal: Signal) -> Option<xenith_abi::SigInfo> {
+        self.realtime[..self.realtime_len]
+            .iter()
+            .flatten()
+            .find(|pending| pending.signal == signal)
+            .map(|pending| pending.info)
+    }
+
+    /// Remove the oldest queued instance of one real-time signal.
+    fn consume_realtime(&mut self, signal: Signal) {
+        let Some(remove_at) = self.realtime[..self.realtime_len]
+            .iter()
+            .position(|entry| entry.is_some_and(|pending| pending.signal == signal))
+        else {
+            debug_assert!(false, "pending real-time bit has no queued payload");
+            self.set.remove(signal);
+            return;
+        };
+
+        for index in remove_at..self.realtime_len - 1 {
+            self.realtime[index] = self.realtime[index + 1];
+        }
+        self.realtime_len -= 1;
+        self.realtime[self.realtime_len] = None;
+        if !self.realtime[..self.realtime_len]
+            .iter()
+            .flatten()
+            .any(|pending| pending.signal == signal)
+        {
+            self.set.remove(signal);
         }
     }
 }
@@ -654,8 +726,9 @@ impl SignalState {
         Self {
             pending: SpinLockIRQ::new(PendingState {
                 set: SignalSet::empty(),
-                rt_counts: [0; RT_COUNT],
-                info: [EMPTY_SIGINFO; NSIG as usize],
+                realtime: [None; REALTIME_QUEUE_CAPACITY],
+                realtime_len: 0,
+                standard_info: [EMPTY_SIGINFO; NSIG as usize],
             }),
             blocked: SpinLockIRQ::new(SignalMask::empty()),
             dispositions: SpinLock::new([SignalAction::Default; NSIG as usize]),
@@ -749,13 +822,21 @@ impl SignalState {
         state
     }
 
-    /// Build the signal state for a successful `exec`.  The blocked mask and
-    /// ignored dispositions survive; caught handlers are reset because their
-    /// code addresses belonged to the old image. Pending signals are cleared.
+    /// Build the signal state for a successful `exec`. The blocked mask,
+    /// pending deliveries, and ignored dispositions survive; caught handlers
+    /// are reset because their code addresses belonged to the old image.
     #[must_use]
     pub fn clone_for_exec(&self) -> Self {
         let state = Self::new();
         *state.blocked.lock() = *self.blocked.lock();
+        {
+            let old_pending = self.pending.lock();
+            let mut new_pending = state.pending.lock();
+            new_pending.set = old_pending.set;
+            new_pending.realtime = old_pending.realtime;
+            new_pending.realtime_len = old_pending.realtime_len;
+            new_pending.standard_info = old_pending.standard_info;
+        }
         let old = self.dispositions.lock();
         let mut new = state.dispositions.lock();
         for (destination, source) in new.iter_mut().zip(old.iter()) {
@@ -780,8 +861,8 @@ impl Default for SignalState {
 // Delivery: mark a signal pending
 // ---------------------------------------------------------------------------
 
-/// Result of [`deliver_signal`]: did the delivery record a *new* pending
-/// signal, or just bump an existing real-time count, or was it a no-op?
+/// Result of [`deliver_signal`]: whether delivery was accepted, coalesced, or
+/// rejected because the bounded real-time queue was full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliverOutcome {
     /// A standard signal was newly marked pending (bit was previously clear).
@@ -789,12 +870,17 @@ pub enum DeliverOutcome {
     /// A standard signal was already pending; the second delivery is a no-op
     /// (POSIX coalesces standard signals).
     AlreadyPending,
-    /// A real-time signal's queued count was incremented. The count after the
-    /// increment is returned so the caller can detect overflow.
+    /// A real-time delivery and its payload were queued. `count` is the queue
+    /// depth for this signal number after the enqueue.
     RealtimeQueued {
-        /// The queued count after this delivery. Saturates at `u16::MAX`; a
-        /// caller that cares about overflow can compare against the limit.
+        /// Per-signal queue depth after this delivery.
         count: u16,
+    },
+    /// The process-wide real-time queue was already full. No pending state or
+    /// payload was changed.
+    RealtimeQueueFull {
+        /// The fixed process-wide queue capacity.
+        capacity: usize,
     },
     /// `sig` was out of range or otherwise not recorded.
     Invalid,
@@ -809,9 +895,9 @@ pub enum DeliverOutcome {
 /// process has blocked is legal — the bit is set; the signal simply waits in
 /// `pending` until unblocked.
 ///
-/// Real-time signals increment a per-signal count (up to `u16::MAX`); standard
-/// signals coalesce (a second delivery while the first is still pending is a
-/// no-op). [`Signal::Kill`] and [`Signal::Stop`] are always recorded even if
+/// Real-time signals preserve one payload per delivery up to
+/// [`REALTIME_QUEUE_CAPACITY`] total entries per process. Standard signals
+/// coalesce. [`Signal::Kill`] and [`Signal::Stop`] are always recorded even if
 /// blocked — their default action is unblockable.
 ///
 /// # Safety of calling context
@@ -827,9 +913,9 @@ pub fn deliver_signal(state: &SignalState, sig: Signal) -> DeliverOutcome {
     })
 }
 
-/// Mark `sig` pending together with a stable source/fault payload.
-/// Standard signals retain the first payload until dispatch; real-time
-/// signals retain the most recent payload while their bounded count queues.
+/// Mark `sig` pending together with a stable source/fault payload. Standard
+/// signals retain the first payload until dispatch; real-time signals retain
+/// every accepted payload in arrival order.
 pub fn deliver_signal_with_info(
     state: &SignalState,
     sig: Signal,
@@ -838,27 +924,20 @@ pub fn deliver_signal_with_info(
     let mut g = state.pending.lock();
     info.signo = sig.as_number();
     info.reserved = 0;
-    let info_index = (sig.as_number() - 1) as usize;
 
     if sig.is_realtime() {
-        let idx = (sig.as_number() - RT_MIN) as usize;
-        let count = {
-            let slot = &mut g.rt_counts[idx];
-            // Saturate: a real-time signal with a full queue keeps the bit set and
-            // the count at MAX, matching POSIX's "at least one delivery is
-            // recorded" guarantee without overflowing the u16.
-            *slot = slot.saturating_add(1);
-            *slot
-        };
-        g.set.add(sig);
-        g.info[info_index] = info;
-        DeliverOutcome::RealtimeQueued { count }
+        match g.enqueue_realtime(sig, info) {
+            Some(count) => DeliverOutcome::RealtimeQueued { count },
+            None => DeliverOutcome::RealtimeQueueFull {
+                capacity: REALTIME_QUEUE_CAPACITY,
+            },
+        }
     } else {
         let was = g.set.add(sig);
         if was {
             DeliverOutcome::AlreadyPending
         } else {
-            g.info[info_index] = info;
+            g.standard_info[(sig.as_number() - 1) as usize] = info;
             DeliverOutcome::NewlyPending
         }
     }
@@ -931,31 +1010,28 @@ fn select_deliverable<'a>(
             // out if the disposition is `Ignore` and we want to clear rather
             // than re-pend. We hand back the guard; the caller consumes via
             // `consume_delivered`.
-            let info = g.info[(sig.as_number() - 1) as usize];
+            let info = if sig.is_realtime() {
+                let Some(info) = g.first_realtime_info(sig) else {
+                    debug_assert!(false, "pending real-time bit has no queued payload");
+                    continue;
+                };
+                info
+            } else {
+                g.standard_info[(sig.as_number() - 1) as usize]
+            };
             return Some((sig, info, g));
         }
     }
     None
 }
 
-/// Consume `sig` from the pending state held by `guard`: clear the bit, and
-/// for real-time signals decrement the count (clearing the bit only when the
-/// count reaches zero).
+/// Consume one instance of `sig` from the pending state held by `guard`.
 fn consume_delivered(guard: &mut SpinLockIRQGuard<'_, PendingState>, sig: Signal) {
     if sig.is_realtime() {
-        let idx = (sig.as_number() - RT_MIN) as usize;
-        let slot = &mut guard.rt_counts[idx];
-        if *slot > 0 {
-            *slot -= 1;
-        }
-        if *slot == 0 {
-            guard.set.remove(sig);
-        }
+        guard.consume_realtime(sig);
     } else {
         guard.set.remove(sig);
-    }
-    if !guard.set.contains(sig) {
-        guard.info[(sig.as_number() - 1) as usize] = EMPTY_SIGINFO;
+        guard.standard_info[(sig.as_number() - 1) as usize] = EMPTY_SIGINFO;
     }
 }
 

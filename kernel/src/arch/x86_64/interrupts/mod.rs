@@ -9,29 +9,30 @@
 //!   interrupts/
 //!     exceptions.rs  — ExceptionContext + per-vector Rust handlers + dispatch
 //!     handlers.rs    — dump_and_panic: shared terminal policy
-//!     apic.rs        — local APIC (stub, replaced by the apic phase)
-//!     ioapic.rs      — I/O APIC  (stub, replaced by the devices phase)
-//!     pic.rs         — 8259 PIC   (stub, replaced by the devices phase)
+//!     apic.rs        — per-CPU x2APIC setup, timer, EOI, and IPI delivery
+//!     ioapic.rs      — ACPI discovery and device-IRQ redirection
+//!     pic.rs         — legacy 8259 remap and quiescing
 //! ```
 //!
 //! # Bring-up order
 //!
-//! [`init`] runs *after* the GDT and TSS are loaded (the IDT's gates
-//! reference [`super::gdt::KERNEL_CODE_SELECTOR`], and IST indices — once
-//! any are used — point at TSS stacks) and *before* interrupts are
-//! enabled. It:
+//! Descriptor-table setup runs after the GDT and TSS are loaded (the IDT's
+//! gates reference [`super::gdt::KERNEL_CODE_SELECTOR`] and critical gates
+//! select TSS IST stacks) and before interrupts are enabled. The normal BSP
+//! boot loads exception gates during architecture initialization, then brings
+//! up the controllers after ACPI discovery. The aggregate [`init`] helper
+//! performs both parts in one call for an already-discovered platform:
 //!
 //! 1. Installs the 32 CPU-exception gates into the static IDT
 //!    ([`super::idt::install_exception_handlers`]).
 //! 2. Loads the IDT into the CPU ([`super::idt::load`]).
-//! 3. Defers to the controller submodules' own `init`s. Today these are
-//!    no-ops; the apic phase will wire the local APIC and mask the legacy
-//!    PIC, and the devices phase will route IRQs through the I/O APIC.
+//! 3. Remaps and masks the legacy PIC, enables the local x2APIC, and discovers
+//!    and masks the I/O APIC redirection tables.
 //!
-//! After [`init`] returns, a CPU exception is delivered to a real Rust
-//! handler instead of triple-faulting the machine. Maskable IRQs are still
-//! off at this point — the local APIC init and `sti` happen later in the
-//! boot sequence (see [`crate::init`]).
+//! After controller initialization, exceptions and installed IRQ vectors have
+//! live dispatch paths. Device routes remain masked until their drivers claim
+//! them, and `sti` happens only after scheduler/device setup (see
+//! [`crate::init`]).
 
 pub mod apic;
 pub mod exceptions;
@@ -39,10 +40,8 @@ pub mod handlers;
 pub mod ioapic;
 pub mod pic;
 
-// Re-export the controller `init` entry points so the boot sequence and
-// later phases can reach them without naming the submodule. Each is a
-// no-op today; replacing the stub body with the real bring-up does not
-// change the call site.
+// Re-export controller entry points for callers that prefer the aggregate
+// interrupt namespace.
 pub use apic::init as init_apic;
 pub use ioapic::init as init_ioapic;
 pub use pic::init as init_pic;
@@ -93,10 +92,10 @@ pub extern "sysv64" fn rust_timer_interrupt(context: &mut exceptions::ExceptionC
 ///
 /// # Safety of calling
 ///
-/// Safe to call exactly once on the BSP, after the GDT has been loaded
-/// (so [`super::gdt::KERNEL_CODE_SELECTOR`] resolves) and before
-/// `EFLAGS.IF` is set. Calling it on an AP before the BSP has run it is
-/// harmless but the AP's own per-CPU tables are a later-phase concern.
+/// Safe to call exactly once on the BSP, after the GDT/TSS and platform ACPI
+/// data have been published (so the code selector and I/O APIC topology are
+/// valid) and before `EFLAGS.IF` is set. APs load the shared IDT and initialize
+/// only their CPU-local LAPIC in the SMP entry path.
 pub fn init() {
     // 1. Fill vectors 0..31 with present interrupt-gate descriptors
     //    pointing at the matching asm exception stubs. The stubs normalise
@@ -109,10 +108,8 @@ pub fn init() {
     //    installed above are live.
     super::idt::load();
 
-    // 3. Controller bring-up. Each is a stub today (the apic and devices
-    //    phases replace the bodies). Kept here — and called unconditionally
-    //    — so the boot sequence does not change when the real controllers
-    //    land; a later phase only swaps a stub body for a real one.
+    // 3. Quiesce legacy delivery, initialize this CPU's LAPIC, then discover
+    //    and mask the platform I/O APICs ready for explicit device routes.
     init_pic();
     init_apic();
     init_ioapic();

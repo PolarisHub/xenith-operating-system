@@ -19,9 +19,10 @@ pub use disk::{
 pub use error::ImageError;
 pub use fat::{
     build_efi_system_partition, build_efi_system_partition_with_layout,
-    validate_efi_system_partition, EfiSystemPartitionLayout, EFI_SECTOR_SIZE,
-    EFI_SYSTEM_PARTITION_SECTORS,
+    extract_efi_system_partition_files, validate_efi_system_partition, EfiSystemPartitionFiles,
+    EfiSystemPartitionLayout, EFI_SECTOR_SIZE, EFI_SYSTEM_PARTITION_SECTORS,
 };
 pub use iso9660::{
-    build_iso_image, build_iso_image_with_layout, IsoConfig, IsoLayout, ISO_BLOCK_SIZE,
+    build_iso_image, build_iso_image_with_layout, extract_el_torito_boot_images,
+    ElToritoBootImages, IsoConfig, IsoLayout, ISO_BLOCK_SIZE,
 };

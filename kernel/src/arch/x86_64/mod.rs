@@ -15,16 +15,9 @@
 //!     percpu.rs      — per-CPU control block reached via GS_BASE
 //!     tss.rs         — Task State Segment(s) for IST + ring 3 stacks
 //!     fpu.rs         — CR0/CR4 EM/MP/OSFXSR enablement + xsave area size
-//!     interrupts.rs  — interrupt controller surface (8259PIC / LAPIC stubs)
+//!     interrupts.rs  — exception and interrupt-controller integration
 //!     asm/           — hand-written .S entry trampolines (built by cc::Build)
 //! ```
-//!
-//! Several of these files are filled in by later phases (`gdt`, `idt`, `tss`,
-//! `percpu`, `fpu`, `interrupts`, `asm`). This phase lands the leaf primitives
-//! (`port`, `instructions`, `msr`, `registers`) and the module root that wires
-//! them together. The not-yet-written modules are declared here so the public
-//! surface is fixed; their bodies grow over subsequent phases without callers
-//! changing their `use` paths.
 //!
 //! # Safety posture
 //!
@@ -68,10 +61,10 @@ pub use registers::{Cr0, Cr3, Cr4};
 
 /// Very early, allocation-free CPU setup.
 ///
-/// Runs before the console, the log backend, or any allocator is available —
-/// in the binary `_start` prologue, before [`crate::init`] is called. The
-/// work done here is restricted to what *must* happen before any Rust code
-/// can safely touch CPU state:
+/// Runs at the start of architecture bring-up, before descriptor tables and
+/// the per-CPU area are installed. The work here is allocation-free so the AP
+/// bootstrap can apply the same register policy before joining normal kernel
+/// execution:
 ///
 /// * Confirm we are in long mode (EFER.LME), enable EFER.NXE, and confirm
 ///   that paging is on (CR0.PG). Limine performs the transition for the BSP,
@@ -81,24 +74,21 @@ pub use registers::{Cr0, Cr3, Cr4};
 /// * Clear CR0.EM and set CR0.MP so x87/MMX/SSE instructions do not trap, and
 ///   set CR4.OSFXSR + CR4.OSXMMEXCPT so SSE/SSE2 are usable in ring 0 and
 ///   SIMD exceptions go to a dedicated vector rather than #GP.
-/// * Enable the `rdrand` / `rdseed` CPU feature bits if present (no-op on
-///   parts that lack them) so the entropy pool can use them later.
 ///
-/// Everything that needs tables (GDT, IDT, TSS) or a per-CPU area is deferred
-/// to [`init`], which runs after the console is up and can report failures.
+/// Everything that needs tables (GDT, IDT, TSS) or a per-CPU area is sequenced
+/// by [`init`] after this register setup.
 ///
 /// # Safety
 ///
-/// Must be called exactly once on the BSP, in ring 0, before any other code
-/// in this module touches control registers or MSRs. Calling it on an AP
-/// before the BSP has run it is harmless (the bits are idempotent) but the
-/// AP bring-up path in a later phase will invoke it again under its own
-/// per-CPU state.
+/// Must be called in ring 0 once on each CPU before that CPU enables the FPU,
+/// user execution, or interrupts. The BSP reaches it through [`init`]; the AP
+/// bootstrap invokes it before installing CPU-local state. Its register
+/// updates are idempotent.
 pub fn early_init() {
     // All work is done through the safe wrappers in `instructions` and
     // `registers`; each of those encapsulates its own unsafe asm. We keep
-    // `early_init` itself safe because the invariants (ring 0, single BSP
-    // call, post-Limine handoff) are established by the boot contract, not
+    // `early_init` itself safe because the invariants (ring 0, one bring-up
+    // call per CPU, post-loader handoff) are established by the boot contract, not
     // by something the caller can check at runtime.
 
     // Long-mode + paging sanity. EFER.LME bit 8 is "IA-32e mode enable";
@@ -184,21 +174,6 @@ pub fn early_init() {
         unsafe { cr4.write() };
     }
     usercopy::set_smap_enabled(has_smap);
-
-    // Best-effort CPUID probe for RDRAND / RDSEED. Unlike SSE these are CPUID
-    // features, not CR bits; there is no "enable" bit — the instructions are
-    // either present or they #UD. We probe once here so the entropy path
-    // later can short-circuit without re-running CPUID on every draw. The
-    // result is intentionally discarded at this phase; the entropy module
-    // will re-probe when it is wired up.
-    //
-    // SAFETY: cpuid is a non-privileged instruction; leaf 1 is defined on
-    // every x86_64 part. The `unsafe` here is surface-uniformity only.
-    let feat = unsafe { cpuid(1) };
-    // ECX bit 30 = RDRAND, EBX bit 18 = RDSEED (leaf 1, subleaf 0). RDSEED
-    // is actually reported in EBX bit 18 only on leaf 7 subleaf 0; we read
-    // leaf 1 here for the RDRAND bit and treat RDSEED as "probe later".
-    let _has_rdrand = (feat.ecx >> 30) & 1 == 1;
 }
 
 /// Full architecture bring-up.
@@ -213,19 +188,17 @@ pub fn early_init() {
 /// submodules; this function only sequences them. Each submodule's `init`
 /// is responsible for its own error reporting through the `log` facade.
 pub fn init(_boot_info: &'static limine::BootInfo) {
-    // Re-run the early register manipulation. On the BSP this is redundant
-    // with early_init() but harmless; on APs (future phase) init() is the
-    // first arch call, so the bits must be set here too. Idempotent by design.
+    // Establish the architectural register prerequisites before loading any
+    // CPU table that depends on them. APs use their dedicated SMP sequence.
     early_init();
 
-    // The real bring-up steps are stubs for now — later phases fill them in:
-    //   gdt::init();        // load the GDT + kernel/user segment selectors
-    //   tss::init();        // allocate a TSS + IST stacks for the BSP
-    //   idt::init();        // build the IDT + install handlers
-    //   percpu::init_bsp(); // set up the BSP's per-CPU block + GS_BASE
-    //   fpu::init();        // finalize FPU/SSE + measure xsave area
-    //
-    // Each is gated behind its own submodule so this function stays a flat
-    // sequence; we deliberately do not bury init logic inside early_init.
-    ::log::debug!("xenith.arch: early_init done, full init pending later phases");
+    // Configure the BSP's critical-fault IST before loading TR. RSP0 remains
+    // zero until the scheduler selects a task with a real kernel stack.
+    tss::init_bsp(0);
+    percpu::init_for_bsp();
+    fpu::init();
+    idt::install_exception_handlers();
+    idt::load();
+
+    ::log::info!("arch: descriptor tables and CPU state ready");
 }

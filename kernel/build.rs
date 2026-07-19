@@ -1,8 +1,8 @@
 //! Prepare hand-written assembly for Rust's integrated assembler.
 //!
 //! `global_asm!` keeps kernel builds self-contained on hosts without a C
-//! compiler. The legacy sources only need simple constant definitions and
-//! conditional blocks, handled here before Rust compiles the crate.
+//! compiler. The sources only need simple constant definitions, handled here
+//! before Rust compiles the crate.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,7 +58,6 @@ fn collect_asm_files(dir: &Path) -> Vec<PathBuf> {
 
 fn preprocess(source: &str, target_msvc: bool) -> String {
     let mut output = String::new();
-    let mut enabled = vec![true];
 
     for line in source.lines() {
         let directive = line.trim_start();
@@ -70,42 +69,22 @@ fn preprocess(source: &str, target_msvc: bool) -> String {
             continue;
         }
         if let Some(rest) = directive.strip_prefix("#define ") {
-            if enabled.iter().all(|state| *state) {
-                let mut fields = rest.split_whitespace();
-                let name = fields.next().expect("#define without a name");
-                let value = fields.collect::<Vec<_>>().join(" ");
-                output.push_str(".equ ");
-                output.push_str(name);
-                output.push_str(", ");
-                output.push_str(&value);
-                output.push('\n');
-            }
-            continue;
-        }
-        if let Some(symbol) = directive.strip_prefix("#ifdef ") {
-            let defined = std::env::var_os(format!("CARGO_FEATURE_{}", symbol.trim())).is_some();
-            enabled.push(defined);
-            continue;
-        }
-        if directive.starts_with("#else") {
-            let current = enabled.last_mut().expect("#else without #ifdef");
-            *current = !*current;
-            continue;
-        }
-        if directive.starts_with("#endif") {
-            assert!(enabled.len() > 1, "#endif without #ifdef");
-            enabled.pop();
+            let mut fields = rest.split_whitespace();
+            let name = fields.next().expect("#define without a name");
+            let value = fields.collect::<Vec<_>>().join(" ");
+            output.push_str(".equ ");
+            output.push_str(name);
+            output.push_str(", ");
+            output.push_str(&value);
+            output.push('\n');
             continue;
         }
         if directive.starts_with("#include ") {
             panic!("assembly #include is not supported: {directive}");
         }
-        if enabled.iter().all(|state| *state) {
-            output.push_str(line);
-            output.push('\n');
-        }
+        output.push_str(line);
+        output.push('\n');
     }
 
-    assert_eq!(enabled.len(), 1, "unterminated assembly #ifdef");
     output
 }

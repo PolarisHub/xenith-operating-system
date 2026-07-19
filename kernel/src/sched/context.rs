@@ -24,28 +24,23 @@
 //!
 //! # FPU / SIMD state
 //!
-//! Each [`Context`] carries a 512-byte [`fxsave_area`] for the task's x87 /
-//! SSE state. By default the switch path does *not* touch it: the kernel uses
-//! lazy FPU save/restore (CR0.TS plus a `#NM` handler in a later phase) so a
-//! task that never touches the FPU pays nothing. The eager path —
-//! `fxsave` on the way out, `fxrstor` on the way in — can be compiled into the
-//! switch stub by enabling the `XENITH_CTX_FPU` preprocessor flag in
-//! `build.rs`; when enabled, the area must be 16-byte aligned (it is — see
-//! [`Context`] layout below) or `fxsave`/`fxrstor` `#GP`.
+//! FPU/SIMD state deliberately does not live in this integer context. The
+//! scheduler's [`TaskNode`](super::scheduler::TaskNode) owns a feature-sized
+//! [`FpuSaveArea`](crate::arch::x86_64::fpu::FpuSaveArea) and exchanges it
+//! before invoking the assembly stack/register switch. This keeps XSAVE size
+//! and alignment policy in the architecture FPU module.
 //!
 //! # Layout contract with the assembly
 //!
 //! [`Context`] is `#[repr(C, align(16))]` and its field order is load-bearing:
 //! the context-switch stub addresses every field by a fixed byte offset, so
-//! reordering the fields or removing the alignment pad breaks the switch. The
-//! offset constants in [`offsets`] are checked against
+//! reordering the fields breaks the switch. The offset constants in
+//! [`offsets`] are checked against
 //! [`core::mem::offset_of`] at compile time (see the `const` assertion at the
 //! bottom of this file), so a Rust-side edit that drifts from the assembly's
 //! `#define`s fails the build rather than corrupting registers at runtime.
 //! When changing the layout, update both this struct and the `CTX_*` offsets
 //! in `arch/x86_64/asm/context_switch.S` together.
-//!
-//! [`fxsave_area`]: Context::fxsave_area
 
 use core::fmt;
 use core::mem::offset_of;
@@ -53,17 +48,6 @@ use core::mem::offset_of;
 use xenith_types::VirtAddr;
 
 use crate::arch::x86_64::asm::context_switch;
-
-/// Size in bytes of the legacy FXSAVE image saved in [`Context::fxsave_area`].
-///
-/// `fxsave` (and `fxrstor`) always transfer exactly 512 bytes in legacy mode:
-/// the first 32 bytes are the x87 FPU/MMX state and the remainder is the
-/// XMM/SSE state plus reserved space. The XSAVE extended area is *not* covered
-/// by this size; a future phase that adopts `xsave`/`xsaveopt` with component
-/// bitmaps will grow the area and switch to a variable-length save, at which
-/// point this constant and the field become the "legacy region" of a larger
-/// block.
-pub const FXSAVE_AREA_SIZE: usize = 512;
 
 /// Byte offsets of each [`Context`] field, mirroring the `CTX_*` `#define`s in
 /// `arch/x86_64/asm/context_switch.S`.
@@ -91,12 +75,6 @@ pub mod offsets {
     pub const R14: usize = 40;
     /// Offset of [`Context::r15`](super::Context::r15).
     pub const R15: usize = 48;
-    /// Offset of [`Context::fxsave_area`](super::Context::fxsave_area).
-    ///
-    /// Placed at 64 (not 56) so it lands on a 16-byte boundary, which
-    /// `fxsave`/`fxrstor` require. The 8 bytes between `r15` and the area are
-    /// the `_pad` field below.
-    pub const FXSAVE_AREA: usize = 64;
 }
 
 /// Saved callee-saved register file and stack pointer for one task.
@@ -121,21 +99,11 @@ pub struct Context {
     pub r14: u64,
     /// Saved `r15` (callee-saved).
     pub r15: u64,
-    /// Alignment padding so [`fxsave_area`](Self::fxsave_area) lands on a
-    /// 16-byte boundary. Not read by the switch; exists solely for layout.
-    _pad: u64,
-    /// 512-byte FXSAVE image of the task's x87/SSE state. Touched by the
-    /// switch only when the `XENITH_CTX_FPU` flag is enabled in the assembly;
-    /// otherwise it is owned by the lazy-FPU `#NM` path.
-    pub fxsave_area: [u8; FXSAVE_AREA_SIZE],
 }
 
 // Compile-time layout contract: the named offsets above must agree with the
-// actual `#[repr(C)]` field positions, and the FXSAVE area must be 16-aligned
-// relative to the struct start (the struct itself is `align(16)`, so a
-// 16-aligned relative offset means every instance's `fxsave_area` is
-// 16-aligned in absolute terms as well). If any of these fail, the build
-// breaks before a runtime #GP can happen.
+// actual `#[repr(C)]` field positions. If any of these fail, the build breaks
+// before assembly can save or restore the wrong register slot.
 const _: () = {
     assert!(offset_of!(Context, rsp) == offsets::RSP);
     assert!(offset_of!(Context, rbx) == offsets::RBX);
@@ -144,8 +112,6 @@ const _: () = {
     assert!(offset_of!(Context, r13) == offsets::R13);
     assert!(offset_of!(Context, r14) == offsets::R14);
     assert!(offset_of!(Context, r15) == offsets::R15);
-    assert!(offset_of!(Context, fxsave_area) == offsets::FXSAVE_AREA);
-    assert!(offsets::FXSAVE_AREA.is_multiple_of(16));
 };
 
 impl Context {
@@ -156,8 +122,8 @@ impl Context {
     /// only ever *written* by the first `context_switch` call (which saves the
     /// then-current register state into it); its `rsp` of zero is never loaded
     /// because nothing ever switches *back* to the bootstrap context before a
-    /// real task takes its place. Zeroing the whole struct — including the
-    /// FXSAVE area — keeps the dump output honest if it is ever inspected.
+    /// real task takes its place. Zeroing the whole struct keeps diagnostics
+    /// deterministic if it is ever inspected.
     pub const fn empty() -> Self {
         Self {
             rsp: 0,
@@ -167,8 +133,6 @@ impl Context {
             r13: 0,
             r14: 0,
             r15: 0,
-            _pad: 0,
-            fxsave_area: [0; FXSAVE_AREA_SIZE],
         }
     }
 
@@ -201,9 +165,8 @@ impl Context {
     ///
     /// The callee-saved GPRs are zeroed: a fresh task has nothing to restore
     /// there, and its own prologue will establish `rbp`/`rbx`/`r12`..`r15` as
-    /// it pleases. The FXSAVE area is zeroed too, so if the eager-FPU path is
-    /// enabled the first `fxrstor` loads a clean (zeroed) FPU state rather
-    /// than stale bytes.
+    /// it pleases. The scheduler constructs the task's independent FPU image
+    /// alongside this integer context.
     ///
     /// # Safety
     ///
@@ -249,8 +212,6 @@ impl Context {
             r13: 0,
             r14: 0,
             r15: 0,
-            _pad: 0,
-            fxsave_area: [0; FXSAVE_AREA_SIZE],
         }
     }
 
@@ -323,15 +284,11 @@ impl Context {
     /// Intended for scheduler diagnostics (e.g. dumping a task's context on a
     /// watchdog expiry or a suspected stack corruption). Uses `debug!` so it
     /// is silent at the default `info` log level and free in production builds
-    /// unless the level is raised. The FXSAVE area is summarised as a
-    /// 16-byte hex prefix rather than dumped in full — 512 bytes of hex in a
-    /// log line is noise, and the first 16 bytes (x87 FCW/FSW/tag word) are
-    /// the part a human inspects.
+    /// unless the level is raised.
     pub fn dump(&self, label: &str) {
         ::log::debug!(
             "context {label}: rsp={:#018x} rbx={:#018x} rbp={:#018x} \
-             r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x} \
-             fxsave[0..16]={:?}",
+             r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}",
             self.rsp,
             self.rbx,
             self.rbp,
@@ -339,16 +296,13 @@ impl Context {
             self.r13,
             self.r14,
             self.r15,
-            FxSavePrefix(self),
         );
     }
 }
 
 impl fmt::Debug for Context {
     /// Structured debug formatting, mirroring the field order used by
-    /// [`Context::dump`]. Does not emit the full FXSAVE area; use
-    /// [`FxSavePrefix`] or inspect [`Context::fxsave_area`] directly when the
-    /// raw image is needed.
+    /// [`Context::dump`].
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Context")
             .field("rsp", &format_args!("{:#018x}", self.rsp))
@@ -358,35 +312,7 @@ impl fmt::Debug for Context {
             .field("r13", &format_args!("{:#018x}", self.r13))
             .field("r14", &format_args!("{:#018x}", self.r14))
             .field("r15", &format_args!("{:#018x}", self.r15))
-            .field("fxsave_area", &FxSavePrefix(self))
             .finish()
-    }
-}
-
-/// Debug helper that formats the first 16 bytes of a [`Context`]'s FXSAVE
-/// area as a hex string.
-///
-/// The leading 16 bytes of an FXSAVE image are the x87 control/status/tag
-/// words — the part a human can read meaningfully when diagnosing FPU state.
-/// The remaining 496 bytes are XMM/SSE state and reserved space, which are
-/// not useful in a log line. This wrapper exists so [`Context::dump`] and
-/// [`Debug` for `Context`](impl-Debug-for-Context) share one rendering and
-/// never accidentally dump the full 512 bytes.
-struct FxSavePrefix<'a>(&'a Context);
-
-impl fmt::Debug for FxSavePrefix<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Show the first 16 bytes as a flat hex run. `fxsave_area` is plain
-        // `u8` data, so there is no alignment or aliasing concern here.
-        f.write_str("[")?;
-        for (i, b) in self.0.fxsave_area.iter().take(16).enumerate() {
-            if i > 0 {
-                f.write_str(" ")?;
-            }
-            write!(f, "{:02x}", b)?;
-        }
-        f.write_str("..]")?;
-        Ok(())
     }
 }
 
@@ -408,16 +334,11 @@ mod tests {
 
     #[test]
     fn context_size_is_16_aligned() {
-        // The struct must be a multiple of 16 so every instance is 16-aligned
-        // and the FXSAVE area (at offset 64) is 16-aligned in absolute terms.
+        // The struct remains 16-aligned for the assembly ABI and occupies one
+        // cache line after representation padding.
         assert_eq!(core::mem::size_of::<Context>() % 16, 0);
         assert_eq!(core::mem::align_of::<Context>(), 16);
-    }
-
-    #[test]
-    fn fxsave_area_offset_is_16_aligned() {
-        assert_eq!(offset_of!(Context, fxsave_area) % 16, 0);
-        assert_eq!(offset_of!(Context, fxsave_area), offsets::FXSAVE_AREA);
+        assert_eq!(core::mem::size_of::<Context>(), 64);
     }
 
     #[test]
@@ -430,7 +351,6 @@ mod tests {
         assert_eq!(ctx.r13, 0);
         assert_eq!(ctx.r14, 0);
         assert_eq!(ctx.r15, 0);
-        assert!(ctx.fxsave_area.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -461,7 +381,6 @@ mod tests {
         assert_eq!(ctx.rsp % 16, 0);
         assert_eq!(ctx.rbx, 0);
         assert_eq!(ctx.r15, 0);
-        assert!(ctx.fxsave_area.iter().all(|&b| b == 0));
 
         // The entry address we wrote must be readable back from the slot.
         // SAFETY: `ctx.rsp` points into `buf`, which we still own.

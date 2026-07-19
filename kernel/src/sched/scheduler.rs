@@ -1068,12 +1068,10 @@ pub fn init() {
     //    default slice length. Must precede the first tick.
     preempt::init();
 
-    // 2. Idle task for the BSP. The idle entry is the scheduler-local
-    //    `idle_entry`, which matches our `unsafe extern "C" fn(u64) -> !`
-    //    spawn contract (the sibling `idle` module's `idle_loop` has a
-    //    different signature and is reconciled at integration; the scheduler
-    //    uses its own entry so it is self-contained). The lock-plus-spawn
-    //    block runs with interrupts off because `lock()` requires it.
+    // 2. Idle task for the BSP. The canonical entry lives in the sibling
+    //    `idle` module; this scheduler remains the sole owner of its task node
+    //    and per-CPU fallback pointer. The lock-plus-spawn block runs with
+    //    interrupts off because `lock()` requires it.
     let flags = save_flags_and_cli();
     let idle_node = {
         let mut inner = lock();
@@ -1082,7 +1080,7 @@ pub fn init() {
         // not placed on the normal run queue. `pick_next` selects it only when
         // that queue is empty, so runnable work can never sit behind idle in
         // FIFO order.
-        let idle_node = match create_task_inner(&mut inner, idle_name, idle_entry, 0) {
+        let idle_node = match create_task_inner(&mut inner, idle_name, super::idle::entry, 0) {
             Some(id) => id,
             None => {
                 ::log::error!("xenith.sched: failed to allocate idle task — halting");
@@ -1130,14 +1128,18 @@ pub fn init_ap() {
     {
         let mut inner = lock();
         if inner.idle_tasks[cpu].is_none() {
-            let idle =
-                create_task_inner(&mut inner, KString::from("idle-ap"), idle_entry, cpu as u64)
-                    .unwrap_or_else(|| {
-                        ::log::error!("xenith.sched: failed to allocate idle task for CPU {cpu}");
-                        loop {
-                            hlt();
-                        }
-                    });
+            let idle = create_task_inner(
+                &mut inner,
+                KString::from("idle-ap"),
+                super::idle::entry,
+                cpu as u64,
+            )
+            .unwrap_or_else(|| {
+                ::log::error!("xenith.sched: failed to allocate idle task for CPU {cpu}");
+                loop {
+                    hlt();
+                }
+            });
             inner.idle_tasks[cpu] = Some(idle);
         }
     }
@@ -1148,31 +1150,6 @@ pub fn init_ap() {
     // bring-up) and restores exactly that state.
     unsafe { restore_flags(flags) };
     ::log::info!("xenith.sched: CPU {cpu} run queue and idle task ready");
-}
-
-/// The scheduler's idle-task entry: halt until an interrupt, then loop.
-///
-/// This is the body the BSP's idle task runs. It mirrors the
-/// `sti; hlt` race-free idle pattern documented in the sibling `idle` module;
-/// we keep a private copy here so the scheduler's idle task matches this
-/// module's `unsafe extern "C" fn(u64) -> !` spawn contract without depending
-/// on the sibling module's signature.
-unsafe extern "C" fn idle_entry(_arg: u64) -> ! {
-    loop {
-        // A device IRQ or timer wakeup may have queued work while this task
-        // was halted. Dispatch it immediately instead of waiting for the
-        // idle task's next time-slice expiry.
-        schedule_next();
-        // SAFETY: `sti; hlt` is the architecturally-guaranteed race-free idle
-        // pattern: `sti` opens a one-instruction interrupt shadow, so an
-        // interrupt arriving between the two is taken before `hlt` retires,
-        // and otherwise `hlt` halts until the next interrupt. Both are
-        // privileged but we are in ring 0.
-        unsafe {
-            sti();
-            hlt();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

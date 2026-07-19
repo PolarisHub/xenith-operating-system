@@ -8,7 +8,19 @@ Numbers 49 through 51 provide `sigreturn`, `sigaction`, and `sigprocmask` with
 checked signal-frame restoration and a fixed RX trampoline. Number 52 is
 `getrandom(buf, length, flags)`; it accepts zero or `GRND_NONBLOCK`, fills at
 most 1 MiB per call from the initialized kernel CSPRNG, and rejects unknown
-flag bits.
+flag bits. Number 53 is `sigaltstack(new, old)`. Alternate stacks are bounded
+from 16 KiB through 8 MiB, report `SS_ONSTACK` from the interrupted stack
+pointer, cannot be changed while active, survive `fork`, and are disabled by
+`exec`.
+
+Caught-signal frames contain the complete integer/control context, stable
+`siginfo`, and the exact enabled x87/SSE/YMM state. The kernel owns the xstate
+location and validates its size, feature mask, MXCSR, XSAVE header, selectors,
+addresses, flags, and reserved fields before `sigreturn` restores it.
+`SA_SIGINFO` handlers receive `(signo, siginfo *, frame *)`; legacy handlers
+receive `(signo, frame *)`. `SA_ONSTACK` selects the alternate stack unless it
+is already active. `SA_RESTART` is deliberately limited to a zero-progress
+`read` that returned `EINTR`; no other syscall is replayed.
 
 Path-taking calls pass `(pointer, byte_length)` and do not require a trailing NUL. `read_dir` writes fixed `DirectoryEntry` records with a bounded 256-byte name. `spawn` and `exec` accept a NUL-terminated pointer vector with at most 32 arguments and 255 bytes per argument.
 

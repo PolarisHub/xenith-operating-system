@@ -21,6 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut script_path = None;
     let mut offline = false;
     let mut load_bias = None;
+    let mut gdb_listen = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -38,6 +39,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 offline = true;
             },
             "--offline" => offline = true,
+            "--gdb-listen" => {
+                gdb_listen = Some(arguments.next().ok_or("--gdb-listen needs an address")?)
+            },
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -56,6 +60,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if load_bias.is_some() && symbol_path.is_none() {
         return Err("--load-bias requires --symbols".into());
+    }
+    if gdb_listen.is_some() && (offline || !commands.is_empty()) {
+        return Err(
+            "--gdb-listen cannot be combined with --offline, --command, or --script".into(),
+        );
     }
     let symbols = symbol_path
         .map(|path| {
@@ -82,6 +91,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let mut client = DebugClient::connect(&address)?;
+    if let Some(listen) = gdb_listen {
+        xenith_debug::rsp::serve_tcp(client, &listen)?;
+        return Ok(());
+    }
     if !commands.is_empty() {
         for command in commands {
             if execute(&translator, &mut client, &command)? {
@@ -150,7 +163,9 @@ fn print_help() {
     println!(
         "xenith-debug [--connect 127.0.0.1:9000] [--symbols kernel.elf] [--load-bias ADDRESS] [--command 'break _start']... [--script commands.txt]"
     );
+    println!("xenith-debug --connect 127.0.0.1:9000 --gdb-listen 127.0.0.1:9001");
     println!("xenith-debug --symbols kernel.elf --lookup ADDRESS|SYMBOL|FILE:LINE[:COLUMN]");
     println!("commands: break/delete, watch/unwatch/watchpoints, step, continue [N], backtrace/bt [N], registers, reg/setreg, read/write, breakpoints, status, symbol, lookup, source/where, info, quit");
     println!("break/delete/read/write/lookup accept an address, symbol[+offset], or DWARF file:line[:column]; --offline runs local lookup/info commands without an emulator");
+    println!("--gdb-listen exposes a bounded single-client GDB RSP bridge; run `target remote 127.0.0.1:9001` in GDB");
 }

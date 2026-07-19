@@ -44,6 +44,14 @@ pub struct EfiSystemPartitionLayout {
     pub initrd_cluster: u16,
 }
 
+/// Owned files selected through the exact removable-media paths in one ESP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EfiSystemPartitionFiles {
+    pub bootx64: Vec<u8>,
+    pub kernel: Vec<u8>,
+    pub initrd: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Allocation {
     first_cluster: u16,
@@ -140,6 +148,36 @@ pub fn validate_efi_system_partition(
     compare_file(image, geometry, kernel_entry, kernel)?;
     compare_file(image, geometry, initrd_entry, initrd)?;
     Ok(())
+}
+
+/// Parses a FAT16 ESP and returns the exact files consumed by Xenith's UEFI
+/// loader. Directory types, long-name metadata, FAT chains, and terminal EOC
+/// markers are all validated before any bytes are returned.
+pub fn extract_efi_system_partition_files(
+    image: &[u8],
+) -> Result<EfiSystemPartitionFiles, ImageError> {
+    let geometry = parse_geometry(image)?;
+    let efi = find_entry(root_directory(image, geometry)?, &EFI_NAME)?;
+    require_directory(efi)?;
+    let efi_directory = cluster_bytes(image, geometry, entry_cluster(efi))?;
+    let boot = find_entry(efi_directory, &BOOT_NAME)?;
+    let xenith = find_entry(efi_directory, &XENITH_NAME)?;
+    require_directory(boot)?;
+    require_directory(xenith)?;
+
+    let boot_directory = cluster_bytes(image, geometry, entry_cluster(boot))?;
+    let bootx64_entry = find_entry(boot_directory, &BOOTX64_NAME)?;
+    let xenith_directory = cluster_bytes(image, geometry, entry_cluster(xenith))?;
+    let kernel_entry = find_entry(xenith_directory, &KERNEL_NAME)?;
+    let initrd_entry = find_long_entry(xenith_directory, INITRD_LONG_NAME, &INITRD_SHORT_NAME)?;
+
+    let files = EfiSystemPartitionFiles {
+        bootx64: read_file(image, geometry, bootx64_entry)?,
+        kernel: read_file(image, geometry, kernel_entry)?,
+        initrd: read_file(image, geometry, initrd_entry)?,
+    };
+    validate_payloads(&files.bootx64, &files.kernel, &files.initrd)?;
+    Ok(files)
 }
 
 fn validate_payloads(bootx64: &[u8], kernel: &[u8], initrd: &[u8]) -> Result<(), ImageError> {
@@ -576,6 +614,39 @@ fn compare_file(
         }
     }
     Ok(())
+}
+
+fn read_file(image: &[u8], geometry: Geometry, entry: &[u8]) -> Result<Vec<u8>, ImageError> {
+    if entry[11] & 0x10 != 0 {
+        return Err(ImageError::InvalidInput("EFI file metadata is invalid"));
+    }
+    let byte_len = read_u32(entry, 28) as usize;
+    if byte_len == 0 {
+        return Err(ImageError::InvalidInput("EFI file is empty"));
+    }
+    let mut bytes = Vec::with_capacity(byte_len);
+    let mut cluster = entry_cluster(entry);
+    let mut visits = 0_u32;
+    while bytes.len() < byte_len {
+        visits += 1;
+        if visits > DATA_CLUSTER_COUNT {
+            return Err(ImageError::InvalidInput("EFI FAT chain loops"));
+        }
+        let data = cluster_bytes(image, geometry, cluster)?;
+        let count = (byte_len - bytes.len()).min(EFI_SECTOR_SIZE);
+        bytes.extend_from_slice(&data[..count]);
+        let next = fat_entry(image, geometry, cluster)?;
+        if bytes.len() == byte_len {
+            if next < 0xfff8 {
+                return Err(ImageError::InvalidInput("EFI FAT chain is too long"));
+            }
+        } else if !(2..0xfff8).contains(&next) {
+            return Err(ImageError::InvalidInput("EFI FAT chain is truncated"));
+        } else {
+            cluster = next;
+        }
+    }
+    Ok(bytes)
 }
 
 fn fat_entry(image: &[u8], geometry: Geometry, cluster: u16) -> Result<u16, ImageError> {

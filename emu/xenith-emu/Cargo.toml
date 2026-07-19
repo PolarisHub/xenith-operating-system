@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 limine = { path = "../../crates/limine-compat" }
 xenith-boot-common = { path = "../../bootloader/common" }
+xenith-iso = { path = "../../tools/xenith-iso" }
 xenith-x86 = { path = "../../crates/xenith-x86" }
 
 [lints]

@@ -28,12 +28,12 @@
 //!
 //! # Layering
 //!
-//! `syscall` sits at the top of the kernel: it depends on `sched` (the
-//! current process, exit, yield), `fs` (open/stat), `mm` (brk/mmap), `time`
-//! (nanosleep), `devices`/`console` (write to stdout), and `arch` (the entry
-//! trampoline). Until those parallel phases land, handlers reference thin
-//! local stubs (see [`handlers::stubs`]) so the table compiles and the
-//! console-backed `write` path is genuinely usable.
+//! `syscall` is the ABI adapter at the top of the kernel. Handlers validate
+//! and copy raw userspace arguments, then delegate ownership to the live
+//! subsystems: `user::process` for process state, `fs::syscalls` for files
+//! and descriptors, `sched`/`time` for blocking, `net` for sockets, and
+//! `arch` for the entry trampoline. Subsystem errors are translated to the
+//! stable [`Errno`] return convention here.
 
 pub mod entry;
 pub mod handlers;

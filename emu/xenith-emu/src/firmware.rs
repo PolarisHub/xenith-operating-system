@@ -8,7 +8,7 @@
 //! does not substitute a second host-side image format.
 
 #[path = "firmware_exec.rs"]
-mod firmware_exec;
+pub(crate) mod firmware_exec;
 
 use core::mem::size_of;
 use std::fmt;

@@ -18,6 +18,35 @@ Useful commands are `break _start`, `continue`, `step`, `registers`, `reg rip`,
 `--command` may be repeated and `--script` runs one command per line for deterministic
 tests and CI.
 
+## GDB compatibility bridge
+
+Keep the emulator's native debug socket on port 9000 and expose a separate,
+loopback-only GDB Remote Serial Protocol endpoint:
+
+```powershell
+cargo run -p xenith-debug --target x86_64-pc-windows-msvc -- --connect 127.0.0.1:9000 --gdb-listen 127.0.0.1:9001
+gdb build\kernel.elf -ex "target remote 127.0.0.1:9001"
+```
+
+The Xenith CLI remains the primary debugger. The compatibility bridge supports
+`qSupported`, no-ack negotiation, target descriptions, stop reasons, complete
+general/segment register reads and writes, memory reads and writes, continue,
+single-step, software breakpoints, detach, and kill. It presents one x86-64
+thread and maps requests onto the existing emulator debug commands. Packets are
+checksum-validated and capped at 16 KiB, memory transfers at 4 KiB, and
+bridge-owned software breakpoints at 128. Unsupported RSP packets receive the
+protocol-defined empty response; malformed or over-limit requests receive a
+stable `E..` error.
+
+The library's `rsp::serve_stream` accepts any blocking `Read + Write` byte
+stream, so a serial-port implementation can reuse exactly the same bounded RSP
+framer. This is only the safe host transport seam today: the kernel does not
+yet implement a serial stop-the-world debug stub or the native register,
+memory, step, and breakpoint commands on physical hardware. Also, the native
+emulator protocol has no asynchronous pause command, so GDB Ctrl-C cannot
+interrupt a `continue` already executing in the backend; execution stops at the
+emulator's normal stop or configured instruction limit.
+
 When the ELF contains DWARF line tables, addresses and source locations work in
 both directions. `break kernel/src/main.rs:120` sets a breakpoint at the first
 instruction attributed to that line; `file:line:column` selects an exact DWARF
@@ -63,11 +92,7 @@ larger variable/type debug payload. The debugger does not yet expose variables,
 types, inline call stacks, DWARF-CFI unwinding, or hardware debug registers.
 
 The current server controls the interpreter emulator's BSP only, accepts one client, and uses
-non-invasive address checks rather than patching `int3` into guest code. It has no
-authentication. GDB RSP requires a packet/acknowledgement and register-layout adapter;
-serial hardware requires a framed transport plus an in-kernel stop-the-world debug stub;
-and VMM debugging requires the WHP runner to expose vCPU pause/register/memory/step
-operations through a backend-neutral target interface. Those are separate execution
-and transport architectures, not aliases that can be safely stubbed onto this TCP
-interpreter session. Bind the current server to loopback unless the surrounding network
-is trusted.
+non-invasive address checks rather than patching `int3` into guest code. Neither the native
+socket nor the GDB bridge has authentication. VMM debugging still requires the WHP runner
+to expose vCPU pause/register/memory/step operations through a backend-neutral target
+interface. Bind both listeners to loopback unless the surrounding network is trusted.

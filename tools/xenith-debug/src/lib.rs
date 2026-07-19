@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod command;
+pub mod rsp;
 pub mod source;
 pub mod symbols;
 

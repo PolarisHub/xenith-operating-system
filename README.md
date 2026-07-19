@@ -1,6 +1,6 @@
 # Xenith
 
-Xenith is a freestanding x86_64 operating-system workspace. It contains a `no_std` kernel and userspace, BIOS and UEFI loaders, a deterministic x86 interpreter, a Windows Hypervisor Platform lifecycle scaffold, image/filesystem/assembler/debugger tools, and a dependency-free C/assembly/static-link toolchain that builds a shipped userspace utility.
+Xenith is a freestanding x86_64 operating-system workspace. It contains a `no_std` kernel and userspace, BIOS and UEFI loaders, a deterministic SMP x86 interpreter, a multi-vCPU Windows Hypervisor Platform runner, image/filesystem/assembler/debugger tools, and a dependency-free C/assembly/static-link toolchain that builds a shipped userspace utility.
 
 The default build path does not invoke QEMU, Limine, xorriso, NASM, GCC, GDB, or a system C library. Limine files remain only as a compatibility path.
 
@@ -28,7 +28,7 @@ The thin Makefile exposes the same paths as `make all`, `make run`, `make test`,
 
 - `kernel/`: x86_64 kernel, scheduler, virtual memory, VFS, AML, XenithFS, drivers, networking, terminal, syscalls, and ELF processes.
 - `bootloader/`: 512-byte stage1 with the `0x55AA` BIOS boot signature, long-mode stage2, and `BOOTX64.EFI`.
-- `emu/`: deterministic interpreter/device model and optional Windows Hypervisor Platform ownership/probe scaffold; guest execution currently remains interpreted.
+- `emu/`: deterministic SMP interpreter/device/firmware model plus a Windows Hypervisor Platform runner that executes the same built kernel and shared device bus.
 - `crates/`: boot/ABI/address/bitflag support and shared x86 decoder/encoder.
 - `tools/`: build, ISO/disk, assembler/disassembler, debugger, linker/compiler, and filesystem utilities.
 - `user/`: `libuser`, C ABI runtime, init, shell, coreutils, editor, network utilities, and examples.
@@ -36,7 +36,7 @@ The thin Makefile exposes the same paths as `make all`, `make run`, `make test`,
 
 ## Validation
 
-Kernel and userspace require their separate custom targets and build-std flags; host tools use the native target. CI runs formatting, strict Clippy, native tests, `xenith-build all`, and the explicit emulator boot gate.
+Kernel and userspace require their separate custom targets and build-std flags; host tools use the native target. CI checks the complete workspace, runs host/kernel/bootloader tests and strict Clippy, builds every artifact with `xenith-build all`, then gates direct, packaged-image, BIOS-stage, SMP, shell/coreutils, pipeline, C-toolchain, and debugger execution in Xenith's own emulator.
 
 See [BUILD](docs/BUILD.md), [TOOLCHAIN](docs/TOOLCHAIN.md), [EMULATOR](docs/EMULATOR.md), [BOOT_PROTOCOL](docs/BOOT_PROTOCOL.md), and [STATUS](docs/STATUS.md). `STATUS.md` distinguishes compile-tested code from emulator-, firmware-, or hardware-tested behavior.
 

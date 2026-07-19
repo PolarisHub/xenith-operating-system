@@ -51,14 +51,12 @@ pub use x86_64::{
 /// Called by [`init`](crate::init) once the early console and log backend are
 /// up. Delegates to [`x86_64::init`], which runs the full CPU setup sequence
 /// (GDT, IDT, TSS, per-CPU area, FPU enablement, CPU feature flags). Earlier
-/// still, [`early_init`] performs the bare-minimum register manipulation that
-/// has to happen before even the console is available; that is invoked from
-/// the binary `_start` prologue.
+/// first calls [`early_init`] for allocation-free control-register policy,
+/// then installs the BSP descriptor tables, per-CPU area, FPU state, and IDT.
 ///
-/// Keeping both an `init` and an `early_init` lets the boot sequence split
-/// cleanly: `early_init` touches only control registers and MSRs (no
-/// allocations, no logging), while `init` does the heavier table
-/// construction once we can report progress and handle failures.
+/// Keeping both an `init` and an `early_init` lets AP bring-up reuse the
+/// allocation-free register policy before installing its CPU-local tables,
+/// while the BSP uses this complete entry point.
 pub fn init(boot_info: &'static limine::BootInfo) {
     #[cfg(target_arch = "x86_64")]
     x86_64::init(boot_info);

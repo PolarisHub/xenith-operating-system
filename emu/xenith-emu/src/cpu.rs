@@ -16,6 +16,12 @@ const FLAG_SF: u64 = 1 << 7;
 const FLAG_IF: u64 = 1 << 9;
 const FLAG_DF: u64 = 1 << 10;
 const FLAG_OF: u64 = 1 << 11;
+const CR0_EM: u64 = 1 << 2;
+const CR0_TS: u64 = 1 << 3;
+const CR4_OSFXSR: u64 = 1 << 9;
+const FXSAVE_SIZE: usize = 512;
+const FXSAVE_ALIGNMENT: u64 = 16;
+const MXCSR_MASK: u32 = 0x0000_ffbf;
 
 const IDT_ENTRY_SIZE: u64 = 16;
 const GDT_ENTRY_SIZE: u64 = 8;
@@ -108,6 +114,8 @@ pub enum CpuFault {
         instruction: Instruction,
     },
     InvalidOperand,
+    GeneralProtection(&'static str),
+    DeviceNotAvailable,
     DivideError,
     InvalidControlRegister(u8),
     InvalidInterruptGate {
@@ -143,6 +151,7 @@ pub struct Cpu {
     interrupts_delivered: u64,
     apic_id: u32,
     processor_count: u16,
+    fx_state: [u8; FXSAVE_SIZE],
 }
 
 impl Default for Cpu {
@@ -179,6 +188,7 @@ impl Cpu {
             interrupts_delivered: 0,
             apic_id,
             processor_count,
+            fx_state: initial_fx_state(),
         }
     }
 
@@ -312,6 +322,26 @@ impl Cpu {
             Mnemonic::Cld => self.state.rflags &= !FLAG_DF,
             Mnemonic::Std => self.state.rflags |= FLAG_DF,
             Mnemonic::Int3 => return Ok(Some(ExitReason::Breakpoint(start_rip))),
+            Mnemonic::Clts => self.clts()?,
+            Mnemonic::Fninit => self.fninit()?,
+            Mnemonic::Fxsave => {
+                if self.state.cr4 & CR4_OSFXSR == 0 {
+                    return Err(CpuFault::Unsupported {
+                        rip: start_rip,
+                        instruction,
+                    });
+                }
+                self.fxsave(bus, first.ok_or(CpuFault::InvalidOperand)?)?;
+            },
+            Mnemonic::Fxrstor => {
+                if self.state.cr4 & CR4_OSFXSR == 0 {
+                    return Err(CpuFault::Unsupported {
+                        rip: start_rip,
+                        instruction,
+                    });
+                }
+                self.fxrstor(bus, first.ok_or(CpuFault::InvalidOperand)?)?;
+            },
             Mnemonic::Mov => {
                 let destination = first.ok_or(CpuFault::InvalidOperand)?;
                 let source = second.ok_or(CpuFault::InvalidOperand)?;
@@ -593,6 +623,71 @@ impl Cpu {
             _ => 0,
         });
         address
+    }
+
+    fn clts(&mut self) -> Result<(), CpuFault> {
+        if self.state.cs & 3 != 0 {
+            return Err(CpuFault::GeneralProtection("CLTS requires CPL0"));
+        }
+        self.state.cr0 &= !CR0_TS;
+        Ok(())
+    }
+
+    fn require_fpu_available(&self) -> Result<(), CpuFault> {
+        if self.state.cr0 & (CR0_EM | CR0_TS) != 0 {
+            Err(CpuFault::DeviceNotAvailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fx_address(&self, operand: Operand) -> Result<u64, CpuFault> {
+        let Operand::Memory(memory) = operand else {
+            return Err(CpuFault::InvalidOperand);
+        };
+        let address = self.effective_address(memory);
+        if !address.is_multiple_of(FXSAVE_ALIGNMENT) {
+            return Err(CpuFault::GeneralProtection(
+                "FXSAVE/FXRSTOR area is not 16-byte aligned",
+            ));
+        }
+        Ok(address)
+    }
+
+    fn fxsave(&mut self, bus: &mut MemoryBus, operand: Operand) -> Result<(), CpuFault> {
+        self.require_fpu_available()?;
+        let address = self.fx_address(operand)?;
+        self.fx_state[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+        bus.write_linear(address, &self.fx_state, self.paging_context())?;
+        Ok(())
+    }
+
+    fn fxrstor(&mut self, bus: &mut MemoryBus, operand: Operand) -> Result<(), CpuFault> {
+        self.require_fpu_available()?;
+        let address = self.fx_address(operand)?;
+        let mut image = [0_u8; FXSAVE_SIZE];
+        bus.read_linear(address, &mut image, self.paging_context(), Access::Read)?;
+        let mxcsr = u32::from_le_bytes(image[24..28].try_into().expect("four-byte MXCSR"));
+        if mxcsr & !MXCSR_MASK != 0 {
+            return Err(CpuFault::GeneralProtection(
+                "FXRSTOR image has unsupported MXCSR bits",
+            ));
+        }
+        // MXCSR_MASK and the reserved tail are outputs of FXSAVE rather than
+        // restorable register state. Preserve the emulated processor's mask
+        // while loading the x87, MXCSR, ST, and XMM portions.
+        self.fx_state[..28].copy_from_slice(&image[..28]);
+        self.fx_state[32..416].copy_from_slice(&image[32..416]);
+        self.fx_state[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+        Ok(())
+    }
+
+    fn fninit(&mut self) -> Result<(), CpuFault> {
+        self.require_fpu_available()?;
+        self.fx_state[..24].fill(0);
+        self.fx_state[..2].copy_from_slice(&0x037f_u16.to_le_bytes());
+        self.fx_state[32..160].fill(0);
+        Ok(())
     }
 
     fn extend_for_destination(&self, value: u64, source: Operand, destination: Operand) -> u64 {
@@ -1534,6 +1629,14 @@ impl Cpu {
     }
 }
 
+fn initial_fx_state() -> [u8; FXSAVE_SIZE] {
+    let mut image = [0_u8; FXSAVE_SIZE];
+    image[..2].copy_from_slice(&0x037f_u16.to_le_bytes());
+    image[24..28].copy_from_slice(&0x1f80_u32.to_le_bytes());
+    image[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+    image
+}
+
 #[derive(Clone, Copy, Debug)]
 struct InterruptGate {
     offset: u64,
@@ -2018,5 +2121,129 @@ mod tests {
         assert_eq!(cpu.state.register(Register::Rax), 42);
         assert_eq!(cpu.state.rip, 9);
         assert_eq!(cpu.interrupts_delivered(), 1);
+    }
+
+    #[test]
+    fn clts_is_cpl0_only_and_clears_only_cr0_ts() {
+        let mut bus = MemoryBus::new(0x1000);
+        bus.write_physical(0, &[0x0f, 0x06]).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.cs = 8;
+        cpu.state.cr0 |= CR0_TS;
+        let before = cpu.state.cr0;
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.state.cr0, before & !CR0_TS);
+
+        cpu.state.rip = 0;
+        cpu.state.cs = 0x2b;
+        cpu.state.cr0 |= CR0_TS;
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(CpuFault::GeneralProtection("CLTS requires CPL0"))
+        );
+        assert_ne!(cpu.state.cr0 & CR0_TS, 0);
+    }
+
+    #[test]
+    fn fxrstor_and_fxsave_round_trip_the_legacy_state_image() {
+        let mut bus = MemoryBus::new(0x6000);
+        // clts; fxrstor [rsi]; fxsave [rdi]; hlt
+        bus.write_physical(0, &[0x0f, 0x06, 0x0f, 0xae, 0x0e, 0x0f, 0xae, 0x07, 0xf4])
+            .unwrap();
+        let mut input = initial_fx_state();
+        input[24..28].copy_from_slice(&0x0000_1f00_u32.to_le_bytes());
+        input[32..160].fill(0x5a);
+        input[160..416].fill(0xa5);
+        input[28..32].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        bus.write_physical(0x2000, &input).unwrap();
+
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.cs = 8;
+        cpu.state.cr0 |= CR0_TS;
+        cpu.state.cr4 |= CR4_OSFXSR;
+        cpu.state.set_register(Register::Rsi, 0x2000);
+        cpu.state.set_register(Register::Rdi, 0x3000);
+        assert_eq!(cpu.run(&mut bus, 4), ExitReason::Halted);
+
+        let mut output = [0_u8; FXSAVE_SIZE];
+        bus.read_physical(0x3000, &mut output).unwrap();
+        assert_eq!(&output[..28], &input[..28]);
+        assert_eq!(&output[32..416], &input[32..416]);
+        assert_eq!(
+            u32::from_le_bytes(output[28..32].try_into().unwrap()),
+            MXCSR_MASK
+        );
+        assert!(output[416..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn legacy_fpu_state_access_checks_ts_alignment_mxcsr_and_page_bounds() {
+        let mut bus = MemoryBus::new(0x5000);
+        bus.write_physical(0, &[0x0f, 0xae, 0x07]).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.set_register(Register::Rdi, 0x2000);
+        let instruction = decode(&[0x0f, 0xae, 0x07]).unwrap();
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(CpuFault::Unsupported {
+                rip: 0,
+                instruction,
+            })
+        );
+
+        cpu.state.rip = 0;
+        cpu.state.cr4 |= CR4_OSFXSR;
+        cpu.state.cr0 |= CR0_TS;
+        assert_eq!(cpu.step(&mut bus), Err(CpuFault::DeviceNotAvailable));
+
+        cpu.state.rip = 0;
+        cpu.state.cr0 &= !CR0_TS;
+        cpu.state.set_register(Register::Rdi, 0x2001);
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(CpuFault::GeneralProtection(
+                "FXSAVE/FXRSTOR area is not 16-byte aligned"
+            ))
+        );
+
+        // fxrstor [rdi] with a reserved MXCSR bit must #GP without loading it.
+        bus.write_physical(0, &[0x0f, 0xae, 0x0f]).unwrap();
+        let mut invalid = initial_fx_state();
+        invalid[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        bus.write_physical(0x2000, &invalid).unwrap();
+        cpu.state.rip = 0;
+        cpu.state.set_register(Register::Rdi, 0x2000);
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(CpuFault::GeneralProtection(
+                "FXRSTOR image has unsupported MXCSR bits"
+            ))
+        );
+
+        // A 16-byte-aligned 512-byte save that crosses into a non-present
+        // page reports the precise write page fault rather than truncating.
+        let mut paged = MemoryBus::new(0x6000);
+        for (entry, next) in [(0x1000, 0x2000), (0x2000, 0x3000), (0x3000, 0x4000)] {
+            paged.write_u64_physical(entry, next | 3).unwrap();
+        }
+        paged.write_u64_physical(0x4000, 0x5000 | 3).unwrap();
+        paged.write_physical(0x5000, &[0x0f, 0xae, 0x07]).unwrap();
+        let mut paged_cpu = Cpu::new();
+        paged_cpu.state.rip = 0;
+        paged_cpu.state.cr3 = 0x1000;
+        paged_cpu.state.cr0 |= 1 << 31;
+        paged_cpu.state.cr4 |= CR4_OSFXSR;
+        paged_cpu.state.set_register(Register::Rdi, 0x0ff0);
+        assert_eq!(
+            paged_cpu.step(&mut paged),
+            Err(CpuFault::Memory(MemoryError::PageFault {
+                address: 0x1000,
+                access: Access::Write,
+                reason: "not present",
+            }))
+        );
     }
 }

@@ -322,7 +322,7 @@ impl Context {
     /// Every field is zero; the scheduler fills `rsp`/`rip` in when it
     /// actually performs the switch. This is the safe default for a
     /// not-yet-started task that is *not* being constructed via
-    /// [`Task::new`] (e.g. an idle task the scheduler builds by hand).
+    /// [`Task::new`].
     #[must_use]
     pub const fn zeroed() -> Self {
         Self {
@@ -675,9 +675,9 @@ impl Task {
     /// stack and a prepared [`Context`].
     ///
     /// Used by callers that need to customise the entry frame beyond what
-    /// [`Task::new_kernel`] sets up (e.g. an idle task that begins in a
-    /// special `hlt` loop, or a userspace task whose first `rip` is the
-    /// syscall-return trampoline rather than a kernel entry function).
+    /// [`Task::new_kernel`] sets up, such as a userspace task whose first
+    /// `rip` is the syscall-return trampoline rather than a kernel entry
+    /// function.
     /// `new_kernel` is the thin wrapper for the common case and should be
     /// preferred where it fits.
     #[must_use]

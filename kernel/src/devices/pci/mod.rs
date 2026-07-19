@@ -1,11 +1,11 @@
 //! PCI bus core: device descriptor, config-space types, and enumeration hub.
 //!
-//! This module is the root of the kernel's PCI support. It owns the
-//! [`PciDevice`] record that enumeration produces and re-exports the
-//! config-space access primitives from [`config`]. The actual bus walk lives
-//! in [`enumerate`], which scans every bus/device/function triplet, probes
-//! each one through [`config::PciAddress`], and collects the present
-//! functions into a [`PciDevice`] table the rest of the kernel consumes.
+//! This module is the root of the kernel's PCI support. It owns the compact
+//! [`PciDevice`] config snapshot used by low-level controller code and
+//! re-exports the config-space access primitives from [`config`]. The actual
+//! recursive bus walk and richer discovery record live in [`enumerate`]; all
+//! config transactions share [`config::PciAddress`] and its global selector
+//! lock.
 //!
 //! # Layering
 //!
@@ -20,10 +20,10 @@
 //! A PCI function is identified by a 24-bit bus/device/function (BDF) triplet:
 //! up to 256 buses, 32 devices per bus, 8 functions per device. Each function
 //! exposes a 256-byte config space reached through [`config::PciAddress`].
-//! [`PciDevice`] is the "decoded header" snapshot of one function: the vendor
-//! and device IDs, the class code, the six BARs, and the interrupt line that
-//! enumeration reads once and the drivers thereafter consult without touching
-//! the bus again.
+//! [`PciDevice`] is a compact decoded-header view: vendor and device IDs, the
+//! class code, six BARs, and the interrupt line. Enumeration retains
+//! additional topology fields in [`enumerate::PciDevice`] and converts only
+//! when a low-level driver needs this compact form.
 
 pub mod capability;
 pub mod config;
@@ -97,7 +97,7 @@ bitflags! {
 // PciDevice — the decoded config-space snapshot of one function
 // ---------------------------------------------------------------------------
 
-/// A snapshot of a PCI function's standard header, produced by enumeration.
+/// A compact snapshot of a PCI function's standard header.
 ///
 /// `PciDevice` holds the fields a driver consults at bring-up: the vendor and
 /// device IDs for matching, the class code for generic-class drivers, the six

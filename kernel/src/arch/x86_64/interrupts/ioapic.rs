@@ -55,13 +55,13 @@ use crate::sync::SpinLock;
 const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
 
 /// The default I/O APIC MMIO base on a PC-AT compatible system. The MADT
-/// normally reports this exact value; the stub list uses it so the driver
-/// works on QEMU and typical hardware before the acpi phase is wired up.
+/// normally reports this exact value; the ACPI-less direct-emulator fallback
+/// uses it for the conventional single-controller layout.
 const DEFAULT_IOAPIC_MMIO: u32 = 0xFEC0_0000;
 
 /// The number of redirection entries the classic single-IOAPIC PC layout
 /// exposes (24). Real hardware reports the actual count in the version
-/// register's `max_redir` field; this constant is only the stub-list value.
+/// register's `max_redir` field; this is only the fallback's initial value.
 const DEFAULT_MAX_ENTRIES: u8 = 24;
 
 /// IOREGSEL: the 8-bit index register, written to select which 32-bit
@@ -535,7 +535,7 @@ impl IoApic {
     /// Bits 16..23 of the version register hold the *maximum redirection
     /// entry index*, which is `count - 1`. We store the count so
     /// [`route`](Self::route) and [`mask`](Self::mask) can bounds-check GSI
-    /// arguments against the real hardware capacity rather than the stub
+    /// arguments against the real hardware capacity rather than the fallback
     /// default.
     pub fn read_version(&mut self) {
         let ver = self.read_reg(REG_IOAPIC_VER);

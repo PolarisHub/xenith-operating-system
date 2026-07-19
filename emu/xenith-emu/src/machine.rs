@@ -18,6 +18,7 @@ use crate::elf::{ElfError, ElfImage, ProgramHeader};
 use crate::firmware::{boot_bios_image, BiosBootTrace, FirmwareError};
 use crate::memory::{ApicEventKind, MemoryBus, MemoryError, PagingContext, Privilege};
 use crate::platform::{AtaDiskError, AtaDiskImage, AtaPioDisk, Hpet, LegacyPciConfig, Rtl8139Nic};
+use crate::uefi::{boot_uefi_iso, UefiError, UefiIsoBootTrace};
 
 const PAGE_SIZE: u64 = 4096;
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
@@ -101,6 +102,7 @@ pub enum MachineError {
     Ata(AtaDiskError),
     DiskAlreadyAttached,
     Firmware(FirmwareError),
+    Uefi(UefiError),
 }
 
 impl From<ElfError> for MachineError {
@@ -129,6 +131,12 @@ impl From<AtaDiskError> for MachineError {
 impl From<FirmwareError> for MachineError {
     fn from(value: FirmwareError) -> Self {
         Self::Firmware(value)
+    }
+}
+
+impl From<UefiError> for MachineError {
+    fn from(value: UefiError) -> Self {
+        Self::Uefi(value)
     }
 }
 
@@ -197,6 +205,7 @@ pub struct Machine {
     disk: Option<AtaDiskImage>,
     framebuffer: Option<FramebufferSurface>,
     bios_trace: Option<BiosBootTrace>,
+    uefi_trace: Option<UefiIsoBootTrace>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +259,7 @@ impl Machine {
             disk: None,
             framebuffer: None,
             bios_trace: None,
+            uefi_trace: None,
         }
     }
 
@@ -286,6 +296,7 @@ impl Machine {
         stack_top: u64,
     ) -> Result<(), MachineError> {
         self.bios_trace = None;
+        self.uefi_trace = None;
         self.bus.write_physical(address, program)?;
         self.reset_application_processors();
         self.cpu = Cpu::new_with_topology(0, self.cpu_count() as u16, true);
@@ -302,6 +313,7 @@ impl Machine {
     ) -> Result<(), MachineError> {
         self.framebuffer = None;
         self.bios_trace = None;
+        self.uefi_trace = None;
         let image = ElfImage::parse(kernel)?;
         let root = 0x1000;
         let mut tables = TableAllocator::new(0x2000, BOOT_INFO_PHYS);
@@ -589,6 +601,7 @@ impl Machine {
             return Err(MachineError::DiskAlreadyAttached);
         }
         self.framebuffer = None;
+        self.uefi_trace = None;
         self.reset_application_processors();
         let boot = boot_bios_image(&mut self.bus, &mut self.cpu, &image)?;
         self.cpu
@@ -610,6 +623,47 @@ impl Machine {
     #[must_use]
     pub fn bios_boot_trace(&self) -> Option<&BiosBootTrace> {
         self.bios_trace.as_ref()
+    }
+
+    /// Boot the actual platform-0xEF El Torito entry in a packaged Xenith ISO.
+    /// The selected `BOOTX64.EFI` PE instructions execute through the ordinary
+    /// long-mode interpreter and may call only Xenith's validated UEFI subset.
+    pub fn load_uefi_iso(&mut self, iso: &[u8]) -> Result<(), MachineError> {
+        if self.disk.is_some() {
+            return Err(MachineError::DiskAlreadyAttached);
+        }
+        self.framebuffer = None;
+        self.bios_trace = None;
+        self.uefi_trace = None;
+        self.reset_application_processors();
+        let processor_count = self.cpu_count() as u16;
+        self.cpu = Cpu::new_with_topology(0, processor_count, true);
+        install_acpi_tables(&mut self.bus, usize::from(processor_count))?;
+        let geometry = self.config.framebuffer.unwrap_or(FramebufferConfig {
+            width: 800,
+            height: 600,
+        });
+        let boot = boot_uefi_iso(
+            &mut self.bus,
+            &mut self.cpu,
+            iso,
+            geometry.width,
+            geometry.height,
+        )?;
+        self.framebuffer = Some(FramebufferSurface {
+            physical: boot.framebuffer.physical,
+            width: boot.framebuffer.width,
+            height: boot.framebuffer.height,
+            pitch: boot.framebuffer.pitch,
+        });
+        self.uefi_trace = Some(boot.trace);
+        Ok(())
+    }
+
+    /// PE instruction and UEFI service evidence from the latest ISO boot.
+    #[must_use]
+    pub fn uefi_boot_trace(&self) -> Option<&UefiIsoBootTrace> {
+        self.uefi_trace.as_ref()
     }
 
     /// Attach sector-aligned bytes as the legacy primary-master ATA disk.

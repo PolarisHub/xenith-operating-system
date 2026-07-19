@@ -1,11 +1,9 @@
 //! Spin-backed mutex with a scheduler-yield hook.
 //!
-//! [`Mutex<T>`] is mutual exclusion for kernel code that would *like* to
-//! block instead of spin but cannot yet, because the scheduler is not
-//! running. Today the implementation is a thin test-and-set spinlock —
-//! functionally identical to [`SpinLock`](super::spinlock::SpinLock) — but
-//! its spin loop calls [`yield_cpu`], which is currently a `pause` hint and
-//! will become a real `schedule()` invocation once the `sched` phase lands.
+//! [`Mutex<T>`] is scheduler-aware mutual exclusion for task context. The
+//! uncontended path is one atomic compare-exchange. A contended task yields
+//! once the scheduler is online; early boot, interrupt-disabled code, and
+//! preemption-disabled critical sections retain a `pause` spin fallback.
 //!
 //! # Why a separate type from `SpinLock`?
 //!
@@ -14,13 +12,14 @@
 //!
 //! * `SpinLock` is for critical sections so short that blocking is never
 //!   worth it — IRQ-data structures, MMU table edits. It will always spin.
-//! * `Mutex` is for critical sections that may be long (allocators, driver
-//!   state machines). Today it spins because there is nowhere to block to,
-//!   but the contract is "this will become a blocking lock." Callers pick
-//!   `Mutex` to opt into that future behaviour without a refactor.
+//! * `Mutex` is for task-context critical sections that may be long enough to
+//!   let another runnable task make progress while the lock is held.
 //!
-//! Keeping the types distinct now means that swapping the spin loop for a
-//! scheduler yield later does not change any call site.
+//! This remains a cooperative yield mutex rather than a sleep-queue mutex:
+//! contention is rechecked after every yield and there is no waiter queue or
+//! priority inheritance. It must not protect state shared with an interrupt
+//! handler on the same CPU; use [`SpinLockIRQ`](super::spinlock_irq::SpinLockIRQ)
+//! for that case.
 //!
 //! # Reentrancy
 //!
@@ -28,24 +27,59 @@
 //! `SpinLock`. The `sched` phase may add a reentrant variant if one is
 //! needed; for now, structure code to release before re-acquiring.
 
+use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{fmt, hint};
 
+const RFLAGS_INTERRUPT_ENABLE: u64 = 1 << 9;
+
 /// Give the CPU a breather while waiting for a contended `Mutex`.
 ///
-/// Today this is just [`core::hint::spin_loop`] (a `pause` on x86_64), so a
-/// `Mutex` behaves exactly like a `SpinLock`. Once the scheduler is up,
-/// this will become a call to `sched::yield_now()` that parks the current
-/// task and runs another, turning `Mutex` into a real blocking lock without
-/// any call-site changes.
+/// Yielding is safe only from an ordinary preemptible task with interrupts
+/// enabled. An IRQ may have interrupted the lock owner on this same CPU, and
+/// a task switched out with a non-zero per-CPU preemption count would leak its
+/// critical-section state into the incoming task. Both cases therefore spin.
 #[inline]
 fn yield_cpu() {
-    // Placeholder: the `sched` module does not exist yet. When it does,
-    // replace this body with `crate::sched::yield_now()` and keep the
-    // `spin_loop` as the no-scheduler fallback under a cfg flag.
+    if scheduler_yield_allowed() {
+        crate::sched::yield_now();
+    }
+    // `yield_now` is a no-op when no task is current, and a resumed contender
+    // may still lose the next CAS. Keep the architectural spin hint in every
+    // path so those retries remain friendly to a sibling hardware thread.
     hint::spin_loop();
+}
+
+/// Whether the current execution context may enter the scheduler voluntarily.
+#[inline]
+fn scheduler_yield_allowed() -> bool {
+    let scheduler_online = crate::sched::is_initialised();
+    if !scheduler_online {
+        return false;
+    }
+    let preempt_disabled = crate::sched::preempt::preempt_disabled();
+    if preempt_disabled {
+        return false;
+    }
+
+    let flags: u64;
+    // SAFETY: `pushfq; pop` is stack-balanced, non-privileged, and only reads
+    // the current RFLAGS image. No flag or memory state is changed.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {flags}",
+            flags = out(reg) flags,
+        );
+    }
+    yield_policy(scheduler_online, preempt_disabled, flags)
+}
+
+#[inline]
+const fn yield_policy(scheduler_online: bool, preempt_disabled: bool, flags: u64) -> bool {
+    scheduler_online && !preempt_disabled && flags & RFLAGS_INTERRUPT_ENABLE != 0
 }
 
 /// A mutex protecting a value of type `T`.
@@ -229,5 +263,13 @@ mod tests {
     fn default_uses_inner_default() {
         let m: Mutex<u16> = Mutex::default();
         assert_eq!(*m.lock(), 0);
+    }
+
+    #[test]
+    fn scheduler_yield_policy_requires_safe_task_context() {
+        assert!(yield_policy(true, false, RFLAGS_INTERRUPT_ENABLE));
+        assert!(!yield_policy(false, false, RFLAGS_INTERRUPT_ENABLE));
+        assert!(!yield_policy(true, true, RFLAGS_INTERRUPT_ENABLE));
+        assert!(!yield_policy(true, false, 0));
     }
 }

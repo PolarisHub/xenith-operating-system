@@ -43,6 +43,7 @@
 use core::fmt;
 
 use crate::arch::{Port16, Port32, Port8};
+use crate::sync::SpinLock;
 
 // ---------------------------------------------------------------------------
 // Port numbers and the CONFIG_ADDRESS bit layout
@@ -122,11 +123,7 @@ pub const VENDOR_NONE: u16 = 0xFFFF;
 /// concurrent config transactions would clobber each other's selector and
 /// return the wrong device's register. We hold this lock across the
 /// address-write and the following data-transfer so the pair is atomic.
-///
-/// Uses `spin::Mutex` directly, matching the other `devices/` drivers; the
-/// swap to [`crate::sync::SpinLock`] is a one-line type change when the
-/// in-tree wrapper is adopted.
-static CONFIG_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static CONFIG_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Typed handle to the CONFIG_ADDRESS port (32-bit write-only selector).
 static CONFIG_ADDRESS_PORT: Port32 = Port32::new(CONFIG_ADDRESS);
@@ -193,10 +190,30 @@ impl PciAddress {
         self.dev
     }
 
+    /// The device number on the bus.
+    ///
+    /// Spelled-out alias used by enumeration-facing code; equivalent to
+    /// [`dev`](Self::dev).
+    #[inline]
+    #[must_use]
+    pub const fn device(self) -> u8 {
+        self.dev
+    }
+
     /// The function number on the device.
     #[inline]
     #[must_use]
     pub const fn func(self) -> u8 {
+        self.func
+    }
+
+    /// The function number on the device.
+    ///
+    /// Spelled-out alias used by enumeration-facing code; equivalent to
+    /// [`func`](Self::func).
+    #[inline]
+    #[must_use]
+    pub const fn function(self) -> u8 {
         self.func
     }
 

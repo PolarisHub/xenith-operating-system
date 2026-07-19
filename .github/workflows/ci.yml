@@ -28,8 +28,12 @@ jobs:
             cargo fmt --manifest-path $_ --all -- --check
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
+      - name: Complete workspace check
+        run: cargo check --workspace --all-targets
       - name: Native tests
-        run: cargo test --target x86_64-pc-windows-msvc -p limine -p xenith-types -p xenith-bitflags -p xenith-boot -p xenith-abi -p xenith-fs-format -p xenith-x86 -p xenith-emu -p xenith-vmm -p xenith-asm -p xenith-disasm -p xenith-iso -p xenith-build -p xenith-mkfs -p xenith-fsck -p xenith-mount -p xenith-ld -p xenith-cc -p xenith-debug -p xenith-integration
+        run: cargo test --target x86_64-pc-windows-msvc -p limine -p xenith-types -p xenith-bitflags -p xenith-boot -p xenith-abi -p xenith-fs-format -p xenith-x86 -p xenith-emu -p xenith-vmm -p xenith-asm -p xenith-disasm -p xenith-iso -p xenith-build -p xenith-mkfs -p xenith-fsck -p xenith-mount -p xenith-ld -p xenith-cc -p xenith-debug -p xenith-integration -p xenith-libc
+      - name: Kernel host tests
+        run: cargo test -p xenith-kernel --lib --target x86_64-pc-windows-msvc
       - name: Native Clippy
         run: cargo clippy --workspace --target x86_64-pc-windows-msvc --exclude xenith-kernel --exclude xenith-init --exclude xenith-sh --exclude xenith-coreutils --exclude xenith-editor --exclude xenith-net --exclude xenith-examples --exclude xenith-libc --all-targets -- -D warnings
       - name: Kernel Clippy
@@ -63,3 +67,21 @@ jobs:
         run: cargo test -p xenith-integration --test boot kernel_reaches_userspace_shell -- --ignored --exact
       - name: Emulator shell and coreutils gate
         run: cargo test -p xenith-integration --test shell shell_executes_builtins_and_coreutils_via_ps2 -- --ignored --exact
+      - name: Packaged image and BIOS firmware gates
+        shell: pwsh
+        run: |
+          cargo test -p xenith-emu --test image_boot manifest_image_reaches_userspace_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p xenith-emu --test image_boot bios_firmware_image_reaches_userspace_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p xenith-emu --test image_boot uefi_iso_executes_packaged_pe_and_reaches_userspace_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Shell pipeline and Xenith C toolchain gates
+        shell: pwsh
+        run: |
+          cargo test -p xenith-emu --test cli_input input_script_proves_shell_pipeline_and_redirection -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p xenith-emu --test c_toolchain xenith_built_c_utility_executes_in_ring3 -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Two-processor emulator gate
+        run: cargo test -p xenith-emu --test smp_boot two_processor_kernel_brings_ap_online_and_reaches_shell -- --ignored --exact

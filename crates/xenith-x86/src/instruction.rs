@@ -102,6 +102,14 @@ pub enum Mnemonic {
     Cld,
     Std,
     Int3,
+    /// CLTS: clear CR0.TS at CPL0.
+    Clts,
+    /// FNINIT: reset the architectural x87 state.
+    Fninit,
+    /// FXSAVE/FXSAVE64 legacy 512-byte state image.
+    Fxsave,
+    /// FXRSTOR/FXRSTOR64 legacy 512-byte state image.
+    Fxrstor,
     Mov,
     Xchg,
     Movzx,

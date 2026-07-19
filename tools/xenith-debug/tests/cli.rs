@@ -11,6 +11,8 @@ fn help_exposes_watch_backtrace_and_pie_controls() {
     assert!(stdout.contains("watch/unwatch/watchpoints"));
     assert!(stdout.contains("backtrace/bt"));
     assert!(stdout.contains("--load-bias ADDRESS"));
+    assert!(stdout.contains("--gdb-listen 127.0.0.1:9001"));
+    assert!(stdout.contains("target remote 127.0.0.1:9001"));
 }
 
 #[test]

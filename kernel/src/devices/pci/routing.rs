@@ -455,7 +455,7 @@ mod tests {
 
     fn test_device(bus: u8, device: u8, function: u8, pin: u8) -> PciDevice {
         PciDevice {
-            address: super::super::enumerate::PciAddress::new_unchecked(bus, device, function),
+            address: PciAddress::new(bus, device, function).expect("bounded test PCI address"),
             vendor_id: 0x1234,
             device_id: 0x5678,
             revision: 0,

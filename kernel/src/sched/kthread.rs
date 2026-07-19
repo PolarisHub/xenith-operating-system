@@ -266,8 +266,8 @@ pub unsafe extern "C" fn kthread_trampoline(start_ptr: u64) -> ! {
 /// # Errors / panics
 ///
 /// Panics if the stack allocation fails. A kernel thread without a stack
-/// cannot exist, and at the call sites we have today (idle task, boot-time
-/// workers) an OOM is fatal. A future dynamic-spawn path can add a
+/// cannot exist, and the current boot-time worker call sites treat OOM as
+/// fatal. A future dynamic-spawn path can add a
 /// `try_spawn_kernel_thread` variant that returns `Result` instead.
 pub fn spawn_kernel_thread(name: &str, f: extern "C" fn(usize) -> usize, arg: usize) -> TaskId {
     // Build a startup record and pass its pointer through the scheduler's

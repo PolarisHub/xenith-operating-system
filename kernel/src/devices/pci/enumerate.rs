@@ -18,166 +18,33 @@
 //!
 //! # Config-space access
 //!
-//! The 0xCF8/0xCFC port-I/O primitives and [`PciAddress`] encoding live below
-//! as private stubs that move to `super::config` when that module lands; the
-//! public enumeration surface does not change. ECAM/MCFG will replace the
-//! port-I/O backend behind the same `config_read_dword` seam without
-//! touching this file.
+//! Every read goes through [`super::config::PciAddress`]. Its shared lock
+//! serialises the host bridge's `0xCF8/0xCFC` selector/data pair across CPUs,
+//! so enumeration, capability probing, and live drivers cannot select each
+//! other's config dwords.
 
-use core::arch::asm;
 use core::fmt;
 
+use super::config::{PciAddress, VENDOR_NONE};
 use crate::mm::KVec;
 use crate::sync::SpinLock;
-
-// --- Config-space access (private stubs; replaced by `super::config`) -------
-// These primitives encode the legacy 0xCF8/0xCFC indexed-config mechanism and
-// the per-function register readers the enumerator needs. They are private so
-// they cannot clash with `super::config`'s public surface; integration is a
-// one-line `use super::config::{...}` once that module exists.
-
-/// I/O port for the PCI config-address latch.
-const PCI_CONFIG_ADDR: u16 = 0xCF8;
-/// I/O port for the PCI config-data window.
-const PCI_CONFIG_DATA: u16 = 0xCFC;
-
-/// Read a 32-bit word from an I/O port.
-///
-/// SAFETY: the caller must ensure `port` selects a device I/O port the kernel
-/// may read. 0xCF8/0xCFC are the fixed PCI config-space ports on every PC.
-unsafe fn inl(port: u16) -> u32 {
-    let val: u32;
-    // SAFETY: `in eax, dx` reads a 32-bit word from the port in dx into eax.
-    // It performs no memory access and modifies no flags (Intel SDM), so
-    // `nomem`, `preserves_flags`, and `nostack` are correct.
-    unsafe {
-        asm!(
-            "in eax, dx",
-            in("dx") port,
-            out("eax") val,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    val
-}
-
-/// Write a 32-bit word to an I/O port.
-///
-/// SAFETY: the caller must ensure `port` selects a device I/O port the kernel
-/// may write. As with `inl`, the cycle touches no memory and no flags.
-unsafe fn outl(port: u16, val: u32) {
-    // SAFETY: `out dx, eax` writes eax to the port in dx; same constraints as
-    // `inl` apply.
-    unsafe {
-        asm!(
-            "out dx, eax",
-            in("dx") port,
-            in("eax") val,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-}
-
-/// A fully-qualified location of a PCI function: bus, device, function.
-///
-/// Encodes the `bus:device.function` triple the config-address latch expects.
-/// `device` is 0..32 and `function` is 0..8; the constructors reject anything
-/// wider so callers can never build an out-of-range config cycle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PciAddress {
-    bus: u8,
-    device: u8,
-    function: u8,
-}
-
-impl PciAddress {
-    /// Build a config address, returning `None` if the device/function index
-    /// is outside the architecturally valid range.
-    pub const fn new(bus: u8, device: u8, function: u8) -> Option<Self> {
-        if device < 32 && function < 8 {
-            Some(Self {
-                bus,
-                device,
-                function,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Build a config address without bounds checking.
-    ///
-    /// Used only by the enumerator, which already iterates `device` 0..32 and
-    /// `function` 0..8 and therefore cannot construct an invalid address.
-    pub const fn new_unchecked(bus: u8, device: u8, function: u8) -> Self {
-        Self {
-            bus,
-            device,
-            function,
-        }
-    }
-
-    pub const fn bus(&self) -> u8 {
-        self.bus
-    }
-    pub const fn device(&self) -> u8 {
-        self.device
-    }
-    pub const fn function(&self) -> u8 {
-        self.function
-    }
-
-    /// Encode the 32-bit value written to 0xCF8 to select this function at the
-    /// given dword-aligned `offset` for the next 0xCFC access.
-    #[inline]
-    const fn config_address(&self, offset: u8) -> u32 {
-        0x8000_0000
-            | ((self.bus as u32) << 16)
-            | ((self.device as u32) << 11)
-            | ((self.function as u32) << 8)
-            | ((offset as u32) & 0xFC)
-    }
-}
-
-impl fmt::Display for PciAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:02x}:{:02x}.{}", self.bus, self.device, self.function)
-    }
-}
-
-/// Read a 4-byte config dword at `offset` (dword-aligned; low bits ignored).
-///
-/// SAFETY: this issues a real PCI config cycle. `addr` must address a present
-/// function or the read returns 0xFFFF_FFFF, which the enumerator treats as
-/// "absent". Config reads are side-effect-free on compliant devices.
-unsafe fn config_read_dword(addr: PciAddress, offset: u8) -> u32 {
-    // SAFETY: 0xCF8/0xCFC are the fixed PCI config ports; the address latch
-    // value is well-formed by construction via PciAddress::config_address.
-    unsafe {
-        outl(PCI_CONFIG_ADDR, addr.config_address(offset));
-        inl(PCI_CONFIG_DATA)
-    }
-}
 
 /// Vendor ID at offset 0x00; `0xFFFF` means no function present.
 #[inline]
 fn read_vendor_id(addr: PciAddress) -> u16 {
-    // SAFETY: read-only config cycle; absent functions yield 0xFFFF.
-    let d = unsafe { config_read_dword(addr, 0x00) };
-    (d & 0xFFFF) as u16
+    addr.read_vendor()
 }
 
 /// Device ID at offset 0x02.
 #[inline]
 fn read_device_id(addr: PciAddress) -> u16 {
-    let d = unsafe { config_read_dword(addr, 0x00) };
-    (d >> 16) as u16
+    addr.read_device()
 }
 
 /// Revision / prog-if / subclass / base-class packed at offset 0x08.
 #[inline]
 fn read_class_code(addr: PciAddress) -> (u8, u8, u8, u8) {
-    let d = unsafe { config_read_dword(addr, 0x08) };
+    let d = addr.read32(0x08);
     // little-endian dword: rev(0x08) | progif(0x09)<<8 | sub(0x0A)<<16 | base(0x0B)<<24
     (
         (d & 0xFF) as u8,         // revision
@@ -190,29 +57,27 @@ fn read_class_code(addr: PciAddress) -> (u8, u8, u8, u8) {
 /// Header type at offset 0x0E. Bit 7 set => multi-function device.
 #[inline]
 fn read_header_type(addr: PciAddress) -> u8 {
-    let d = unsafe { config_read_dword(addr, 0x0C) };
-    ((d >> 16) & 0xFF) as u8
+    addr.read_header_type_byte()
 }
 
 /// Raw BAR `i` (0..6) at offset `0x10 + 4*i`.
 #[inline]
 fn read_bar_raw(addr: PciAddress, index: u8) -> u32 {
     debug_assert!(index < 6);
-    unsafe { config_read_dword(addr, 0x10 + index * 4) }
+    addr.read_bar(index as usize).unwrap_or(0)
 }
 
 /// Interrupt line (0x3C) and interrupt pin (0x3D).
 #[inline]
 fn read_interrupt(addr: PciAddress) -> (u8, u8) {
-    let d = unsafe { config_read_dword(addr, 0x3C) };
+    let d = addr.read32(0x3C);
     ((d & 0xFF) as u8, ((d >> 8) & 0xFF) as u8)
 }
 
 /// Secondary bus number behind a type-1 bridge (offset 0x19).
 #[inline]
 fn read_secondary_bus(addr: PciAddress) -> u8 {
-    let d = unsafe { config_read_dword(addr, 0x18) };
-    ((d >> 8) & 0xFF) as u8
+    addr.read8(0x19)
 }
 
 // --- Header-type and base-class taxonomy ------------------------------------
@@ -225,9 +90,6 @@ const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
 const HEADER_TYPE_MASK: u8 = 0x7F;
 /// PCI base class for bridge devices — the recursion trigger.
 const BASE_CLASS_BRIDGE: u8 = 0x06;
-/// Vendor ID returned by an absent function; used as the "no device here" test.
-const VENDOR_NONE: u16 = 0xFFFF;
-
 /// Decoded config-header layout. Only the shapes the enumerator acts on are
 /// distinguished; anything else is surfaced as [`Self::Other`] so a log line
 /// still names it and a driver can inspect the raw byte.
@@ -615,7 +477,8 @@ fn scan_bus(bus: u8, out: &mut KVec<PciDevice>, visited: &mut [bool; 256]) {
     visited[bus as usize] = true;
 
     for device in 0u8..32 {
-        let base = PciAddress::new_unchecked(bus, device, 0);
+        let base = PciAddress::new(bus, device, 0)
+            .expect("enumerator device/function indices are architecturally bounded");
         // Function 0 must be present for any function on this device to exist.
         let Some(first) = PciDevice::probe(base) else {
             continue;
@@ -629,7 +492,8 @@ fn scan_bus(bus: u8, out: &mut KVec<PciDevice>, visited: &mut [bool; 256]) {
         // functions, producing phantom duplicates.
         if multifunction {
             for function in 1u8..8 {
-                let addr = PciAddress::new_unchecked(bus, device, function);
+                let addr = PciAddress::new(bus, device, function)
+                    .expect("enumerator device/function indices are architecturally bounded");
                 if let Some(dev) = PciDevice::probe(addr) {
                     emit_function(dev, out, visited);
                 }

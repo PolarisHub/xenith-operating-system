@@ -32,12 +32,10 @@
 //!
 //! # Per-CPU status
 //!
-//! This module currently owns a single, statically-allocated TSS for the
-//! BSP. When the SMP phase lands, each AP will get its own TSS via the
-//! `PerCpu` area and a GDT slot pointing at it; the `bsp_tss` static and
-//! `BSP_GDT.tss` reference will move into `PerCpu::tss`. The public
-//! surface (`load`, `load_tss`, `set_rsp0`) is written so that swap is
-//! mechanical.
+//! The BSP retains statically allocated GDT/TSS storage. Each AP already owns
+//! a permanent TSS in its [`PerCpuArea`](super::percpu::PerCpuArea) and a
+//! CPU-local GDT prepared by the SMP bring-up path; [`init_for_ap`] patches
+//! that GDT's descriptor to the matching TSS before loading GDTR and TR.
 
 use core::mem;
 use core::ptr::{addr_of, addr_of_mut};
@@ -524,8 +522,8 @@ const _: () = assert!(mem::size_of::<TaskStateSegment>() == 104);
 ///
 /// The TSS is held out-of-line (in a separate static) and referenced by
 /// address from the TSS descriptor. This keeps the TSS mutable without
-/// having to make the entire GDT `static mut`, and it matches how the
-/// SMP phase will allocate one TSS per CPU from the `PerCpu` area.
+/// having to mutate descriptor bytes when `rsp0` changes. The BSP uses its
+/// static TSS; AP descriptors reference their `PerCpuArea` TSS.
 #[repr(C, packed)]
 pub struct GlobalDescriptorTable {
     null: SegmentDescriptor,
@@ -724,17 +722,15 @@ pub unsafe fn load_tss(selector: u16) {
 ///
 /// Statically allocated so the GDT can reference its address at
 /// const-evaluation time. The scheduler overwrites `rsp0` on every
-/// context switch and the IDT phase sets `ist[6]` (IST7) for the
-/// double-fault stack.
+/// context switch and [`super::tss::build_tss`] installs `ist[6]` (IST7) for
+/// the BSP critical-fault stack.
 ///
 /// This is `static mut` because the scheduler mutates `rsp0` on every
 /// context switch. Access is mediated by [`bsp_tss`] which hands out a
 /// `&mut` guarded by the fact that only the BSP touches its own TSS and
 /// only after `load_tss` has run.
-// Future: when the SMP phase lands, this moves into `PerCpu::tss` and
-// each AP gets its own TSS allocated from the per-CPU area. The `BSP_GDT`
-// below will be replaced by a per-CPU GDT whose TSS descriptor points at
-// that CPU's TSS. Until then this static is the single source of truth.
+// This object is intentionally BSP-only. APs use the TSS embedded in their
+// permanent PerCpuArea and a matching GDT stored by the SMP module.
 static mut BSP_TSS: TaskStateSegment = TaskStateSegment::new();
 
 /// The BSP's Global Descriptor Table.
@@ -774,15 +770,15 @@ static BSP_RSP0_WRITES: AtomicU64 = AtomicU64::new(0);
 /// Returns a `&mut TaskStateSegment` that the scheduler / IDT phase can
 /// use to set `rsp0` and the IST entries. This is safe because:
 ///
-/// * only the BSP calls this (APs use their own per-CPU TSS later);
+/// * only the BSP calls this (APs use their live per-CPU TSS);
 /// * the BSP runs single-threaded until the scheduler starts, and after
 ///   that only the scheduler on the BSP touches `rsp0`;
 /// * the GDT's TSS descriptor only stores the TSS's *address*, so
 ///   mutating the TSS through this reference cannot invalidate the
 ///   descriptor.
 ///
-/// When the SMP phase lands this function is replaced by
-/// `PerCpu::current().tss()` and the BSP static is retired.
+/// This remains the BSP-specific accessor because the BSP GDT intentionally
+/// references this static; AP scheduling updates `PerCpuArea::tss` directly.
 pub fn bsp_tss() -> &'static mut TaskStateSegment {
     // SAFETY: `BSP_TSS` is a `static mut` aliased by the GDT's TSS
     // descriptor (which only holds the address). We hand out an exclusive
@@ -801,11 +797,9 @@ pub fn bsp_tss() -> &'static mut TaskStateSegment {
 /// 2. loads the TSS selector into TR so privilege changes pick up
 ///    `rsp0` and IST entries.
 ///
-/// After this returns, `bsp_tss().rsp0` is still zero — the scheduler
-/// must set it before entering ring 3, and the IDT phase must set
-/// `ist[6]` (IST7) for the double-fault stack. We do not set them here
-/// because the stacks are allocated by the mm/sched phases, which run
-/// later.
+/// This function only loads the already-configured TSS. The public
+/// [`super::tss::init_bsp`] wrapper installs the BSP IST stack first; the
+/// scheduler refreshes `rsp0` before entering ring 3.
 pub fn init_bsp() {
     // Patch the TSS descriptor base with the real address of `BSP_TSS`.
     // `BSP_GDT::new(0)` left this as zero because const evaluation cannot

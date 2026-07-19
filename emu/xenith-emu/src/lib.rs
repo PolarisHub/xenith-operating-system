@@ -9,6 +9,7 @@ pub mod host_input;
 pub mod machine;
 pub mod memory;
 pub mod platform;
+pub mod uefi;
 
 pub use cpu::{Cpu, CpuFault, CpuState, ExitReason};
 pub use debug::{
@@ -23,3 +24,4 @@ pub use machine::{
 };
 pub use memory::{Access, MemoryBus, MemoryError, PagingContext, Privilege};
 pub use platform::{AtaDiskError, AtaDiskImage};
+pub use uefi::{UefiError, UefiIsoBootTrace, UefiServiceCalls};

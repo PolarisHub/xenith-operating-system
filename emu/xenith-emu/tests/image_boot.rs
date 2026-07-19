@@ -143,3 +143,81 @@ fn bios_firmware_image_reaches_userspace_shell() {
         assert!(serial.contains(marker), "missing {marker:?}\n{serial}");
     }
 }
+
+#[test]
+#[ignore = "requires `xenith-build all`; executes packaged BOOTX64.EFI and boots for 100M iterations"]
+fn uefi_iso_executes_packaged_pe_and_reaches_userspace_shell() {
+    let iso = fs::read(workspace_file("build/xenith.iso")).expect("read built ISO");
+    let bootx64 = fs::read(workspace_file("build/bootloader/BOOTX64.EFI"))
+        .expect("read independently built BOOTX64.EFI");
+    let kernel =
+        fs::read(workspace_file("build/kernel.elf")).expect("read independently built kernel");
+    let initrd =
+        fs::read(workspace_file("build/initramfs.cpio")).expect("read independently built initrd");
+    let mut machine = Machine::new(MachineConfig {
+        memory_bytes: 256 * 1024 * 1024,
+        instruction_limit: 100_000_000,
+        mirror_serial: false,
+        ..MachineConfig::default()
+    });
+    machine
+        .load_uefi_iso(&iso)
+        .expect("execute packaged UEFI application from platform-0xEF ESP");
+    let trace = machine
+        .uefi_boot_trace()
+        .cloned()
+        .expect("UEFI execution trace");
+    assert_eq!(trace.boot_catalog_lba, 22);
+    assert!(trace.bios_image_lba > trace.boot_catalog_lba);
+    assert!(trace.efi_image_lba > trace.bios_image_lba);
+    assert_eq!(trace.efi_load_sectors, 32_768);
+    assert_eq!(
+        trace.bootx64_checksum,
+        xenith_boot_common::fnv1a64(&bootx64)
+    );
+    assert_eq!(trace.kernel_checksum, xenith_boot_common::fnv1a64(&kernel));
+    assert_eq!(trace.initrd_checksum, xenith_boot_common::fnv1a64(&initrd));
+    assert_ne!(trace.preferred_image_base, trace.image_load_base);
+    assert_eq!(trace.image_load_base, 0x0100_0000);
+    assert!(trace.pe_instructions > 1_000, "{trace:#?}");
+    assert!(trace.pe_fetched_bytes > trace.pe_instructions);
+    assert_ne!(trace.pe_execution_checksum, 0);
+    assert_eq!(trace.services.handle_protocol, 2);
+    assert_eq!(trace.services.open_volume, 1);
+    assert_eq!(trace.services.file_open, 2);
+    assert_eq!(trace.services.file_get_info, 2);
+    assert_eq!(trace.services.file_read, 2);
+    assert_eq!(trace.services.file_close, 2);
+    assert_eq!(trace.services.locate_protocol, 1);
+    assert!(trace.services.allocate_pages >= 8);
+    assert!(trace.services.get_memory_map >= 2);
+    assert_eq!(trace.services.exit_boot_services, 1);
+    assert!(trace.bios_catalog_exact_stage_execution);
+    assert!(trace.bios_stage1_instructions >= 50);
+    assert!(trace.bios_stage2_instructions >= 8_000);
+    assert!(trace.boot_services_exited);
+    assert!(!trace.semantic_loader_fallback);
+    assert_eq!(trace.rsdp, 0x000e_0000);
+    assert_ne!(trace.final_cr3, 0x1000);
+    let mut handoff_magic = [0_u8; 8];
+    machine
+        .bus
+        .read_physical(trace.handoff_address, &mut handoff_magic)
+        .expect("read UEFI handoff");
+    assert_eq!(
+        u64::from_le_bytes(handoff_magic),
+        xenith_boot_common::XENITH_BOOT_MAGIC
+    );
+
+    let summary = machine.run();
+    let serial = String::from_utf8_lossy(&summary.serial);
+    assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+    for marker in [
+        "xenith: init",
+        "user: init spawned",
+        "Xenith shell 0.1",
+        "xenith$ ",
+    ] {
+        assert!(serial.contains(marker), "missing {marker:?}\n{serial}");
+    }
+}

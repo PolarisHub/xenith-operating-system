@@ -19,37 +19,14 @@
 //! userspace program that passes a kernel address or an unmapped pointer gets
 //! `-EFAULT` instead of corrupting kernel state.
 //!
-//! # What is real vs stub
+//! # Subsystem delegation
 //!
-//! The handlers that have a real backing subsystem today are fully
-//! implemented:
-//!
-//! * [`sys_write`] — writes to stdout/stderr (fd 1/2) through the kernel
-//!   [`console`], and to any open file through the fd table.
-//! * [`sys_exit`] — terminates the current task via the scheduler.
-//! * [`sys_getpid`] / [`sys_getppid`] — return the current task's id (and a
-//!   placeholder parent until the process tree lands).
-//! * [`sys_yield`] — delegates to [`sched::yield_now`].
-//! * [`sys_nanosleep`] — sleeps via [`sched::sleep_until`] against the
-//!   monotonic clock.
-//! * [`sys_uname`] — fills a `utsname` with static system identification.
-//!
-//! Handlers whose backing subsystem has not landed yet (the VFS, the user
-//! allocator, the process tree) are thin local stubs that either return
-//! `-ENOSYS` or implement the minimum that keeps `libuser` usable. Each stub
-//! names the future replacement in a single-line comment so the wiring point
-//! is greppable when the real module arrives.
-//!
-//! # The file-descriptor table
-//!
-//! There is no `Process` struct in tree yet (`user::process` is a sibling
-//! phase), so the per-process file-descriptor table lives here as a thin
-//! global stub: [`FD_TABLE`] is a fixed-size array of [`Option<FileHandle>`]
-//! guarded by a [`SpinLock`]. Descriptors 0, 1, and 2 are pre-installed as
-//! stdin/stdout/stderr backed by the kernel console. When `user::process`
-//! lands, this table moves onto the `Process` struct verbatim and the global
-//! is removed; the handler call sites do not change because they already go
-//! through [`with_fd_table`].
+//! This module owns ABI decoding, user-memory copies, and errno conversion;
+//! the backing objects remain in their canonical subsystems. File operations
+//! and per-process descriptor tables go through [`crate::fs::syscalls`],
+//! process identity/lifecycle/waiting goes through [`crate::user::process`],
+//! and socket operations go through [`crate::net`]. Socket handles currently
+//! use a separate bounded descriptor range mapped by [`SOCKET_FDS`].
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -144,15 +121,9 @@ fn copy_to_user(dst: u64, src: &[u8], len: usize) -> Result<usize, Errno> {
 }
 
 // ---------------------------------------------------------------------------
-// File-descriptor table (thin stub — moves to user::process when it lands)
+// Socket-descriptor compatibility table
 // ---------------------------------------------------------------------------
 
-/// The maximum number of open file descriptors per process.
-///
-/// Matches the conventional `RLIMIT_NOFILE` soft limit on a stock Linux
-/// process; generous enough for `init`/`shell` and small enough that the
-/// fixed array is cheap. When this moves onto `Process` the constant travels
-/// with it.
 /// The standard-input file descriptor number, matching POSIX.
 pub const STDIN_FD: i32 = 0;
 /// The standard-output file descriptor number, matching POSIX.
@@ -381,28 +352,16 @@ impl Timespec {
 }
 
 // ---------------------------------------------------------------------------
-// Process-id helpers (thin stubs — real parent tracking lands with Process)
+// Process-id helpers
 // ---------------------------------------------------------------------------
 
-/// Return the current task's id as a process id, or `1` if there is no
-/// current task.
-///
-/// The scheduler identifies the running task with a [`sched::task::TaskId`];
-/// until `user::process` introduces a separate `Pid` space, the task id is
-/// the pid. The fallback to `1` covers the very first boot path where `init`
-/// runs before the scheduler has installed a current task — `1` is the
-/// conventional `init` pid.
+/// Return the registered process id, or PID 0 outside a userspace process.
 fn current_pid() -> i64 {
     crate::user::process::current_pid().as_u64() as i64
 }
 
-/// Return the parent process id of the current task, or `0` if unknown.
-///
-/// There is no parent-pointer on the task struct yet — the process tree
-/// (`user::process`) is a sibling phase. Until it lands, `getppid` returns
-/// `0` for the first process and `1` for any other, which is the conventional
-/// "init's parent is the kernel, everyone else's parent is init" shape. The
-/// real implementation will read `current_process.parent.pid`.
+/// Return the recorded parent process id, or PID 0 for kernel context and
+/// kernel-spawned processes.
 fn current_ppid() -> i64 {
     crate::user::process::current_ppid().as_u64() as i64
 }
@@ -527,10 +486,8 @@ pub fn sys_write(ctx: &SyscallContext) -> i64 {
 /// Arguments: `args[0]` = path pointer, `args[1]` = flags, `args[2]` = mode.
 ///
 /// Returns a non-negative file descriptor on success, or `-errno` on failure.
-/// The VFS (`fs::vfs`) is a sibling phase; until it lands, `open` returns
-/// `-ENOSYS` for any path. The handler still validates the path pointer so a
-/// buggy or hostile caller gets `-EFAULT` rather than reaching the not-yet-
-/// existent VFS with a kernel address.
+/// Copies and validates the bounded UTF-8 path before delegating to
+/// [`crate::fs::syscalls::sys_open`].
 pub fn sys_open(ctx: &SyscallContext) -> i64 {
     let path_ptr = ctx.arg(0);
     let path_len = ctx.arg(1) as usize;
@@ -739,8 +696,8 @@ pub fn sys_getpid(_ctx: &SyscallContext) -> i64 {
 ///
 /// Arguments: none.
 ///
-/// Returns the ppid. See [`current_ppid`] for the placeholder parent-tracking
-/// that will be replaced by the real process tree in `user::process`.
+/// Returns the parent id recorded by the process table, or PID 0 for a
+/// kernel-spawned process and kernel context.
 pub fn sys_getppid(_ctx: &SyscallContext) -> i64 {
     current_ppid()
 }
@@ -890,6 +847,7 @@ fn process_errno(error: crate::user::ProcessError) -> Errno {
         crate::user::ProcessError::NoCurrentProcess
         | crate::user::ProcessError::NoSuchProcess(_) => Errno::Esrch,
         crate::user::ProcessError::PermissionDenied => Errno::Eperm,
+        crate::user::ProcessError::SignalQueueFull => Errno::Eagain,
         crate::user::ProcessError::NoChildren | crate::user::ProcessError::NotChild(_) => {
             Errno::Echild
         },
@@ -946,9 +904,9 @@ fn process_request_from_user(
 /// options.
 ///
 /// Returns the reaped child's pid on success, `0` for a non-blocking `WNOHANG`
-/// with no changed child, or `-errno` on failure. The process tree is a
-/// sibling phase; until it lands, `waitpid` returns `-ENOSYS` after
-/// validating the status pointer.
+/// with no changed child, or `-errno` on failure. Selection, blocking, and
+/// state transitions are handled by the process table; this adapter encodes
+/// the selected status into the userspace wait-status representation.
 pub fn sys_waitpid(ctx: &SyscallContext) -> i64 {
     let raw_pid = ctx.arg_isize(0);
     let status_ptr = ctx.arg(1);
@@ -1188,10 +1146,9 @@ pub fn sys_ioctl(ctx: &SyscallContext) -> i64 {
 ///
 /// Arguments: `args[0]` = fd, `args[1]` = offset, `args[2]` = whence.
 ///
-/// Returns the new offset on success or `-errno` on failure. The VFS
-/// (`fs::vfs`) tracks per-file offsets; until it lands, `lseek` returns
-/// `-ESPIPE` for the console (which is not seekable) and `-ENOSYS` for a
-/// VFS-backed fd placeholder.
+/// Returns the new offset on success or `-errno` on failure. Per-open-file
+/// offsets and seekability checks are handled by
+/// [`crate::fs::syscalls::sys_lseek`].
 pub fn sys_lseek(ctx: &SyscallContext) -> i64 {
     let fd = ctx.arg_i32(0);
     let offset = ctx.arg_isize(1) as i64;
@@ -1204,12 +1161,12 @@ pub fn sys_lseek(ctx: &SyscallContext) -> i64 {
 
 /// `stat(path, buf)` — get file status.
 ///
-/// Arguments: `args[0]` = path pointer, `args[1]` = pointer to a `stat`
-/// struct.
+/// Arguments: `args[0]` = path pointer, `args[1]` = path length, `args[2]` =
+/// pointer to a `stat` struct.
 ///
-/// Returns `0` on success or `-errno` on failure. The VFS (`fs::vfs`) is a
-/// sibling phase; until it lands, `stat` returns `-ENOSYS` after validating
-/// both pointers.
+/// Returns `0` on success or `-errno` on failure. The path is copied from
+/// userspace, metadata is obtained through [`crate::fs::syscalls::sys_stat`],
+/// and the stable ABI structure is copied back to the caller.
 pub fn sys_stat(ctx: &SyscallContext) -> i64 {
     let path_ptr = ctx.arg(0);
     let path_len = ctx.arg(1) as usize;
@@ -1257,11 +1214,9 @@ pub fn sys_stat(ctx: &SyscallContext) -> i64 {
 ///
 /// Arguments: `args[0]` = fd.
 ///
-/// Returns the lowest free fd that now refers to the same file, or `-errno`
-/// on failure. The duplication is handled entirely within the fd table: we
-/// read the handle, then allocate a new slot for a copy of it. The console
-/// handle is `Copy`, so this is a cheap clone; a future VFS `File` will need
-/// a refcount bump here.
+/// Returns the lowest free fd that now refers to the same open file, or
+/// `-errno` on failure. The filesystem descriptor table preserves the shared
+/// open-file state and allocates the new slot.
 pub fn sys_dup(ctx: &SyscallContext) -> i64 {
     let fd = ctx.arg_i32(0);
     match crate::fs::syscalls::sys_dup(fd) {
@@ -1292,9 +1247,9 @@ pub fn sys_dup2(ctx: &SyscallContext) -> i64 {
 /// Arguments: `args[0]` = pointer to a two-element `int` array to receive
 /// the read and write descriptors.
 ///
-/// Returns `0` on success or `-errno` on failure. A kernel pipe
-/// implementation (a ring buffer with two fds) is a sibling phase; until it
-/// lands, `pipe` returns `-ENOSYS` after validating the pointer.
+/// Returns `0` on success or `-errno` on failure. The filesystem creates the
+/// pipe endpoints and installs both descriptors atomically; if copying the
+/// pair to userspace fails, this handler closes both endpoints.
 pub fn sys_pipe(ctx: &SyscallContext) -> i64 {
     let fds_ptr = ctx.arg(0);
     if let Err(e) = check_user_buf(fds_ptr, 8) {

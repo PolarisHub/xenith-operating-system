@@ -14,10 +14,11 @@
 //! * an optional framebuffer console registered later by the `console`
 //!   subsystem via [`register_console`].
 //!
-//! The UART driver here is deliberately minimal — just enough to push bytes
-//! out before the real `devices`-phase serial driver exists. It is a thin
-//! local stub that the console/devices phase will supersede; the public sink
-//! trait lets that phase plug its own writer in without touching this file.
+//! The UART writer here is deliberately small and permanently independent of
+//! higher-level device registration: its polled COM1 path remains available
+//! during early boot, interrupts-disabled sections, and panic handling. The
+//! public sink trait adds the framebuffer console without replacing that
+//! emergency serial path.
 //!
 //! Disambiguation: this crate declares `pub mod log`, so the external `log`
 //! crate is reached through the `log_facade` alias (`use ::log as
@@ -85,9 +86,9 @@ const COM1: u16 = 0x3F8;
 
 /// A minimal 16550 UART writer.
 ///
-/// Replaced by the full `devices`-phase serial driver; until then this is the
-/// only kernel output path. The port is configured for 115200 baud, 8 data
-/// bits, no parity, one stop bit (8N1) with the FIFO enabled.
+/// Kept as the logger's independent polled sink even after device
+/// initialization. The port is configured for 115200 baud, 8 data bits, no
+/// parity, one stop bit (8N1) with the FIFO enabled.
 #[derive(Clone, Copy)]
 struct SerialPort {
     base: u16,

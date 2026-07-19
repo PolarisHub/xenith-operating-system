@@ -1,4 +1,4 @@
-.PHONY: all build bootloader userspace image iso run test integration clippy fmt fmt-check docs clean
+.PHONY: all build bootloader userspace image iso run check test integration clippy fmt fmt-check docs clean
 
 all build:
 	cargo run -p xenith-build -- all
@@ -15,12 +15,25 @@ image iso:
 run: all
 	cargo run -p xenith-emu -- --kernel build/kernel.elf --initrd build/initramfs.cpio --memory 512M --serial stdio --max-instructions 100000000
 
+check:
+	cargo check --workspace --all-targets
+
 test:
-	cargo test -p xenith-fs-format -p xenith-x86 -p xenith-emu -p xenith-iso -p xenith-asm -p xenith-build -p xenith-mkfs -p xenith-fsck -p xenith-mount -p xenith-ld -p xenith-cc -p xenith-integration
+	cargo test --workspace
+	cargo test --manifest-path bootloader/common/Cargo.toml
+	cargo test --manifest-path bootloader/stage1/Cargo.toml
+	cargo test --manifest-path bootloader/stage2/Cargo.toml --features host-tool
+	cargo test --manifest-path bootloader/uefi/Cargo.toml
 
 integration: all
 	cargo test -p xenith-integration --test boot kernel_reaches_userspace_shell -- --ignored --exact
 	cargo test -p xenith-integration --test shell shell_executes_builtins_and_coreutils_via_ps2 -- --ignored --exact
+	cargo test -p xenith-emu --test image_boot manifest_image_reaches_userspace_shell -- --ignored --exact
+	cargo test -p xenith-emu --test image_boot bios_firmware_image_reaches_userspace_shell -- --ignored --exact
+	cargo test -p xenith-emu --test image_boot uefi_iso_executes_packaged_pe_and_reaches_userspace_shell -- --ignored --exact
+	cargo test -p xenith-emu --test cli_input input_script_proves_shell_pipeline_and_redirection -- --ignored --exact
+	cargo test -p xenith-emu --test c_toolchain xenith_built_c_utility_executes_in_ring3 -- --ignored --exact
+	cargo test -p xenith-emu --test smp_boot two_processor_kernel_brings_ap_online_and_reaches_shell -- --ignored --exact
 
 clippy:
 	cargo clippy --workspace --exclude xenith-kernel --exclude xenith-init --exclude xenith-sh --exclude xenith-coreutils --exclude xenith-editor --exclude xenith-net --exclude xenith-examples --exclude xenith-libc --all-targets -- -D warnings

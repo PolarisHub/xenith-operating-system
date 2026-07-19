@@ -67,6 +67,17 @@ pub struct IsoLayout {
     pub total_blocks: u32,
 }
 
+/// Borrowed El Torito images selected from a validated ISO boot catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElToritoBootImages<'a> {
+    pub boot_catalog_lba: u32,
+    pub bios_image_lba: u32,
+    pub efi_image_lba: u32,
+    pub efi_load_sectors: u16,
+    pub bios_disk: &'a [u8],
+    pub efi_system_partition: &'a [u8],
+}
+
 /// Builds a hybrid ISO9660 image with BIOS hard-disk and UEFI FAT boot entries.
 pub fn build_iso_image(
     bios_disk: &[u8],
@@ -152,6 +163,155 @@ pub fn build_iso_image_with_layout(
     write_file(&mut image, layout.initrd_lba, initrd)?;
 
     Ok((image, layout))
+}
+
+/// Selects Xenith's BIOS hard-disk and platform-0xEF no-emulation images from
+/// the actual ISO descriptors, catalog, and root-directory extents.
+pub fn extract_el_torito_boot_images(image: &[u8]) -> Result<ElToritoBootImages<'_>, ImageError> {
+    if image.len() < (BOOT_CATALOG_LBA as usize + 1) * ISO_BLOCK_SIZE
+        || !image.len().is_multiple_of(ISO_BLOCK_SIZE)
+    {
+        return Err(ImageError::InvalidInput(
+            "ISO image is truncated or unaligned",
+        ));
+    }
+    let pvd = logical_block(image, PRIMARY_VOLUME_DESCRIPTOR_LBA)?;
+    require_descriptor(pvd, 1)?;
+    let boot_record = logical_block(image, BOOT_RECORD_DESCRIPTOR_LBA)?;
+    require_descriptor(boot_record, 0)?;
+    if &boot_record[7..30] != BOOT_SYSTEM_IDENTIFIER {
+        return Err(ImageError::InvalidInput(
+            "El Torito boot record identifier is invalid",
+        ));
+    }
+    let catalog_lba = read_u32_le(boot_record, 71);
+    let catalog = logical_block(image, catalog_lba)?;
+    if catalog[0] != 1
+        || catalog[1] != 0
+        || catalog[30..32] != [0x55, 0xaa]
+        || el_torito_word_sum(&catalog[..32]) != 0
+    {
+        return Err(ImageError::InvalidInput(
+            "El Torito validation entry is invalid",
+        ));
+    }
+    if catalog[32] != 0x88 || catalog[33] != 4 || read_u16_le(catalog, 38) != 1 {
+        return Err(ImageError::InvalidInput(
+            "El Torito BIOS hard-disk entry is invalid",
+        ));
+    }
+    let bios_lba = read_u32_le(catalog, 40);
+    if catalog[64] != 0x91 || catalog[65] != 0xef || read_u16_le(catalog, 66) != 1 {
+        return Err(ImageError::InvalidInput(
+            "El Torito UEFI section is invalid",
+        ));
+    }
+    if catalog[96] != 0x88
+        || catalog[97] != 0
+        || read_u16_le(catalog, 98) != 0
+        || catalog[100] != 0
+        || catalog[101] != 0
+    {
+        return Err(ImageError::InvalidInput(
+            "El Torito UEFI boot entry is invalid",
+        ));
+    }
+    let efi_load_sectors = read_u16_le(catalog, 102);
+    let efi_lba = read_u32_le(catalog, 104);
+
+    let root_lba = read_u32_le(pvd, 158);
+    let root_len = read_u32_le(pvd, 166);
+    let root = byte_extent(image, root_lba, root_len)?;
+    let (bios_file_lba, bios_len) = find_iso_file(root, BIOS_IMAGE_NAME)?;
+    let (efi_file_lba, efi_len) = find_iso_file(root, EFI_IMAGE_NAME)?;
+    if bios_file_lba != bios_lba || efi_file_lba != efi_lba {
+        return Err(ImageError::InvalidInput(
+            "El Torito catalog and ISO extents disagree",
+        ));
+    }
+    if usize::from(efi_load_sectors).checked_mul(crate::EFI_SECTOR_SIZE) != Some(efi_len as usize) {
+        return Err(ImageError::InvalidInput(
+            "El Torito UEFI load size is invalid",
+        ));
+    }
+    let bios_disk = byte_extent(image, bios_lba, bios_len)?;
+    validate_disk_image(bios_disk)?;
+    let efi_system_partition = byte_extent(image, efi_lba, efi_len)?;
+    Ok(ElToritoBootImages {
+        boot_catalog_lba: catalog_lba,
+        bios_image_lba: bios_lba,
+        efi_image_lba: efi_lba,
+        efi_load_sectors,
+        bios_disk,
+        efi_system_partition,
+    })
+}
+
+fn require_descriptor(descriptor: &[u8], kind: u8) -> Result<(), ImageError> {
+    if descriptor[0] != kind || &descriptor[1..6] != STANDARD_IDENTIFIER || descriptor[6] != 1 {
+        return Err(ImageError::InvalidInput("ISO volume descriptor is invalid"));
+    }
+    Ok(())
+}
+
+fn find_iso_file(directory: &[u8], name: &[u8]) -> Result<(u32, u32), ImageError> {
+    let mut cursor = 0_usize;
+    while cursor < directory.len() && directory[cursor] != 0 {
+        let length = usize::from(directory[cursor]);
+        let record = directory.get(cursor..cursor.saturating_add(length)).ok_or(
+            ImageError::InvalidInput("ISO directory record is truncated"),
+        )?;
+        if record.len() < 34 {
+            return Err(ImageError::InvalidInput("ISO directory record is invalid"));
+        }
+        let name_len = usize::from(record[32]);
+        let identifier =
+            record
+                .get(33..33_usize.saturating_add(name_len))
+                .ok_or(ImageError::InvalidInput(
+                    "ISO directory identifier is truncated",
+                ))?;
+        if identifier == name {
+            if record[25] & 2 != 0 {
+                return Err(ImageError::InvalidInput("ISO boot image is a directory"));
+            }
+            return Ok((read_u32_le(record, 2), read_u32_le(record, 10)));
+        }
+        cursor = cursor
+            .checked_add(length)
+            .ok_or(ImageError::ImageTooLarge("ISO directory"))?;
+    }
+    Err(ImageError::InvalidInput(
+        "required ISO boot image is missing",
+    ))
+}
+
+fn logical_block(image: &[u8], lba: u32) -> Result<&[u8], ImageError> {
+    let start = block_offset(lba)?;
+    image
+        .get(start..start + ISO_BLOCK_SIZE)
+        .ok_or(ImageError::InvalidInput("ISO logical block is truncated"))
+}
+
+fn byte_extent(image: &[u8], lba: u32, byte_len: u32) -> Result<&[u8], ImageError> {
+    let start = block_offset(lba)?;
+    let length = usize::try_from(byte_len).map_err(|_| ImageError::ImageTooLarge("ISO extent"))?;
+    image
+        .get(start..start.saturating_add(length))
+        .ok_or(ImageError::InvalidInput("ISO file extent is truncated"))
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 fn validate_inputs(

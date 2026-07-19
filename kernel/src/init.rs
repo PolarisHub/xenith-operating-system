@@ -15,16 +15,7 @@ pub fn init(boot_info: &'static limine::BootInfo) {
     crate::console::init(boot_info);
     ::log::info!("console: ready");
 
-    crate::arch::x86_64::early_init();
-    // Configure the BSP's critical-fault IST before loading TR. RSP0 is
-    // filled with the selected task's stack by the scheduler before the
-    // first ring-3 transition.
-    crate::arch::x86_64::tss::init_bsp(0);
-    crate::arch::x86_64::percpu::init_for_bsp();
-    crate::arch::x86_64::fpu::init();
-    crate::arch::x86_64::idt::install_exception_handlers();
-    crate::arch::x86_64::idt::load();
-    ::log::info!("arch: descriptor tables and CPU state ready");
+    crate::arch::init(boot_info);
 
     crate::mm::init(boot_info);
     ::log::info!("mm: ready");

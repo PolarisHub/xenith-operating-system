@@ -13,8 +13,8 @@
 //! [`Idt`] is a fixed array of 256 [`IdtEntry`] words. Vectors 0..=31 are
 //! the architecture-defined CPU exceptions (`#DE`..reserved) and are
 //! installed by [`install_exception_handlers`]. Vectors 32..=255 are the
-//! IRQ and software-interrupt region; those are wired up by later phases
-//! (the local APIC, the I/O APIC, the syscall path) via
+//! IRQ and software-interrupt region; timer, SMP IPI, and device gates are
+//! installed by their owning live subsystems via
 //! [`Idt::set_interrupt_handler`].
 //!
 //! # Gate type
@@ -42,11 +42,10 @@
 //!
 //! # The static table
 //!
-//! A single [`IDT`] lives in a `spin::mutex::SpinLock` for the whole
-//! kernel. Early boot is single-CPU and the only writer; later, SMP phases
-//! add per-CPU tables if APs need private IRQ vectors. The lock keeps the
-//! common "build it once, then read it from every core" path safe without
-//! paying for a per-CPU indirection today. The table is `static`, so its
+//! A single shared [`IDT`] lives in a [`SpinLock`] for the whole kernel.
+//! Subsystems publish gates before the relevant IRQ source is unmasked, and
+//! every AP loads this same table before enabling interrupts. The table is
+//! `static`, so its
 //! address is stable for the lifetime of the kernel — a hard requirement,
 //! because `lidt` stores the base address in the IDTR and the CPU keeps
 //! reading from it on every interrupt.
@@ -348,11 +347,10 @@ impl core::fmt::Debug for Idt {
 
 /// The kernel's single Interrupt Descriptor Table.
 ///
-/// Behind a [`SpinLock`] because, although early boot is the only writer,
-/// later SMP phases may install per-CPU IRQ vectors and a lock keeps that
-/// path correct without a per-CPU indirection today. The table lives in a
-/// `static`, so its address — which `lidt` bakes into the IDTR — is stable
-/// for the lifetime of the kernel.
+/// Behind a [`SpinLock`] because timer, SMP, and device initialization publish
+/// gates at different points before their sources are unmasked. Every CPU
+/// loads this shared table; its static address remains valid in each IDTR for
+/// the lifetime of the kernel.
 pub static IDT: SpinLock<Idt> = SpinLock::new(Idt::new());
 
 /// Install handlers for the 32 architecture CPU exceptions (vectors 0..31).

@@ -13,8 +13,9 @@
 //!
 //! The struct is re-exported here rather than defined here so the dependency
 //! stays natural: `gdt` owns the CPU table entries, `tss` owns the runtime
-//! policy. When the SMP phase lands, the per-CPU TSS allocation will live
-//! here too, replacing the single BSP static.
+//! policy. The BSP uses the static owned by `gdt`; APs use the TSS embedded in
+//! their permanent per-CPU area and call [`build_tss_with_ist`] with their own
+//! critical-fault stacks during SMP bring-up.
 //!
 //! # IST[7] — the critical-fault stack
 //!
@@ -40,11 +41,11 @@ pub use super::gdt::TaskStateSegment;
 
 /// The IST index reserved for the double-fault (`#DF`) / critical-fault stack.
 ///
-/// IDT gates that select this IST switch to [`BSP_DF_STACK`] on entry,
-/// breaking the recursion that a kernel-stack overflow would otherwise cause.
-/// The value is 7, the highest IST slot; the matching TSS field is
-/// `ist[6]` (IST entries are 1-indexed in IDT gates but stored 0-indexed in
-/// the TSS array).
+/// IDT gates that select this IST switch to the current CPU's configured
+/// critical-fault stack, breaking the recursion that a kernel-stack overflow
+/// would otherwise cause. The BSP uses [`BSP_DF_STACK`]; APs have permanent
+/// stacks in the SMP module. The value is 7, the highest IST slot; the matching
+/// TSS field is `ist[6]` (IDT entries are 1-indexed, the array 0-indexed).
 pub const DOUBLE_FAULT_IST: u8 = 7;
 
 /// The size of each IST stack in bytes.
@@ -85,9 +86,8 @@ struct IstStack {
 /// The BSP's double-fault / critical-fault IST stack.
 ///
 /// Statically allocated in BSS so its address is known at link time and the
-/// TSS can reference it without an allocator. When the SMP phase lands, each
-/// AP will get its own IST stack allocated from the per-CPU area; until then
-/// this single static serves the BSP.
+/// BSP TSS can reference it without an allocator. APs use their own permanent
+/// IST stacks prepared by the SMP bring-up path.
 ///
 /// This is `static mut` because [`df_stack_top`] takes its address for the
 /// CPU to read, and the stack is never accessed through a Rust reference —
@@ -218,8 +218,8 @@ pub fn iomap_base(tss: &TaskStateSegment) -> u16 {
 ///    `ltr` with [`super::gdt::TSS_SELECTOR`].
 ///
 /// After this returns, the CPU will load `RSP0` on the next ring-3 -> ring-0
-/// transition and switch to IST[7] on a `#DF` (once the IDT phase wires
-/// vector 8 to IST 7). Interrupts may be safely enabled; the TSS is ready.
+/// transition and switch to IST[7] on a `#DF`, whose IDT gate selects that
+/// stack. Interrupts may be safely enabled; the TSS is ready.
 ///
 /// # Safety contract (caller)
 ///

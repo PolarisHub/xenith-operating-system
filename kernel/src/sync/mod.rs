@@ -12,7 +12,7 @@
 //! |------|----------|
 //! | [`SpinLock<T>`] | Short, data-only critical sections. Never blocks interrupts. |
 //! | [`SpinLockIRQ<T>`] | Critical sections reachable from interrupt handlers on the same CPU. |
-//! | [`Mutex<T>`] | Code that *will* want to block once a scheduler exists; today it spins. |
+//! | [`Mutex<T>`] | Task-context critical sections; yields when safe and spins during early boot or critical contexts. |
 //! | [`RwLock<T>`] | Read-heavy data with rare, short writes (module list, device tables). |
 //! | [`PerCpu<T>`] | Per-CPU private data accessed without locks. |
 //!
@@ -26,10 +26,13 @@
 //!
 //! # Layering
 //!
-//! `sync` sits below `sched` and `mm` and above `arch`. Standalone short
-//! critical sections use [`crate::arch::x86_64::InterruptGuard`]. The
-//! IRQ-safe spinlock retains its coupled save/lock and unlock/restore
-//! implementation so it can release the lock bit before restoring IF.
+//! Most of `sync` sits below `sched` and `mm` and above `arch`. The mutex slow
+//! path may call the scheduler after checking that it is online; scheduler
+//! internals themselves use [`SpinLock`] so this dependency cannot recurse.
+//! Standalone short critical sections use
+//! [`crate::arch::x86_64::InterruptGuard`]. The IRQ-safe spinlock retains its
+//! coupled save/lock and unlock/restore implementation so it can release the
+//! lock bit before restoring IF.
 //!
 //! # No bring-up step
 //!

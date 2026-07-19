@@ -901,7 +901,7 @@ pub fn signal(pid: ProcessId, signal: Signal) -> Result<DeliverOutcome, ProcessE
     if process.has_exited() {
         return Err(ProcessError::NoSuchProcess(pid));
     }
-    Ok(apply_signal(process, signal))
+    delivery_result(apply_signal(process, signal))
 }
 
 /// Deliver a signal with an explicit stable `siginfo` source payload.
@@ -917,7 +917,7 @@ pub fn signal_with_info(
     else {
         return Err(ProcessError::NoSuchProcess(pid));
     };
-    Ok(apply_signal_with_info(process, signal, Some(info)))
+    delivery_result(apply_signal_with_info(process, signal, Some(info)))
 }
 
 /// Deliver a signal to every live member of a process group.
@@ -940,18 +940,34 @@ fn signal_group_inner(
     info: Option<xenith_abi::SigInfo>,
 ) -> Result<usize, ProcessError> {
     let mut table = PROCESS_TABLE.lock();
+    let mut matched = 0usize;
     let mut delivered = 0usize;
+    let mut queue_full = false;
     for process in table
         .iter_mut()
         .filter(|process| process.process_group == process_group && !process.has_exited())
     {
-        let _ = apply_signal_with_info(process, signal, info);
-        delivered += 1;
+        matched += 1;
+        match delivery_result(apply_signal_with_info(process, signal, info)) {
+            Ok(_) => delivered += 1,
+            Err(ProcessError::SignalQueueFull) => queue_full = true,
+            Err(error) => return Err(error),
+        }
     }
-    if delivered == 0 {
+    if matched == 0 {
         Err(ProcessError::NoSuchProcess(process_group))
+    } else if delivered == 0 && queue_full {
+        Err(ProcessError::SignalQueueFull)
     } else {
         Ok(delivered)
+    }
+}
+
+fn delivery_result(outcome: DeliverOutcome) -> Result<DeliverOutcome, ProcessError> {
+    match outcome {
+        DeliverOutcome::RealtimeQueueFull { .. } => Err(ProcessError::SignalQueueFull),
+        DeliverOutcome::Invalid => Err(ProcessError::InvalidArgument),
+        accepted => Ok(accepted),
     }
 }
 
@@ -964,6 +980,17 @@ fn apply_signal_with_info(
     signal: Signal,
     info: Option<xenith_abi::SigInfo>,
 ) -> DeliverOutcome {
+    let outcome = info.map_or_else(
+        || deliver_signal(&process.signals, signal),
+        |info| deliver_signal_with_info(&process.signals, signal, info),
+    );
+    if matches!(
+        outcome,
+        DeliverOutcome::RealtimeQueueFull { .. } | DeliverOutcome::Invalid
+    ) {
+        return outcome;
+    }
+
     let disposition = process.signals.disposition(signal);
     let uses_default = signal.is_uncatchable() || matches!(disposition, SignalAction::Default);
     if uses_default {
@@ -991,10 +1018,7 @@ fn apply_signal_with_info(
             DefaultAction::Ignore => {},
         }
     }
-    info.map_or_else(
-        || deliver_signal(&process.signals, signal),
-        |info| deliver_signal_with_info(&process.signals, signal, info),
-    )
+    outcome
 }
 
 /// Park a stopped process at a syscall boundary and apply a pending default
@@ -1651,6 +1675,7 @@ pub enum ProcessError {
     NotChild(ProcessId),
     NoSuchProcess(ProcessId),
     PermissionDenied,
+    SignalQueueFull,
     TableCorrupt,
     Filesystem(FsError),
     AddressSpace(MapError),
@@ -1674,6 +1699,7 @@ impl fmt::Display for ProcessError {
             Self::NotChild(pid) => write!(f, "{pid} is not a child of the current process"),
             Self::NoSuchProcess(pid) => write!(f, "no such process {pid}"),
             Self::PermissionDenied => f.write_str("process operation is not permitted"),
+            Self::SignalQueueFull => f.write_str("real-time signal queue is full"),
             Self::TableCorrupt => f.write_str("process table invariant violated"),
             Self::Filesystem(error) => write!(f, "filesystem error: {error}"),
             Self::AddressSpace(error) => write!(f, "address-space error: {error:?}"),

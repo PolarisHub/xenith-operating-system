@@ -209,6 +209,13 @@ impl<'a> Decoder<'a> {
             0xFC => Ok(Instruction::new(Mnemonic::Cld)),
             0xFD => Ok(Instruction::new(Mnemonic::Std)),
             0xCC => Ok(Instruction::new(Mnemonic::Int3)),
+            0xDB => {
+                if self.byte()? == 0xE3 {
+                    Ok(Instruction::new(Mnemonic::Fninit))
+                } else {
+                    Err(self.error(DecodeErrorKind::UnsupportedOpcode))
+                }
+            },
             0x9C => Ok(Instruction::new(Mnemonic::PushFlags)),
             0x9D => Ok(Instruction::new(Mnemonic::PopFlags)),
             0x98 => {
@@ -577,6 +584,7 @@ impl<'a> Decoder<'a> {
         let opcode = self.byte()?;
         match opcode {
             0x05 => Ok(Instruction::new(Mnemonic::Syscall)),
+            0x06 => Ok(Instruction::new(Mnemonic::Clts)),
             0x07 => Ok(Instruction::new(Mnemonic::Sysret)),
             0x31 => Ok(Instruction::new(Mnemonic::Rdtsc)),
             0x32 => Ok(Instruction::new(Mnemonic::Rdmsr)),
@@ -611,11 +619,17 @@ impl<'a> Decoder<'a> {
                 Ok(Instruction::new(mnemonic).with_operands(base, Some(index)))
             },
             0xAE => {
-                let (operand, _, extension) = self.modrm(OperandSize::Qword)?;
-                if !matches!(operand, Operand::Register { .. }) || !(5..=7).contains(&extension) {
-                    return Err(self.error(DecodeErrorKind::UnsupportedOpcode));
+                let (operand, _, extension) = self.modrm(OperandSize::Oword)?;
+                match (operand, extension) {
+                    (Operand::Memory(_), 0) => {
+                        Ok(Instruction::new(Mnemonic::Fxsave).with_operands(operand, None))
+                    },
+                    (Operand::Memory(_), 1) => {
+                        Ok(Instruction::new(Mnemonic::Fxrstor).with_operands(operand, None))
+                    },
+                    (Operand::Register { .. }, 5..=7) => Ok(Instruction::new(Mnemonic::Fence)),
+                    _ => Err(self.error(DecodeErrorKind::UnsupportedOpcode)),
                 }
-                Ok(Instruction::new(Mnemonic::Fence))
             },
             0x1F => {
                 // Architecturally defined multi-byte NOP.  Its ModRM/SIB and
@@ -925,5 +939,32 @@ mod tests {
             Some(Operand::register(Register::Rdi, OperandSize::Dword)),
             None,
         ]);
+    }
+
+    #[test]
+    fn decodes_legacy_fpu_state_instructions_and_clts() {
+        assert_eq!(decode(&[0x0f, 0x06]).unwrap().mnemonic, Mnemonic::Clts);
+        assert_eq!(decode(&[0xdb, 0xe3]).unwrap().mnemonic, Mnemonic::Fninit);
+
+        let save = decode(&[0x0f, 0xae, 0x07]).unwrap();
+        assert_eq!(save.mnemonic, Mnemonic::Fxsave);
+        assert_eq!(save.length, 3);
+        assert!(matches!(save.operands[0], Some(Operand::Memory(_))));
+
+        let save64 = decode(&[0x48, 0x0f, 0xae, 0x07]).unwrap();
+        assert_eq!(save64.mnemonic, Mnemonic::Fxsave);
+        assert_eq!(save64.length, 4);
+
+        let restore = decode(&[0x0f, 0xae, 0x0e]).unwrap();
+        assert_eq!(restore.mnemonic, Mnemonic::Fxrstor);
+        assert!(matches!(restore.operands[0], Some(Operand::Memory(_))));
+
+        assert!(matches!(
+            decode(&[0x0f, 0xae, 0xc0]),
+            Err(DecodeError {
+                kind: DecodeErrorKind::UnsupportedOpcode,
+                ..
+            })
+        ));
     }
 }
