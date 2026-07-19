@@ -8,6 +8,7 @@ use xenith_boot_common::{
     DiskEntry, DiskEntryKind, DiskManifest, ManifestError, XenithBootInfo, DISK_MANIFEST_LBA,
     DISK_MANIFEST_SIZE,
 };
+use xenith_iso::{extract_el_torito_boot_images, ImageError};
 use xenith_x86::Register;
 
 use crate::cpu::{Cpu, CpuFault, ExitReason};
@@ -103,6 +104,7 @@ pub enum MachineError {
     Ata(AtaDiskError),
     DiskAlreadyAttached,
     Firmware(FirmwareError),
+    Image(ImageError),
     Uefi(UefiError),
 }
 
@@ -132,6 +134,12 @@ impl From<AtaDiskError> for MachineError {
 impl From<FirmwareError> for MachineError {
     fn from(value: FirmwareError) -> Self {
         Self::Firmware(value)
+    }
+}
+
+impl From<ImageError> for MachineError {
+    fn from(value: ImageError) -> Self {
+        Self::Image(value)
     }
 }
 
@@ -617,6 +625,41 @@ impl Machine {
         self.bios_trace = Some(boot.trace);
         self.attach_ata_disk(image, read_only)?;
         Ok(manifest)
+    }
+
+    /// Select and boot the x86 hard-disk-emulation entry from a Xenith El
+    /// Torito ISO. Catalog validation and ISO extent checks happen before the
+    /// embedded disk is passed through the same BIOS path as a raw image.
+    pub fn load_bios_iso(
+        &mut self,
+        iso: &[u8],
+        read_only: bool,
+    ) -> Result<ManifestBoot, MachineError> {
+        let mut bios_disk = extract_el_torito_boot_images(iso)?.bios_disk.to_vec();
+        let manifest_start = usize::try_from(DISK_MANIFEST_LBA)
+            .ok()
+            .and_then(|lba| lba.checked_mul(DISK_MANIFEST_SIZE))
+            .ok_or(MachineError::InvalidDiskImage("manifest offset overflow"))?;
+        let manifest_sector = bios_disk
+            .get(manifest_start..manifest_start + DISK_MANIFEST_SIZE)
+            .ok_or(MachineError::InvalidDiskImage("missing LBA1 manifest"))?;
+        let manifest = DiskManifest::parse(manifest_sector)?;
+        let declared_bytes = usize::try_from(manifest.image_sectors())
+            .ok()
+            .and_then(|sectors| sectors.checked_mul(DISK_MANIFEST_SIZE))
+            .ok_or(MachineError::InvalidDiskImage(
+                "declared disk size overflow",
+            ))?;
+        if declared_bytes > bios_disk.len() {
+            return Err(MachineError::InvalidDiskImage(
+                "ISO BIOS image is shorter than its manifest disk",
+            ));
+        }
+        // The extractor already validated the full-cylinder zero padding used
+        // to give legacy El Torito firmware stable CHS geometry. The bounded
+        // BIOS runner consumes the manifest-declared disk prefix itself.
+        bios_disk.truncate(declared_bytes);
+        self.load_bios_image(bios_disk, read_only)
     }
 
     /// Recorded reset/stage transition evidence for the most recent BIOS-shim
@@ -1356,27 +1399,41 @@ mod tests {
     }
 
     #[test]
-    fn generated_acpi_madt_describes_every_emulated_processor() {
-        let mut bus = MemoryBus::new(2 * 1024 * 1024);
-        install_acpi_tables(&mut bus, 2).unwrap();
-        let mut rsdp = [0_u8; 36];
-        bus.read_physical(ACPI_RSDP_PHYS, &mut rsdp).unwrap();
-        assert_eq!(&rsdp[..8], b"RSD PTR ");
-        assert_eq!(rsdp.iter().copied().fold(0_u8, u8::wrapping_add), 0);
+    fn generated_acpi_madt_describes_supported_processor_counts() {
+        for processor_count in [1, 3, MAX_EMULATED_CPUS] {
+            let mut bus = MemoryBus::new(2 * 1024 * 1024);
+            install_acpi_tables(&mut bus, processor_count).unwrap();
+            let mut rsdp = [0_u8; 36];
+            bus.read_physical(ACPI_RSDP_PHYS, &mut rsdp).unwrap();
+            assert_eq!(&rsdp[..8], b"RSD PTR ");
+            assert_eq!(rsdp.iter().copied().fold(0_u8, u8::wrapping_add), 0);
 
-        let mut madt = vec![0_u8; 44 + 2 * 8 + 12];
-        bus.read_physical(ACPI_MADT_PHYS, &mut madt).unwrap();
-        assert_eq!(&madt[..4], b"APIC");
-        assert_eq!(madt.iter().copied().fold(0_u8, u8::wrapping_add), 0);
-        assert_eq!(&madt[44..52], &[0, 8, 0, 0, 1, 0, 0, 0]);
-        assert_eq!(&madt[52..60], &[0, 8, 1, 1, 1, 0, 0, 0]);
+            let mut madt = vec![0_u8; 44 + processor_count * 8 + 12];
+            bus.read_physical(ACPI_MADT_PHYS, &mut madt).unwrap();
+            assert_eq!(&madt[..4], b"APIC");
+            assert_eq!(madt.iter().copied().fold(0_u8, u8::wrapping_add), 0);
+            assert_eq!(
+                u32::from_le_bytes(madt[4..8].try_into().unwrap()) as usize,
+                madt.len()
+            );
+            for processor in 0..processor_count {
+                let offset = 44 + processor * 8;
+                assert_eq!(madt[offset], 0);
+                assert_eq!(madt[offset + 1], 8);
+                assert_eq!(madt[offset + 2], processor as u8);
+                assert_eq!(madt[offset + 3], processor as u8);
+                assert_eq!(&madt[offset + 4..offset + 8], &1_u32.to_le_bytes());
+            }
+            let ioapic = 44 + processor_count * 8;
+            assert_eq!(&madt[ioapic..ioapic + 2], &[1, 12]);
+        }
     }
 
     #[test]
-    fn sipi_validates_guest_trampoline_and_starts_target_ap() {
+    fn sipi_starts_every_application_processor_at_supported_maximum() {
         let mut machine = Machine::new(MachineConfig {
             memory_bytes: 2 * 1024 * 1024,
-            cpu_count: 2,
+            cpu_count: MAX_EMULATED_CPUS,
             mirror_serial: false,
             ..MachineConfig::default()
         });
@@ -1402,15 +1459,20 @@ mod tests {
         page[record..record + 8].copy_from_slice(&0x1000_u64.to_le_bytes());
         page[record + 8..record + 16].copy_from_slice(&0xA000_u64.to_le_bytes());
         page[record + 16..record + 24].copy_from_slice(&0x2000_u64.to_le_bytes());
-        page[record + 24..record + 28].copy_from_slice(&1_u32.to_le_bytes());
-        page[record + 28..record + 32].copy_from_slice(&1_u32.to_le_bytes());
-        machine.bus.write_physical(0x80000, &page).unwrap();
+        for processor in 1..MAX_EMULATED_CPUS {
+            page[record + 24..record + 28].copy_from_slice(&(processor as u32).to_le_bytes());
+            page[record + 28..record + 32].copy_from_slice(&(processor as u32).to_le_bytes());
+            machine.bus.write_physical(0x80000, &page).unwrap();
+            machine
+                .start_application_processor(processor, 0x80)
+                .unwrap();
+        }
 
-        machine.start_application_processor(1, 0x80).unwrap();
-        let ap = &machine.application_processors[0];
-        assert_eq!(ap.lifecycle, ProcessorLifecycle::Running);
-        assert_eq!(ap.cpu.state.rip, 0x2000);
-        assert_eq!(ap.cpu.state.register(Register::Rsp), 0x9ff8);
+        for ap in &machine.application_processors {
+            assert_eq!(ap.lifecycle, ProcessorLifecycle::Running);
+            assert_eq!(ap.cpu.state.rip, 0x2000);
+            assert_eq!(ap.cpu.state.register(Register::Rsp), 0x9ff8);
+        }
         assert_eq!(machine.bus.read_u64_physical(0x9ff8), Ok(0));
     }
 }

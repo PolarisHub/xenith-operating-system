@@ -19,9 +19,21 @@ enum Label {
     Dap = 3,
     Drive = 4,
     Message = 5,
+    ChsSetup = 6,
+    DiskReady = 7,
+    ChsManifest = 8,
+    ManifestLoaded = 9,
+    ChsStage2 = 10,
+    Transfer = 11,
+    ChsRead = 12,
+    ChsLoop = 13,
+    ChsReadFail = 14,
+    DiskMode = 15,
+    SectorsPerTrack = 16,
+    HeadCount = 17,
 }
 
-const LABEL_COUNT: usize = 6;
+const LABEL_COUNT: usize = 18;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
@@ -119,6 +131,30 @@ impl Encoder {
         });
     }
 
+    fn jump16(&mut self, label: Label) {
+        self.bytes.push(0xe9);
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&[0, 0]);
+        self.fixups.push(Fixup {
+            offset,
+            label,
+            kind: FixupKind::Relative16,
+            addend: 0,
+        });
+    }
+
+    fn call16(&mut self, label: Label) {
+        self.bytes.push(0xe8);
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&[0, 0]);
+        self.fixups.push(Fixup {
+            offset,
+            label,
+            kind: FixupKind::Relative16,
+            addend: 0,
+        });
+    }
+
     fn resolve(mut self) -> Result<Vec<u8>, BuildError> {
         for fixup in self.fixups {
             let target = self.labels[fixup.label as usize]
@@ -159,9 +195,10 @@ impl Encoder {
 
 /// Build the exact sector installed at raw-disk LBA 0.
 ///
-/// It uses EDD packet reads, validates the `XENITHIM` magic at LBA 1, and loads the
-/// first manifest entry to physical `0x8000`. The one-call BIOS transfer is deliberately
-/// bounded to 127 sectors; the image builder enforces the same limit.
+/// It prefers EDD packet reads and falls back to geometry-validated CHS reads, validates
+/// the `XENITHIM` magic at LBA 1, and loads the first manifest entry to physical `0x8000`.
+/// The transfer is bounded to 64 sectors so it ends at, but never crosses, the 64-KiB DMA
+/// boundary at physical `0x10000`; the image builder enforces the same limit.
 pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
     let mut code = Encoder::new();
     code.bytes(&[
@@ -171,18 +208,46 @@ pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
         0x8e, 0xc0, // mov es, ax
         0x8e, 0xd0, // mov ss, ax
         0xbc, 0x00, 0x7c, // mov sp, 0x7c00
+        0xfc, // cld
         0xfb, // sti
         0x88, 0x16, // mov [drive], dl
     ]);
     code.abs16(Label::Drive);
 
-    // Require INT 13h extensions before relying on the 64-bit DAP LBA.
+    // Prefer INT 13h extensions, but El Torito hard-disk emulation on older
+    // firmware may expose only the original CHS interface.
     code.bytes(&[0xbb, 0xaa, 0x55, 0xb4, 0x41, 0xcd, 0x13]);
-    code.jcc16(0x82, Label::Fail); // jc
+    code.jcc16(0x82, Label::ChsSetup); // jc
     code.bytes(&[0x81, 0xfb, 0x55, 0xaa]);
-    code.jcc16(0x85, Label::Fail); // jne
+    code.jcc16(0x85, Label::ChsSetup); // jne
     code.bytes(&[0xf7, 0xc1, 0x01, 0x00]);
-    code.jcc16(0x84, Label::Fail); // jz
+    code.jcc16(0x84, Label::ChsSetup); // jz
+    code.bytes(&[0xc6, 0x06]);
+    code.abs16(Label::DiskMode);
+    code.bytes(&[1]);
+    code.jump16(Label::DiskReady);
+
+    code.label(Label::ChsSetup);
+    code.bytes(&[0xc6, 0x06]);
+    code.abs16(Label::DiskMode);
+    code.bytes(&[0]);
+    code.bytes(&[0x8a, 0x16]);
+    code.abs16(Label::Drive);
+    code.bytes(&[0xb4, 0x08, 0xcd, 0x13]);
+    code.jcc16(0x82, Label::Fail);
+    code.bytes(&[0x88, 0xc8, 0x24, 0x3f]); // mov al, cl; and al, 63
+    code.jcc16(0x84, Label::Fail);
+    code.bytes(&[0xa2]);
+    code.abs16(Label::SectorsPerTrack);
+    code.bytes(&[0x31, 0xc0, 0x88, 0xf0, 0x40]); // xor ax, ax; mov al, dh; inc ax
+    code.bytes(&[0xa3]);
+    code.abs16(Label::HeadCount);
+
+    code.label(Label::DiskReady);
+    code.bytes(&[0x80, 0x3e]);
+    code.abs16(Label::DiskMode);
+    code.bytes(&[1]);
+    code.jcc16(0x85, Label::ChsManifest);
 
     // The DAP initially describes one sector from LBA 1 into 0000:0600.
     code.bytes(&[0xbe]);
@@ -190,7 +255,21 @@ pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
     code.bytes(&[0x8a, 0x16]);
     code.abs16(Label::Drive);
     code.bytes(&[0xb4, 0x42, 0xcd, 0x13]);
+    code.jcc16(0x82, Label::ChsSetup);
+    code.jump16(Label::ManifestLoaded);
+
+    code.label(Label::ChsManifest);
+    code.bytes(&[
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xc0, // mov es, ax
+        0xb8, 0x01, 0x00, // mov ax, 1
+        0xb9, 0x01, 0x00, // mov cx, 1
+        0xbb, 0x00, 0x06, // mov bx, 0x600
+    ]);
+    code.call16(Label::ChsRead);
     code.jcc16(0x82, Label::Fail);
+
+    code.label(Label::ManifestLoaded);
 
     // Compare the two little-endian dwords spelling XENITHIM.
     code.bytes(&[0x66, 0x81, 0x3e, 0x00, 0x06, 0x58, 0x45, 0x4e, 0x49]);
@@ -204,21 +283,23 @@ pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
     // sector_count is a u64 at 0600+64+16. The BIOS DAP count is a u16.
     code.bytes(&[0x66, 0xa1, 0x50, 0x06, 0x66, 0x85, 0xc0]);
     code.jcc16(0x84, Label::Fail);
-    code.bytes(&[0x66, 0x3d, 0x7f, 0x00, 0x00, 0x00]);
+    code.bytes(&[0x66, 0x3d, 0x40, 0x00, 0x00, 0x00]);
     code.jcc16(0x87, Label::Fail); // ja
     code.bytes(&[0x66, 0x83, 0x3e, 0x54, 0x06, 0x00]);
     code.jcc16(0x85, Label::Fail);
 
+    code.bytes(&[0x80, 0x3e]);
+    code.abs16(Label::DiskMode);
+    code.bytes(&[1]);
+    code.jcc16(0x85, Label::ChsStage2);
+
     code.bytes(&[0xa1, 0x50, 0x06, 0xa3]);
     code.abs16_offset(Label::Dap, 2);
-    // Copy the manifest's 64-bit start_lba into DAP+8, one word at a time.
-    for word in 0..4_u16 {
-        let source = 0x0648_u16 + word * 2;
-        code.bytes(&[0xa1]);
-        code.bytes(&source.to_le_bytes());
-        code.bytes(&[0xa3]);
-        code.abs16_offset(Label::Dap, 8 + word * 2);
-    }
+    // The raw-image contract fixes stage2 at LBA 2; stage2 later validates the
+    // checksummed manifest before trusting any other payload extent.
+    code.bytes(&[0xc7, 0x06]);
+    code.abs16_offset(Label::Dap, 8);
+    code.bytes(&[0x02, 0x00]);
     code.bytes(&[0xc7, 0x06]);
     code.abs16_offset(Label::Dap, 4);
     code.bytes(&[0x00, 0x00]);
@@ -230,8 +311,71 @@ pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
     code.bytes(&[0x8a, 0x16]);
     code.abs16(Label::Drive);
     code.bytes(&[0xb4, 0x42, 0xcd, 0x13]);
+    code.jcc16(0x82, Label::ChsSetup);
+    code.jump16(Label::Transfer);
+
+    code.label(Label::ChsStage2);
+    code.bytes(&[
+        0xb8, 0x00, 0x08, // mov ax, 0x800
+        0x8e, 0xc0, // mov es, ax
+        0x31, 0xdb, // xor bx, bx
+        0xb8, 0x02, 0x00, // mov ax, 2
+        0x8b, 0x0e, 0x50, 0x06, // mov cx, [0x650]
+    ]);
+    code.call16(Label::ChsRead);
     code.jcc16(0x82, Label::Fail);
+
+    code.label(Label::Transfer);
+    code.bytes(&[0x31, 0xc0, 0x8e, 0xc0]); // xor ax, ax; mov es, ax
+    code.bytes(&[0x8a, 0x16]);
+    code.abs16(Label::Drive);
     code.bytes(&[0xea, 0x00, 0x80, 0x00, 0x00]); // jmp 0000:8000
+
+    // AX=LBA, CX=count, ES:BX=destination. One-sector reads cannot cross a
+    // track or a 64-KiB DMA boundary; stage2 is capped at 64 sectors.
+    code.label(Label::ChsRead);
+    code.bytes(&[
+        0x89, 0xc6, // mov si, ax
+        0x89, 0xcf, // mov di, cx
+    ]);
+    code.label(Label::ChsLoop);
+    code.bytes(&[
+        0x89, 0xf0, // mov ax, si
+        0x31, 0xd2, // xor dx, dx
+        0x0f, 0xb6, 0x0e, // movzx cx, byte [spt]
+    ]);
+    code.abs16(Label::SectorsPerTrack);
+    code.bytes(&[
+        0xf7, 0xf1, // div cx
+        0xfe, 0xc2, // inc dl
+        0x88, 0xd1, // mov cl, dl
+        0x31, 0xd2, // xor dx, dx
+        0x8b, 0x2e, // mov bp, word [heads]
+    ]);
+    code.abs16(Label::HeadCount);
+    code.bytes(&[0xf7, 0xf5, 0x3d, 0xff, 0x03]); // div bp; cmp ax, 1023
+    code.jcc16(0x87, Label::ChsReadFail);
+    code.bytes(&[
+        0x88, 0xd6, // mov dh, dl
+        0x88, 0xc5, // mov ch, al
+        0xc1, 0xe8, 0x02, // shr ax, 2
+        0x24, 0xc0, // and al, 0xc0
+        0x08, 0xc1, // or cl, al
+        0xb8, 0x01, 0x02, // mov ax, 0x0201
+        0x8a, 0x16, // mov dl, [drive]
+    ]);
+    code.abs16(Label::Drive);
+    code.bytes(&[0xcd, 0x13]);
+    code.jcc16(0x82, Label::ChsReadFail);
+    code.bytes(&[
+        0x81, 0xc3, 0x00, 0x02, // add bx, 512
+        0x46, // inc si
+        0x4f, // dec di
+    ]);
+    code.rel8(0x75, Label::ChsLoop);
+    code.bytes(&[0xf8, 0xc3]); // clc; ret
+    code.label(Label::ChsReadFail);
+    code.bytes(&[0xf9, 0xc3]); // stc; ret
 
     code.label(Label::Fail);
     code.bytes(&[0xbe]);
@@ -245,7 +389,7 @@ pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
     code.bytes(&[0xfa, 0xf4]);
     code.rel8(0xeb, Label::Hang);
 
-    while !code.bytes.len().is_multiple_of(16) {
+    while !code.bytes.len().is_multiple_of(4) {
         code.bytes.push(0);
     }
     code.label(Label::Dap);
@@ -258,8 +402,14 @@ pub fn build_boot_sector() -> Result<[u8; BOOT_SECTOR_SIZE], BuildError> {
     ]);
     code.label(Label::Drive);
     code.bytes(&[0]);
+    code.label(Label::DiskMode);
+    code.bytes(&[0]);
+    code.label(Label::SectorsPerTrack);
+    code.bytes(&[0]);
+    code.label(Label::HeadCount);
+    code.bytes(&[0, 0]);
     code.label(Label::Message);
-    code.bytes(b"Xenith: disk boot failed\r\n\0");
+    code.bytes(b"Xenith: boot failed\r\n\0");
 
     let code = code.resolve()?;
     if code.len() > PARTITION_TABLE_OFFSET {
@@ -292,6 +442,18 @@ fn label_name(label: Label) -> &'static str {
         Label::Dap => "dap",
         Label::Drive => "drive",
         Label::Message => "message",
+        Label::ChsSetup => "chs setup",
+        Label::DiskReady => "disk ready",
+        Label::ChsManifest => "CHS manifest read",
+        Label::ManifestLoaded => "manifest loaded",
+        Label::ChsStage2 => "CHS stage2 read",
+        Label::Transfer => "stage2 transfer",
+        Label::ChsRead => "CHS read",
+        Label::ChsLoop => "CHS loop",
+        Label::ChsReadFail => "CHS read failure",
+        Label::DiskMode => "disk mode",
+        Label::SectorsPerTrack => "sectors per track",
+        Label::HeadCount => "head count",
     }
 }
 
@@ -316,8 +478,21 @@ mod tests {
         assert!(sector.windows(4).any(|window| window == b"XENI"));
         assert!(sector.windows(4).any(|window| window == b"THIM"));
         assert!(sector
-            .windows(b"Xenith: disk boot failed".len())
-            .any(|window| window == b"Xenith: disk boot failed"));
+            .windows(b"Xenith: boot failed".len())
+            .any(|window| window == b"Xenith: boot failed"));
+    }
+
+    #[test]
+    fn includes_chs_geometry_and_single_sector_fallback_without_debug_ports() {
+        let sector = build_boot_sector().unwrap();
+        assert!(sector
+            .windows(4)
+            .any(|window| window == [0xb4, 0x08, 0xcd, 0x13]));
+        assert!(sector.windows(3).any(|window| window == [0xb8, 0x01, 0x02]));
+        assert!(sector
+            .windows(6)
+            .any(|window| window == [0x66, 0x3d, 0x40, 0x00, 0x00, 0x00]));
+        assert!(!sector.windows(2).any(|window| window == [0xe6, 0xe9]));
     }
 
     #[test]

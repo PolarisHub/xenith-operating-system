@@ -2,15 +2,16 @@
 //!
 //! CPUs are discovered through the ACPI MADT and assigned compact logical
 //! ids in `0..MAX_CPUS` (`0` is the BSP). Every AP receives permanent
-//! per-CPU, GDT/TSS, bootstrap-stack, and critical-IST storage. A private
-//! low-memory trampoline page is populated for each AP before the BSP sends
-//! the architectural INIT-SIPI-SIPI sequence.
+//! per-CPU, GDT/TSS, bootstrap-stack, and critical-IST storage. One reserved
+//! low-memory trampoline page is repopulated serially for each AP before the
+//! BSP sends the architectural INIT-SIPI-SIPI sequence.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{
     compiler_fence, fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
 
+use xenith_boot::BootInfo;
 use xenith_types::{PhysAddr, PhysFrame};
 
 use super::gdt::GlobalDescriptorTable;
@@ -35,6 +36,12 @@ const _: () = {
 
 const INVALID_APIC_ID: u32 = u32::MAX;
 const LOW_TRAMPOLINE_LIMIT: u64 = 0x000A_0000;
+// BIOS stage2 uses 0x70000..0x77fff as its synchronous INT 13h payload
+// bounce buffer, then permanently retires it before entering the kernel. Its
+// handoff marks the whole first MiB reserved, so the physical allocator can
+// never return this page and no ordinary kernel allocation can alias it.
+const BIOS_BOUNCE_TRAMPOLINE_PHYS: u64 = 0x0007_0000;
+const BIOS_BOOT_TOKEN: &str = "xenith.boot=bios";
 const PAGE_SIZE: usize = 4096;
 const AP_BOOT_STACK_SIZE: usize = 32 * 1024;
 const AP_START_TIMEOUT_MS: u64 = 250;
@@ -123,6 +130,58 @@ impl TlbRequest {
 static TLB_REQUESTS: [TlbRequest; MAX_CPUS] = [const { TlbRequest::new() }; MAX_CPUS];
 static TLB_ACK: [AtomicU64; MAX_CPUS * MAX_CPUS] =
     [const { AtomicU64::new(0) }; MAX_CPUS * MAX_CPUS];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrampolinePageSource {
+    Allocator,
+    BiosBounce,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrampolinePage {
+    frame: PhysFrame,
+    source: TrampolinePageSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupDisposition {
+    ReuseTrampoline,
+    Stop,
+}
+
+#[inline]
+fn command_line_has_token(command_line: Option<&str>, token: &str) -> bool {
+    command_line.is_some_and(|line| {
+        line.split_ascii_whitespace()
+            .any(|argument| argument == token)
+    })
+}
+
+#[inline]
+fn select_trampoline_page(
+    allocated: Option<PhysFrame>,
+    command_line: Option<&str>,
+) -> Option<TrampolinePage> {
+    if let Some(frame) = allocated {
+        return Some(TrampolinePage {
+            frame,
+            source: TrampolinePageSource::Allocator,
+        });
+    }
+    command_line_has_token(command_line, BIOS_BOOT_TOKEN).then(|| TrampolinePage {
+        frame: PhysFrame::containing_addr(PhysAddr::new_truncate(BIOS_BOUNCE_TRAMPOLINE_PHYS)),
+        source: TrampolinePageSource::BiosBounce,
+    })
+}
+
+#[inline]
+const fn startup_disposition(acknowledged: bool) -> StartupDisposition {
+    if acknowledged {
+        StartupDisposition::ReuseTrampoline
+    } else {
+        StartupDisposition::Stop
+    }
+}
 
 #[inline]
 const fn tlb_ack_index(source: usize, target: usize) -> usize {
@@ -246,9 +305,7 @@ unsafe fn patch_value<T: Copy>(page: *mut u8, offset: usize, value: T) {
     unsafe { core::ptr::write_unaligned(page.add(offset).cast::<T>(), value) };
 }
 
-fn build_trampoline(cpu: usize, apic_id: u32, cr3: u64) -> Option<(PhysFrame, u8)> {
-    let frame =
-        crate::mm::physical::allocate_frame_below(PhysAddr::new_truncate(LOW_TRAMPOLINE_LIMIT))?;
+fn build_trampoline(cpu: usize, apic_id: u32, cr3: u64, frame: PhysFrame) -> Option<u8> {
     let phys = frame.start_address().as_u64();
     let start_page = u8::try_from(phys >> 12).ok()?;
 
@@ -291,12 +348,12 @@ fn build_trampoline(cpu: usize, apic_id: u32, cr3: u64) -> Option<(PhysFrame, u8
         compiler_fence(Ordering::Release);
     }
 
-    Some((frame, start_page))
+    Some(start_page)
 }
 
 /// Discover and start every enabled MADT processor supported by static
 /// per-CPU capacity.
-pub fn init() {
+pub fn init(boot_info: BootInfo) {
     if INIT_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -332,6 +389,7 @@ pub fn init() {
     }
 
     let mut next_cpu = 1usize;
+    let mut trampoline_page = None;
     for entry in crate::acpi::madt_lapics()
         .iter()
         .filter(|entry| entry.enabled)
@@ -361,14 +419,37 @@ pub fn init() {
         PRESENT_CPUS.fetch_or(1u64 << cpu, Ordering::AcqRel);
         prepare_ap_storage(cpu);
 
-        let Some((_trampoline_frame, start_page)) = build_trampoline(cpu, entry.apic_id, cr3)
-        else {
+        let page = match trampoline_page {
+            Some(page) => page,
+            None => {
+                let allocated = crate::mm::physical::allocate_frame_below(PhysAddr::new_truncate(
+                    LOW_TRAMPOLINE_LIMIT,
+                ));
+                let Some(page) = select_trampoline_page(allocated, boot_info.kernel_cmdline())
+                else {
+                    ::log::warn!(
+                        "xenith.smp: no conventional-memory trampoline page; remaining APs ignored"
+                    );
+                    break;
+                };
+                if page.source == TrampolinePageSource::BiosBounce {
+                    ::log::info!(
+                        "xenith.smp: using retired BIOS bounce page {:#x} for serialized AP startup",
+                        page.frame.start_address().as_u64()
+                    );
+                }
+                trampoline_page = Some(page);
+                page
+            },
+        };
+
+        let Some(start_page) = build_trampoline(cpu, entry.apic_id, cr3, page.frame) else {
             ::log::warn!(
-                "xenith.smp: no conventional-memory frame for AP {} (apic {})",
+                "xenith.smp: failed to prepare trampoline for AP {} (apic {}); remaining APs ignored",
                 cpu,
                 entry.apic_id
             );
-            continue;
+            break;
         };
 
         // Intel's universal startup algorithm: INIT, 10 ms, SIPI, at least
@@ -384,7 +465,8 @@ pub fn init() {
             crate::time::pit::pit_sleep(1);
             waited += 1;
         }
-        if is_online(cpu) {
+        let acknowledged = is_online(cpu);
+        if acknowledged {
             let apic_mode = if LAPIC.is_x2apic() { "x2APIC" } else { "xAPIC" };
             ::log::info!(
                 "xenith.smp: CPU {} online ({} {}, startup page {:#04x})",
@@ -402,6 +484,15 @@ pub fn init() {
                 entry.apic_id,
                 AP_START_TIMEOUT_MS
             );
+        }
+        if startup_disposition(acknowledged) == StartupDisposition::Stop {
+            // A timed-out AP may still consume a delayed SIPI. Never rewrite
+            // its page for another CPU, because that could start the late AP
+            // with the next CPU's logical id, stack, and expected APIC id.
+            ::log::warn!(
+                "xenith.smp: AP startup stopped after timeout; trampoline page quarantined"
+            );
+            break;
         }
     }
 
@@ -678,5 +769,48 @@ mod tests {
         assert_eq!(tlb_ack_index(0, 0), 0);
         assert_eq!(tlb_ack_index(1, 0), MAX_CPUS);
         assert_eq!(tlb_ack_index(MAX_CPUS - 1, MAX_CPUS - 1), TLB_ACK.len() - 1);
+    }
+
+    #[test]
+    fn bios_bounce_fallback_requires_an_exact_command_line_token() {
+        for command_line in [
+            None,
+            Some(""),
+            Some("xenith.boot=uefi"),
+            Some("prefix-xenith.boot=bios"),
+            Some("xenith.boot=bios-suffix"),
+        ] {
+            assert_eq!(select_trampoline_page(None, command_line), None);
+        }
+
+        for command_line in [
+            Some("xenith.boot=bios"),
+            Some("quiet xenith.boot=bios splash"),
+            Some("\t xenith.boot=bios\n"),
+        ] {
+            let page = select_trampoline_page(None, command_line).expect("BIOS fallback page");
+            assert_eq!(page.source, TrampolinePageSource::BiosBounce);
+            assert_eq!(
+                page.frame.start_address().as_u64(),
+                BIOS_BOUNCE_TRAMPOLINE_PHYS
+            );
+        }
+    }
+
+    #[test]
+    fn allocator_page_wins_over_bios_fallback() {
+        let allocated = PhysFrame::containing_addr(PhysAddr::new_truncate(0x80000));
+        let page = select_trampoline_page(Some(allocated), Some(BIOS_BOOT_TOKEN)).unwrap();
+        assert_eq!(page.frame, allocated);
+        assert_eq!(page.source, TrampolinePageSource::Allocator);
+    }
+
+    #[test]
+    fn trampoline_is_reused_only_after_online_acknowledgement() {
+        assert_eq!(
+            startup_disposition(true),
+            StartupDisposition::ReuseTrampoline
+        );
+        assert_eq!(startup_disposition(false), StartupDisposition::Stop);
     }
 }

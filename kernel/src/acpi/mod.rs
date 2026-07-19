@@ -67,7 +67,7 @@ use spin::Once;
 use xenith_types::PhysAddr;
 
 use self::fadt::Fadt;
-use self::madt::{MadtIoApicEntry, MadtLapicEntry};
+use self::madt::{IsaIrqRoute, MadtInterruptSourceOverride, MadtIoApicEntry, MadtLapicEntry};
 use self::xsdt::Tables;
 
 /// The Limine higher-half direct-map base. Adding a physical address to this
@@ -267,6 +267,30 @@ pub fn madt_ioapics() -> &'static [MadtIoApicEntry] {
         Some(t) => t.madt_ioapics(),
         None => &[],
     }
+}
+
+/// The platform's MADT Interrupt Source Override entries.
+///
+/// Returns an empty slice before ACPI initialisation or when no MADT is
+/// present. Consumers normally want [`resolve_isa_irq`] rather than reading
+/// the raw MPS INTI flags themselves.
+#[inline]
+pub fn madt_interrupt_source_overrides() -> &'static [MadtInterruptSourceOverride] {
+    match TABLES.get().and_then(Tables::madt) {
+        Some(madt) => madt.interrupt_source_overrides(),
+        None => &[],
+    }
+}
+
+/// Resolve a legacy ISA IRQ to its ACPI GSI, polarity, and trigger mode.
+///
+/// The result is always usable: absent ACPI/override data yields the PC-AT
+/// identity mapping with active-high, edge-triggered delivery, while a valid
+/// MADT type-2 entry supplies the firmware route and electrical mode.
+#[inline]
+#[must_use]
+pub fn resolve_isa_irq(irq: u8) -> IsaIrqRoute {
+    madt::resolve_isa_irq(madt_interrupt_source_overrides(), irq)
 }
 
 /// The platform's local APIC CPU set, as enumerated by the ACPI MADT.

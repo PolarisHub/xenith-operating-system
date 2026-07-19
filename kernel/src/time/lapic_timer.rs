@@ -90,6 +90,7 @@ use xenith_types::PhysAddr;
 use super::clock::ClockSource;
 use crate::arch::x86_64::cpu::has_x2apic;
 use crate::arch::x86_64::instructions::{rdmsr, wrmsr};
+use crate::arch::x86_64::interrupts::apic::SPURIOUS_VECTOR;
 use crate::arch::x86_64::msr::IA32_LAPIC_BASE;
 
 // ---------------------------------------------------------------------------
@@ -142,14 +143,9 @@ const LVT_MODE_PERIODIC: u64 = 0b01 << LVT_MODE_SHIFT;
 /// granularity, not the ns conversion — see the module docs.
 const DCR_DIVIDE_1: u64 = 0b1011;
 
-/// The spurious-interrupt vector programmed into SVR when the timer driver
-/// enables the APIC. The full LAPIC bring-up (error vector, LVT entries) is
-/// owned by the apic phase; this is the minimal SVR write that makes the
-/// timer run, with spurious delivery routed to a harmless high vector.
-const SPURIOUS_VECTOR: u64 = 0xFF;
 /// SVR image: spurious vector + APIC software-enable (bit 8). Focus-processor
 /// checking (bit 9) is left at its default.
-const SVR_ENABLE: u64 = SPURIOUS_VECTOR | (1 << 8);
+const SVR_ENABLE: u64 = SPURIOUS_VECTOR as u64 | (1 << 8);
 
 /// Build an LVT timer image from its vector, mode field, and mask state.
 /// Keeping the packing in one pure helper makes the hardware bit positions

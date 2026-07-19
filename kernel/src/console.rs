@@ -255,9 +255,14 @@ macro_rules! kprintln {
 /// it is announced on itself, which is the first real output of boot.
 pub fn init(boot_info: &'static limine::BootInfo) {
     let bi = xenith_boot::BootInfo::new(boot_info);
+    let preserve_splash = bi
+        .kernel_cmdline()
+        .is_some_and(|line| command_line_has_token(line, "xenith.splash=1"));
 
-    if try_framebuffer(&bi) {
-        kprintln!("xenith: framebuffer console ready");
+    if try_framebuffer(&bi, preserve_splash) {
+        if !framebuffer::splash_active() {
+            kprintln!("xenith: framebuffer console ready");
+        }
         return;
     }
 
@@ -274,22 +279,33 @@ pub fn init(boot_info: &'static limine::BootInfo) {
 ///
 /// Returns `true` on success (a 32 bpp framebuffer was found, initialised,
 /// and installed), `false` if there is no framebuffer or it is not 32 bpp.
-fn try_framebuffer(bi: &xenith_boot::BootInfo) -> bool {
+fn try_framebuffer(bi: &xenith_boot::BootInfo, preserve_splash: bool) -> bool {
     let Some(fb) = bi.framebuffer() else {
         return false;
     };
     if fb.bpp != 32 {
         return false;
     }
+    let preserve_splash = preserve_splash && fb.width >= 640 && fb.height >= 480;
     let vaddr = bi.phys_to_virt(fb.phys_addr);
     // SAFETY: `FramebufferConsole::init_in_place` writes the geometry fields
     // of a `static mut` singleton. This runs on the BSP before any other CPU
     // or interrupt handler can observe it, so the write is race-free.
     unsafe {
-        framebuffer::init_in_place(vaddr.as_u64() as *mut u8, fb.pitch, fb.width, fb.height);
+        framebuffer::init_in_place(
+            vaddr.as_u64() as *mut u8,
+            fb.pitch,
+            fb.width,
+            fb.height,
+            preserve_splash,
+        );
         set_console(framebuffer::static_ref());
     }
     true
+}
+
+fn command_line_has_token(line: &str, wanted: &str) -> bool {
+    line.split_ascii_whitespace().any(|token| token == wanted)
 }
 
 /// Initialise the VGA text backend, mapping 0xB8000 through the HHDM.
@@ -311,4 +327,25 @@ fn try_vga(bi: &xenith_boot::BootInfo) -> bool {
         set_console(vga::static_ref());
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_line_has_token;
+
+    #[test]
+    fn command_line_tokens_are_matched_exactly() {
+        assert!(command_line_has_token(
+            "xenith.boot=uefi xenith.splash=1",
+            "xenith.splash=1"
+        ));
+        assert!(!command_line_has_token(
+            "xenith.boot=uefi xenith.splash=10",
+            "xenith.splash=1"
+        ));
+        assert!(!command_line_has_token(
+            "prefix=xenith.splash=1",
+            "xenith.splash=1"
+        ));
+    }
 }

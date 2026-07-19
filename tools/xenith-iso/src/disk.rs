@@ -18,7 +18,7 @@ pub const DISK_MANIFEST_VERSION: u16 = 1;
 
 const STAGE2_LBA: u64 = 2;
 const PAYLOAD_ALIGNMENT_SECTORS: u64 = 8;
-const STAGE1_MAX_STAGE2_SECTORS: u64 = 127;
+const STAGE1_MAX_STAGE2_SECTORS: u64 = 64;
 const MANIFEST_FLAGS: u32 = 1;
 const ENTRY_FLAGS_REQUIRED: u32 = 1;
 const MANIFEST_CHECKSUM_OFFSET: usize = 32;
@@ -130,7 +130,7 @@ pub fn build_disk_image_with_layout(
 
     let stage2_entry = component_entry(ManifestEntryKind::Stage2, STAGE2_LBA, stage2)?;
     if stage2_entry.sector_count > STAGE1_MAX_STAGE2_SECTORS {
-        return Err(ImageError::ImageTooLarge("stage2 (maximum is 127 sectors)"));
+        return Err(ImageError::ImageTooLarge("stage2 (maximum is 64 sectors)"));
     }
     let kernel_lba = align_lba(stage2_entry.checked_end_lba()?)?;
     let kernel_entry = component_entry(ManifestEntryKind::Kernel, kernel_lba, kernel)?;
@@ -446,7 +446,7 @@ fn validate_manifest_layout(
     }
     if entries[0].sector_count > STAGE1_MAX_STAGE2_SECTORS {
         return Err(ImageError::InvalidManifest(
-            "stage2 exceeds the stage1 127-sector load limit",
+            "stage2 exceeds the stage1 64-sector load limit",
         ));
     }
     if !entries[1]

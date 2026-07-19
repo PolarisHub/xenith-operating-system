@@ -282,7 +282,59 @@ pub fn pci_route_table_paths() -> Result<Vec<String>, AmlError> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::namespace::{FieldUnit, OperationRegion, OperationRegionBounds, RegionTerm};
     use super::*;
+
+    struct CountingHandler {
+        bytes: [u8; 16],
+        reads: [AtomicUsize; 16],
+    }
+
+    impl CountingHandler {
+        fn new(bytes: [u8; 16]) -> Self {
+            Self {
+                bytes,
+                reads: core::array::from_fn(|_| AtomicUsize::new(0)),
+            }
+        }
+
+        fn reads(&self, address: usize) -> usize {
+            self.reads[address].load(Ordering::Relaxed)
+        }
+    }
+
+    impl RegionHandler for CountingHandler {
+        fn read(&self, space: RegionSpace, address: u64, width: u8) -> Result<u64, AmlError> {
+            if space != RegionSpace::SystemMemory || width != 8 {
+                return Err(AmlError::InvalidRegion);
+            }
+            let index = usize::try_from(address).map_err(|_| AmlError::InvalidRegion)?;
+            let byte = self.bytes.get(index).ok_or(AmlError::InvalidRegion)?;
+            self.reads[index].fetch_add(1, Ordering::Relaxed);
+            Ok(u64::from(*byte))
+        }
+
+        fn write(&self, _: RegionSpace, _: u64, _: u8, _: u64) -> Result<(), AmlError> {
+            Err(AmlError::RegionAccessDenied)
+        }
+    }
+
+    fn field_backed_region_aml() -> Vec<u8> {
+        vec![
+            // OperationRegion (BASE, SystemMemory, 0, 16)
+            0x5b, 0x80, b'B', b'A', b'S', b'E', 0x00, 0x00, 0x0a, 0x10,
+            // Field (BASE, ByteAcc, NoLock, Preserve) { OFFS, 8 }
+            0x5b, 0x81, 0x0b, b'B', b'A', b'S', b'E', 0x00, b'O', b'F', b'F', b'S', 0x08,
+            // OperationRegion (DATA, SystemMemory, Add (OFFS, 1), 1)
+            0x5b, 0x80, b'D', b'A', b'T', b'A', 0x00, 0x72, b'O', b'F', b'F', b'S', 0x01, 0x00,
+            0x01, // Field (DATA, ByteAcc, NoLock, Preserve) { BYTE, 8 }
+            0x5b, 0x81, 0x0b, b'D', b'A', b'T', b'A', 0x00, b'B', b'Y', b'T', b'E', 0x08,
+        ]
+    }
 
     #[test]
     fn absent_sta_uses_acpi_default() {
@@ -299,5 +351,198 @@ mod tests {
         assert_eq!(route_table_parent("\\_SB_.PCI0._PRT"), Some("\\_SB_.PCI0"));
         assert_eq!(route_table_parent("\\_PRT"), Some("\\"));
         assert_eq!(route_table_parent("\\_SB_.PCI0.XPRT"), None);
+    }
+
+    #[test]
+    fn field_backed_region_is_evaluated_once_and_cached() {
+        let mut bytes = [0u8; 16];
+        bytes[0] = 5;
+        bytes[6] = 0xab;
+        let handler = Arc::new(CountingHandler::new(bytes));
+        let mut context =
+            AmlContext::load_with_handler(&field_backed_region_aml(), handler.clone()).unwrap();
+
+        assert_eq!(
+            context.evaluate("\\BYTE", &[]).unwrap(),
+            AmlValue::Integer(0xab)
+        );
+        assert_eq!(
+            context.evaluate("\\BYTE", &[]).unwrap(),
+            AmlValue::Integer(0xab)
+        );
+        assert_eq!(handler.reads(0), 1, "OFFS must be resolved only once");
+        assert_eq!(handler.reads(6), 2, "BYTE is read once per evaluation");
+        let Some(NamespaceObject::OperationRegion(region)) = context.namespace().get("\\DATA")
+        else {
+            panic!("DATA region disappeared");
+        };
+        assert_eq!(region.bounds, OperationRegionBounds::Resolved {
+            offset: 6,
+            length: 1
+        });
+    }
+
+    #[test]
+    fn denied_region_resolution_is_not_cached() {
+        let mut context = AmlContext::load(&field_backed_region_aml()).unwrap();
+        assert!(matches!(
+            context.evaluate("\\BYTE", &[]),
+            Err(AmlError::RegionAccessDenied)
+        ));
+        let Some(NamespaceObject::OperationRegion(region)) = context.namespace().get("\\DATA")
+        else {
+            panic!("DATA region disappeared");
+        };
+        assert!(matches!(
+            region.bounds,
+            OperationRegionBounds::Deferred { .. }
+        ));
+
+        let mut bytes = [0u8; 16];
+        bytes[0] = 5;
+        bytes[6] = 0x5a;
+        context.set_region_handler(Arc::new(CountingHandler::new(bytes)));
+        assert_eq!(
+            context.evaluate("\\BYTE", &[]).unwrap(),
+            AmlValue::Integer(0x5a)
+        );
+    }
+
+    #[test]
+    fn operation_region_alias_is_resolved_before_access() {
+        let mut namespace = Namespace::default();
+        namespace
+            .insert(
+                "\\REG0".into(),
+                NamespaceObject::OperationRegion(OperationRegion {
+                    space: RegionSpace::SystemMemory,
+                    bounds: OperationRegionBounds::Resolved {
+                        offset: 3,
+                        length: 1,
+                    },
+                }),
+            )
+            .unwrap();
+        namespace
+            .insert("\\ALIA".into(), NamespaceObject::Alias("\\REG0".into()))
+            .unwrap();
+        namespace
+            .insert(
+                "\\BYTE".into(),
+                NamespaceObject::Field(FieldUnit {
+                    region: "\\ALIA".into(),
+                    bit_offset: 0,
+                    bit_length: 8,
+                    flags: 0,
+                }),
+            )
+            .unwrap();
+        let mut bytes = [0u8; 16];
+        bytes[3] = 0xc3;
+        let handler = Arc::new(CountingHandler::new(bytes));
+        let mut context = AmlContext {
+            namespace,
+            region_handler: handler,
+        };
+        assert_eq!(
+            context.evaluate("\\BYTE", &[]).unwrap(),
+            AmlValue::Integer(0xc3)
+        );
+    }
+
+    #[test]
+    fn operation_region_reference_cycle_is_rejected_immediately() {
+        let mut namespace = Namespace::default();
+        namespace
+            .insert(
+                "\\LOOP".into(),
+                NamespaceObject::OperationRegion(OperationRegion {
+                    space: RegionSpace::SystemMemory,
+                    bounds: OperationRegionBounds::Deferred {
+                        offset: RegionTerm::Reference("\\BYTE".into()),
+                        length: RegionTerm::Integer(1),
+                    },
+                }),
+            )
+            .unwrap();
+        namespace
+            .insert(
+                "\\BYTE".into(),
+                NamespaceObject::Field(FieldUnit {
+                    region: "\\LOOP".into(),
+                    bit_offset: 0,
+                    bit_length: 8,
+                    flags: 0,
+                }),
+            )
+            .unwrap();
+        let handler = Arc::new(CountingHandler::new([0; 16]));
+        let mut context = AmlContext {
+            namespace,
+            region_handler: handler.clone(),
+        };
+        assert!(matches!(
+            context.evaluate("\\BYTE", &[]),
+            Err(AmlError::RecursionLimit)
+        ));
+        assert_eq!(
+            handler
+                .reads
+                .iter()
+                .map(|reads| reads.load(Ordering::Relaxed))
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[test]
+    fn deferred_region_span_overflow_precedes_hardware_access() {
+        let mut namespace = Namespace::default();
+        namespace
+            .insert(
+                "\\RLEN".into(),
+                NamespaceObject::Value(AmlValue::Integer(2)),
+            )
+            .unwrap();
+        namespace
+            .insert(
+                "\\OVER".into(),
+                NamespaceObject::OperationRegion(OperationRegion {
+                    space: RegionSpace::SystemMemory,
+                    bounds: OperationRegionBounds::Deferred {
+                        offset: RegionTerm::Integer(u64::MAX),
+                        length: RegionTerm::Reference("\\RLEN".into()),
+                    },
+                }),
+            )
+            .unwrap();
+        namespace
+            .insert(
+                "\\BYTE".into(),
+                NamespaceObject::Field(FieldUnit {
+                    region: "\\OVER".into(),
+                    bit_offset: 0,
+                    bit_length: 8,
+                    flags: 0,
+                }),
+            )
+            .unwrap();
+        let handler = Arc::new(CountingHandler::new([0; 16]));
+        let mut context = AmlContext {
+            namespace,
+            region_handler: handler.clone(),
+        };
+        assert!(matches!(
+            context.evaluate("\\BYTE", &[]),
+            Err(AmlError::InvalidRegion)
+        ));
+        assert_eq!(
+            handler
+                .reads
+                .iter()
+                .map(|reads| reads.load(Ordering::Relaxed))
+                .sum::<usize>(),
+            0
+        );
     }
 }

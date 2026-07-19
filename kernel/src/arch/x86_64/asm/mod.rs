@@ -145,7 +145,9 @@ pub mod isr {
 pub mod irq {
     /// Local-APIC timer entry. This symbol is an IDT target, not a callable
     /// SysV function; install its address with `idt::install_timer_handler`.
-    pub use super::{lapic_timer_isr, reschedule_ipi_isr, tlb_shootdown_ipi_isr};
+    pub use super::{
+        lapic_spurious_isr, lapic_timer_isr, reschedule_ipi_isr, tlb_shootdown_ipi_isr,
+    };
 }
 
 extern "C" {
@@ -241,6 +243,12 @@ extern "C" {
     /// The stub conditionally swaps GS for a ring-3 interruption, preserves
     /// every GPR, calls `rust_timer_interrupt`, and returns with `iretq`.
     pub fn lapic_timer_isr();
+
+    /// Local-APIC spurious-interrupt entry.
+    ///
+    /// The stub returns directly with `iretq` and deliberately sends no EOI,
+    /// because a spurious interrupt is never entered into the LAPIC ISR.
+    pub fn lapic_spurious_isr();
 
     /// Cross-CPU scheduler reschedule IPI entry.
     pub fn reschedule_ipi_isr();

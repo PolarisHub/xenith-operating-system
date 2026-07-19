@@ -35,12 +35,13 @@ The ISO has a primary volume descriptor at block 16, El Torito boot record at
 and a single ISO9660 root directory containing `BOOT.CAT;1`, `BIOS.IMG;1`,
 `EFI.IMG;1`, `KERNEL.ELF;1`, and `INITRD.CPIO;1`.
 
-The catalog's default x86 entry uses hard-disk emulation. `BIOS.IMG;1` is the
-complete raw image, with one active type-`0xDA` MBR partition installed in the
-partition-table area reserved by Xenith stage1. Its virtual LBA 0 is stage1,
-LBA 1 is the checksummed `XENITHIM` manifest, and the manifest payload LBAs are
-unchanged. The separately emitted `xenith.img` is not patched and retains its
-raw-image bytes.
+The catalog's default x86 entry uses hard-disk emulation. `BIOS.IMG;1` contains
+the complete raw image prefix, with one active type-`0xDA` MBR partition
+installed in the partition-table area reserved by Xenith stage1. Its virtual
+LBA 0 is stage1, LBA 1 is the checksummed `XENITHIM` manifest, and all manifest
+payload LBAs remain unchanged. The boot image is then zero-padded to a complete
+16-head by 63-sector cylinder so legacy firmware derives usable CHS geometry.
+The separately emitted `xenith.img` is not patched or cylinder-padded.
 
 The final catalog section has platform ID `0xEF` and a no-emulation entry for
 `EFI.IMG;1`. That 16 MiB FAT16 EFI System Partition contains:
@@ -51,11 +52,12 @@ EFI/XENITH/kernel.elf
 EFI/XENITH/initrd.cpio
 ```
 
-The builder reparses the raw manifest and FAT tree and compares all installed
-payloads byte-for-byte. These checks prove the ISO and boot-image structures;
-they do not prove that a particular BIOS/UEFI implementation or hardware boots
-them. In particular, stage2 still uses legacy primary-master ATA PIO after its
-BIOS entry path, so firmware compatibility remains a runtime validation item.
+The builder reparses the raw manifest and FAT tree, validates the active
+partition and exact CHS geometry, checks the raw-disk prefix and zero cylinder
+tail, and compares all installed payloads byte-for-byte. External VMware
+legacy-BIOS and QEMU/SeaBIOS boots additionally prove the current BIOS ISO and
+raw artifacts to the userspace shell; arbitrary firmware and physical hardware
+remain separate validation boundaries.
 
 ## Raw image format (`XENITHIM` version 1)
 
@@ -65,7 +67,7 @@ All integers are little-endian and all LBAs use 512-byte sectors.
 |---|---:|---|
 | LBA 0 | 512 | Supplied stage1 MBR. Bytes 510-511 are installed as `55 AA`. |
 | LBA 1 | 512 | Xenith manifest described below. |
-| LBA 2 | variable | Stage2, first manifest entry, limited to 127 sectors. |
+| LBA 2 | variable | Stage2, first manifest entry, limited to 64 sectors. |
 | next 4 KiB boundary | variable | Kernel. |
 | next 4 KiB boundary | variable | Initrd. |
 | final 4 KiB boundary | - | End of zero-padded image. |

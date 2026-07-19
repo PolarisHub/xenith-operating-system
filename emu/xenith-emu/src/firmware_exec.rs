@@ -31,6 +31,7 @@ const EDI: usize = 7;
 enum Mode {
     Real16,
     Protected32,
+    Protected16,
     Long64,
 }
 
@@ -39,6 +40,7 @@ impl Mode {
         match self {
             Self::Real16 => "real16",
             Self::Protected32 => "protected32",
+            Self::Protected16 => "protected16",
             Self::Long64 => "long64",
         }
     }
@@ -199,6 +201,7 @@ impl<'a> Runner<'a> {
             let stop = match self.mode {
                 Mode::Real16 => self.step_real(&instruction)?,
                 Mode::Protected32 => self.step_protected(&instruction)?,
+                Mode::Protected16 => self.step_protected16(&instruction)?,
                 Mode::Long64 => self.step_long(&instruction)?,
             };
             if stop {
@@ -222,7 +225,7 @@ impl<'a> Runner<'a> {
             Stage::Stage2 => self.trace.stage2.record(&instruction[..length]),
         }
         self.ip = self.ip.wrapping_add(length as u64);
-        if self.mode == Mode::Real16 {
+        if matches!(self.mode, Mode::Real16 | Mode::Protected16) {
             self.ip &= 0xffff;
         }
     }
@@ -270,6 +273,10 @@ impl<'a> Runner<'a> {
                 self.interrupts = true;
                 self.commit(b, 1);
             },
+            0xfc => {
+                self.direction = false;
+                self.commit(b, 1);
+            },
             0x31 if b[1] == 0xc0 => {
                 self.set16(EAX, 0);
                 self.logic_flags(0);
@@ -286,6 +293,8 @@ impl<'a> Runner<'a> {
                     0xd8 => self.ds = value,
                     0xc0 => self.es = value,
                     0xd0 => self.ss = value,
+                    0xe0 => self.fs = value,
+                    0xe8 => self.gs = value,
                     _ => return Err(self.unsupported(b)),
                 }
                 self.commit(b, 2);
@@ -341,15 +350,40 @@ impl<'a> Runner<'a> {
                 self.write16(self.real_data(self.ds, address), value)?;
                 self.commit(b, 6);
             },
+            0xc6 if b[1] == 0x06 => {
+                let address = u16::from_le_bytes([b[2], b[3]]);
+                self.write8(self.real_data(self.ds, address), b[4])?;
+                self.commit(b, 5);
+            },
+            0x80 if b[1] == 0x3e => {
+                let address = u16::from_le_bytes([b[2], b[3]]);
+                let lhs = self.read8(self.real_data(self.ds, address))?;
+                self.compare(u64::from(lhs), u64::from(b[4]), u8::MAX as u64);
+                self.commit(b, 5);
+            },
             0x83 if b[1] == 0xc7 => {
                 let value = self.get16(EDI).wrapping_add(u16::from(b[2]));
                 self.set16(EDI, value);
                 self.logic_flags(u64::from(value));
                 self.commit(b, 3);
             },
-            0x72 | 0x73 | 0x74 | 0x75 | 0x77 => {
+            0x72..=0x77 => {
                 let taken = self.condition(b[0]);
                 self.branch8(b, 2, taken);
+            },
+            0xeb => self.branch8(b, 2, true),
+            0xe9 => self.branch16(b, 3, true),
+            0xf8 => {
+                self.carry = false;
+                self.commit(b, 1);
+            },
+            0xf9 => {
+                self.carry = true;
+                self.commit(b, 1);
+            },
+            0x83 if b[1] == 0xf8 => {
+                self.compare(u64::from(self.get16(EAX)), u64::from(b[2]), u16::MAX as u64);
+                self.commit(b, 3);
             },
             0xe4 if b[1] == 0x92 => {
                 self.set8(EAX, self.port92);
@@ -407,6 +441,18 @@ impl<'a> Runner<'a> {
 
     fn step_real_66(&mut self, b: &[u8; 15]) -> Result<(), StageExecError> {
         match b[1] {
+            0xe8 => {
+                let displacement = i64::from(i32::from_le_bytes([b[2], b[3], b[4], b[5]]));
+                self.commit(b, 6);
+                let return_address = self.ip as u32;
+                self.push32_real(return_address)?;
+                self.ip = self.ip.wrapping_add_signed(displacement) & 0xffff;
+            },
+            0xc3 => {
+                let return_address = self.pop32_real()?;
+                self.commit(b, 2);
+                self.ip = u64::from(return_address) & 0xffff;
+            },
             0x31 if b[2] == 0xdb => {
                 self.set32(EBX, 0);
                 self.logic_flags(0);
@@ -422,6 +468,12 @@ impl<'a> Runner<'a> {
                 let value = u32::from_le_bytes([b[5], b[6], b[7], b[8]]);
                 self.write32(self.real_data(self.ds, address), value)?;
                 self.commit(b, 9);
+            },
+            0x83 if b[2] == 0x7c && b[3] == 0x14 => {
+                let address = self.real_data(self.ds, self.get16(ESI).wrapping_add(0x14));
+                let lhs = self.read32(address)?;
+                self.compare(u64::from(lhs), u64::from(b[4]), u32::MAX as u64);
+                self.commit(b, 5);
             },
             0x81 if b[2] == 0x3e => {
                 let address = u16::from_le_bytes([b[3], b[4]]);
@@ -440,6 +492,21 @@ impl<'a> Runner<'a> {
                 self.compare(u64::from(self.get32(ECX)), u64::from(b[3]), u32::MAX as u64);
                 self.commit(b, 4);
             },
+            0x83 if b[2] == 0xf8 => {
+                self.compare(u64::from(self.get32(EAX)), u64::from(b[3]), u32::MAX as u64);
+                self.commit(b, 4);
+            },
+            0x83 if b[2] == 0x16 => {
+                let address = self.real_data(self.ds, u16::from_le_bytes([b[3], b[4]]));
+                let carry = u32::from(self.carry);
+                let lhs = self.read32(address)?;
+                let value = lhs.wrapping_add(u32::from(b[5])).wrapping_add(carry);
+                self.write32(address, value)?;
+                self.carry =
+                    u64::from(lhs) + u64::from(b[5]) + u64::from(carry) > u64::from(u32::MAX);
+                self.zero = value == 0;
+                self.commit(b, 6);
+            },
             0x83 if b[2] == 0xc8 => {
                 let value = self.get32(EAX) | u32::from(b[3]);
                 self.set32(EAX, value);
@@ -449,6 +516,14 @@ impl<'a> Runner<'a> {
             0x85 if b[2] == 0xc0 || b[2] == 0xdb => {
                 let register = if b[2] == 0xc0 { EAX } else { EBX };
                 self.logic_flags(u64::from(self.get32(register)));
+                self.commit(b, 3);
+            },
+            0x39 if b[2] == 0xd8 => {
+                self.compare(
+                    u64::from(self.get32(EAX)),
+                    u64::from(self.get32(EBX)),
+                    u32::MAX as u64,
+                );
                 self.commit(b, 3);
             },
             0x3d => {
@@ -461,6 +536,48 @@ impl<'a> Runner<'a> {
                 let value = self.read32(self.real_data(self.ds, address))?;
                 self.set32(EAX, value);
                 self.commit(b, 4);
+            },
+            0xa3 => {
+                let address = u16::from_le_bytes([b[2], b[3]]);
+                self.write32(self.real_data(self.ds, address), self.get32(EAX))?;
+                self.commit(b, 4);
+            },
+            0x8b if b[2] == 0x44 => {
+                let address =
+                    self.real_data(self.ds, self.get16(ESI).wrapping_add(u16::from(b[3])));
+                let value = self.read32(address)?;
+                self.set32(EAX, value);
+                self.commit(b, 4);
+            },
+            0x89 if b[2] == 0x3e => {
+                let address = u16::from_le_bytes([b[3], b[4]]);
+                self.write32(self.real_data(self.ds, address), self.get32(EDI))?;
+                self.commit(b, 5);
+            },
+            0x0f if b[2..4] == [0xb7, 0x06] => {
+                let address = u16::from_le_bytes([b[4], b[5]]);
+                let value = self.read16(self.real_data(self.ds, address))?;
+                self.set32(EAX, u32::from(value));
+                self.commit(b, 6);
+            },
+            0x01 if b[2] == 0x06 => {
+                let address = self.real_data(self.ds, u16::from_le_bytes([b[3], b[4]]));
+                let lhs = self.read32(address)?;
+                let (value, carry) = lhs.overflowing_add(self.get32(EAX));
+                self.write32(address, value)?;
+                self.carry = carry;
+                self.zero = value == 0;
+                self.commit(b, 5);
+            },
+            0x29 if b[2] == 0x06 => {
+                let address = self.real_data(self.ds, u16::from_le_bytes([b[3], b[4]]));
+                let lhs = self.read32(address)?;
+                let rhs = self.get32(EAX);
+                let value = lhs.wrapping_sub(rhs);
+                self.write32(address, value)?;
+                self.carry = lhs < rhs;
+                self.zero = value == 0;
+                self.commit(b, 5);
             },
             0xff if b[2] == 0x06 => {
                 let address = self.real_data(self.ds, u16::from_le_bytes([b[3], b[4]]));
@@ -548,6 +665,48 @@ impl<'a> Runner<'a> {
                 self.set32(ECX, 0);
                 self.commit(b, 2);
             },
+            0xf3 if b[1] == 0xa5 => {
+                if self.direction {
+                    return Err(StageExecError::Bios("reverse REP MOVSD is unsupported"));
+                }
+                let count = self.get32(ECX);
+                let byte_len = usize::try_from(count)
+                    .ok()
+                    .and_then(|value| value.checked_mul(4))
+                    .ok_or(StageExecError::Bios("REP MOVSD length overflow"))?;
+                let source = u64::from(self.get32(ESI));
+                let destination = u64::from(self.get32(EDI));
+                let mut bytes = vec![0_u8; byte_len];
+                self.bus.read_physical(source, &mut bytes)?;
+                self.bus.write_physical(destination, &bytes)?;
+                self.set32(ESI, self.get32(ESI).wrapping_add(count.wrapping_mul(4)));
+                self.set32(EDI, self.get32(EDI).wrapping_add(count.wrapping_mul(4)));
+                self.set32(ECX, 0);
+                self.commit(b, 2);
+            },
+            0x8b if b[1] == 0x3d => {
+                let address = u64::from(u32::from_le_bytes([b[2], b[3], b[4], b[5]]));
+                let value = self.read32(address)?;
+                self.set32(EDI, value);
+                self.commit(b, 6);
+            },
+            0x89 if b[1] == 0x3d => {
+                let address = u64::from(u32::from_le_bytes([b[2], b[3], b[4], b[5]]));
+                self.write32(address, self.get32(EDI))?;
+                self.commit(b, 6);
+            },
+            0x0f if b[1..3] == [0xb7, 0x0d] => {
+                let address = u64::from(u32::from_le_bytes([b[3], b[4], b[5], b[6]]));
+                let value = self.read16(address)?;
+                self.set32(ECX, u32::from(value));
+                self.commit(b, 7);
+            },
+            0xc1 if b[1] == 0xe1 => {
+                let value = self.get32(ECX).wrapping_shl(u32::from(b[2]));
+                self.set32(ECX, value);
+                self.logic_flags(u64::from(value));
+                self.commit(b, 3);
+            },
             0xc7 if b[1] == 0x05 => {
                 let address = u64::from(u32::from_le_bytes([b[2], b[3], b[4], b[5]]));
                 let value = u32::from_le_bytes([b[6], b[7], b[8], b[9]]);
@@ -605,15 +764,71 @@ impl<'a> Runner<'a> {
                 let offset = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
                 let segment = u16::from_le_bytes([b[5], b[6]]);
                 self.commit(b, 7);
-                if self.cr0 & (1 << 31) == 0 || self.efer & (1 << 8) == 0 {
-                    return Err(StageExecError::Bios("long-mode far jump before PG/LME"));
+                if self.cr0 & (1 << 31) != 0 && self.efer & (1 << 8) != 0 {
+                    self.cs = segment;
+                    self.ip = u64::from(offset);
+                    self.mode = Mode::Long64;
+                    self.trace.long_mode_entered = true;
+                } else if self.cr0 & 1 != 0 && segment == 0x18 {
+                    self.cs = segment;
+                    self.ip = u64::from(offset & 0xffff);
+                    self.mode = Mode::Protected16;
+                } else {
+                    return Err(StageExecError::Bios("unsupported protected-mode far jump"));
+                }
+            },
+            0x0f => self.step_protected_0f(b)?,
+            _ => return Err(self.unsupported(b)),
+        }
+        Ok(false)
+    }
+
+    fn step_protected16(&mut self, b: &[u8; 15]) -> Result<bool, StageExecError> {
+        match b[0] {
+            0xb8 => {
+                self.set16(EAX, u16::from_le_bytes([b[1], b[2]]));
+                self.commit(b, 3);
+            },
+            0x8e => {
+                let value = self.get16(EAX);
+                match b[1] {
+                    0xd8 => self.ds = value,
+                    0xc0 => self.es = value,
+                    0xd0 => self.ss = value,
+                    0xe0 => self.fs = value,
+                    0xe8 => self.gs = value,
+                    _ => return Err(self.unsupported(b)),
+                }
+                self.commit(b, 2);
+            },
+            0x0f if b[1..3] == [0x20, 0xc0] => {
+                self.set32(EAX, self.cr0 as u32);
+                self.commit(b, 3);
+            },
+            0x0f if b[1..3] == [0x22, 0xc0] => {
+                self.cr0 = u64::from(self.get32(EAX));
+                self.commit(b, 3);
+            },
+            0x66 if b[1..3] == [0x83, 0xe0] => {
+                let rhs = i32::from(b[3] as i8) as u32;
+                let value = self.get32(EAX) & rhs;
+                self.set32(EAX, value);
+                self.logic_flags(u64::from(value));
+                self.commit(b, 4);
+            },
+            0xea => {
+                let offset = u16::from_le_bytes([b[1], b[2]]);
+                let segment = u16::from_le_bytes([b[3], b[4]]);
+                self.commit(b, 5);
+                if self.cr0 & 1 != 0 || segment != 0 {
+                    return Err(StageExecError::Bios(
+                        "invalid protected16 to real transition",
+                    ));
                 }
                 self.cs = segment;
                 self.ip = u64::from(offset);
-                self.mode = Mode::Long64;
-                self.trace.long_mode_entered = true;
+                self.mode = Mode::Real16;
             },
-            0x0f => self.step_protected_0f(b)?,
             _ => return Err(self.unsupported(b)),
         }
         Ok(false)
@@ -685,6 +900,13 @@ impl<'a> Runner<'a> {
                 self.set32(EDI, u32::from(value));
                 self.commit(b, 7);
             },
+            0x0f if b[1..3] == [0xb6, 0x15] => {
+                let displacement = i64::from(i32::from_le_bytes([b[3], b[4], b[5], b[6]]));
+                let address = self.ip.wrapping_add(7).wrapping_add_signed(displacement);
+                let value = self.read8(address)?;
+                self.set32(EDX, u32::from(value));
+                self.commit(b, 7);
+            },
             0x8b if b[1] == 0x35 => {
                 let displacement = i64::from(i32::from_le_bytes([b[2], b[3], b[4], b[5]]));
                 let address = self.ip.wrapping_add(6).wrapping_add_signed(displacement);
@@ -696,7 +918,10 @@ impl<'a> Runner<'a> {
                 let displacement = i64::from(i32::from_le_bytes([b[1], b[2], b[3], b[4]]));
                 let target = self.ip.wrapping_add(5).wrapping_add_signed(displacement);
                 self.commit(b, 5);
-                if self.get8(EDI) != BOOT_DRIVE || self.get32(ESI) != self.trace.e820_entries {
+                if self.get8(EDI) != BOOT_DRIVE
+                    || self.get32(ESI) != self.trace.e820_entries
+                    || self.get32(EDX) != 1
+                {
                     return Err(StageExecError::Bios(
                         "stage2_main arguments differ from BIOS state",
                     ));
@@ -729,6 +954,12 @@ impl<'a> Runner<'a> {
                 self.carry = false;
             },
             0x15 if self.get32(EAX) == 0xe820 => self.e820()?,
+            0x10 if self.get16(EAX) == 0x4f00 => {
+                // Deliberately model VBE as unavailable. The loader's optional
+                // graphics path must take its documented VGA-text fallback.
+                self.set16(EAX, 0x014f);
+                self.carry = false;
+            },
             0x10 => return Err(StageExecError::Bios("stage failure reached INT 10h")),
             _ => return Err(StageExecError::Bios("unsupported BIOS interrupt")),
         }
@@ -744,7 +975,7 @@ impl<'a> Runner<'a> {
             return Err(StageExecError::Bios("invalid EDD packet size"));
         }
         let sectors = u64::from(self.read16(dap + 2)?);
-        if sectors == 0 || sectors > 127 {
+        if sectors == 0 || sectors > 64 {
             return Err(StageExecError::Bios("invalid EDD sector count"));
         }
         let offset = self.read16(dap + 4)?;
@@ -809,6 +1040,7 @@ impl<'a> Runner<'a> {
             0x73 => !self.carry,
             0x74 => self.zero,
             0x75 => !self.zero,
+            0x76 => self.carry || self.zero,
             0x77 => !self.carry && !self.zero,
             _ => false,
         }
@@ -828,6 +1060,19 @@ impl<'a> Runner<'a> {
 
     fn real_data(&self, segment: u16, offset: u16) -> u64 {
         (u64::from(segment) << 4) + u64::from(offset)
+    }
+
+    fn push32_real(&mut self, value: u32) -> Result<(), StageExecError> {
+        let stack_pointer = self.get16(ESP).wrapping_sub(4);
+        self.set16(ESP, stack_pointer);
+        self.write32(self.real_data(self.ss, stack_pointer), value)
+    }
+
+    fn pop32_real(&mut self) -> Result<u32, StageExecError> {
+        let stack_pointer = self.get16(ESP);
+        let value = self.read32(self.real_data(self.ss, stack_pointer))?;
+        self.set16(ESP, stack_pointer.wrapping_add(4));
+        Ok(value)
     }
 
     fn get8(&self, register: usize) -> u8 {

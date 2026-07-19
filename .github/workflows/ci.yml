@@ -74,6 +74,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p xenith-emu --test image_boot bios_firmware_image_reaches_userspace_shell -- --ignored --exact
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p xenith-emu --test image_boot bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p xenith-emu --test image_boot uefi_iso_executes_packaged_pe_and_reaches_userspace_shell -- --ignored --exact
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Shell pipeline and Xenith C toolchain gates
@@ -83,5 +85,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p xenith-emu --test c_toolchain xenith_built_c_utility_executes_in_ring3 -- --ignored --exact
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Two-processor emulator gate
-        run: cargo test -p xenith-emu --test smp_boot two_processor_kernel_brings_ap_online_and_reaches_shell -- --ignored --exact
+      - name: SMP emulator gates
+        shell: pwsh
+        run: |
+          cargo test -p xenith-emu --test smp_boot two_processor_kernel_brings_ap_online_and_reaches_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p xenith-emu --test smp_boot three_processor_kernel_brings_every_ap_online_and_reaches_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

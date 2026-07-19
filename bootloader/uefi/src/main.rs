@@ -21,14 +21,17 @@ use xenith_boot_common::{
     append_region, Elf64, XenithBootInfo, XenithFramebuffer, XenithMemoryRegion, XenithModule,
     HHDM_OFFSET, PAGE_SIZE,
 };
-use xenith_uefi_loader::{boot_memory_kind, descriptor_length, MemoryDescriptor};
+use xenith_uefi_loader::splash::Splash;
+use xenith_uefi_loader::{
+    boot_memory_kind, descriptor_length, normalize_memory_regions, uefi_command_line,
+    MemoryDescriptor,
+};
 
 const KERNEL_PATH: &[u8] = b"\\EFI\\XENITH\\kernel.elf";
 const KERNEL_FALLBACK: &[u8] = b"\\kernel.elf";
 const INITRD_PATH: &[u8] = b"\\EFI\\XENITH\\initrd.cpio";
 const INITRD_FALLBACK: &[u8] = b"\\initrd.cpio";
 const MODULE_PATH: &[u8] = b"/initrd.cpio";
-const COMMAND_LINE: &[u8] = b"xenith.boot=uefi";
 const PAGE_TABLE_PAGES: usize = 64;
 const KERNEL_STACK_PAGES: usize = 16;
 const MEMORY_MAP_RETRIES: usize = 8;
@@ -46,6 +49,7 @@ enum LoaderError {
     PageTables,
     MemoryMap(Status),
     MemoryMapCapacity,
+    MemoryMapLayout,
     ExitBootServices(Status),
 }
 
@@ -54,7 +58,7 @@ struct BootStorage {
     info: XenithBootInfo,
     module: XenithModule,
     module_path: [u8; 32],
-    command_line: [u8; 32],
+    command_line: [u8; 64],
 }
 
 struct MemoryMapStorage {
@@ -121,26 +125,54 @@ unsafe fn run(
             .as_ref()
             .ok_or(LoaderError::Protocol(INVALID_PARAMETER))?
     };
+    // Locate GOP once, paint before any filesystem I/O, and retain the exact
+    // descriptor for the eventual native handoff.
+    let framebuffer = unsafe { framebuffer(boot_services) };
+    // SAFETY: GOP owns a live direct framebuffer until kernel handoff.
+    let splash = unsafe { Splash::begin(framebuffer) };
     // SAFETY: protocol traversal is bounded to the loaded image's own filesystem.
     let root = unsafe { open_root(boot_services, image_handle)? };
+    if let Some(splash) = splash {
+        // SAFETY: no mode switch occurs during Xenith loader execution.
+        unsafe { splash.progress(12) };
+    }
     let kernel_file = unsafe {
         load_file(boot_services, root, KERNEL_PATH)
             .or_else(|_| load_file(boot_services, root, KERNEL_FALLBACK))?
     };
+    if let Some(splash) = splash {
+        // SAFETY: file allocation does not invalidate GOP storage.
+        unsafe { splash.progress(22) };
+    }
     let initrd = unsafe {
         load_file(boot_services, root, INITRD_PATH)
             .or_else(|_| load_file(boot_services, root, INITRD_FALLBACK))?
     };
+    if let Some(splash) = splash {
+        // SAFETY: file allocation does not invalidate GOP storage.
+        unsafe { splash.progress(34) };
+    }
 
     let page_tables_address = unsafe { allocate_low_pages(boot_services, PAGE_TABLE_PAGES)? };
     let stack_address = unsafe { allocate_low_pages(boot_services, KERNEL_STACK_PAGES)? };
+    let stack_top = stack_address
+        .checked_add(KERNEL_STACK_PAGES as u64 * PAGE_SIZE)
+        .and_then(|top| HHDM_OFFSET.checked_add(top))
+        .ok_or(LoaderError::KernelLayout)?;
     let boot_storage_address = unsafe { allocate_low_pages(boot_services, 1)? };
     // SAFETY: the new allocation is page-aligned, zeroable, and loader-exclusive.
     let mut page_tables = unsafe { PageTables::new(page_tables_address, PAGE_TABLE_PAGES)? };
     page_tables.map_transition_windows()?;
+    if let Some(splash) = splash {
+        // SAFETY: the firmware page tables remain active here.
+        unsafe { splash.progress(44) };
+    }
 
     let kernel = unsafe { load_kernel(boot_services, kernel_file, &mut page_tables)? };
-    let framebuffer = unsafe { framebuffer(boot_services) };
+    if let Some(splash) = splash {
+        // SAFETY: the firmware page tables remain active here.
+        unsafe { splash.progress(56) };
+    }
     if framebuffer.address != 0 && framebuffer.address > u64::from(u32::MAX) {
         let bytes = u64::from(framebuffer.pitch)
             .checked_mul(u64::from(framebuffer.height))
@@ -153,12 +185,17 @@ unsafe fn run(
     }
 
     let memory_storage = unsafe { allocate_memory_map_storage(boot_services)? };
+    if let Some(splash) = splash {
+        // SAFETY: the firmware page tables remain active here.
+        unsafe { splash.progress(62) };
+    }
     // SAFETY: boot storage is one writable loader page and outlives ExitBootServices.
     let storage = unsafe { &mut *(boot_storage_address as *mut BootStorage) };
     storage.module_path.fill(0);
     storage.module_path[..MODULE_PATH.len()].copy_from_slice(MODULE_PATH);
+    let command_line = uefi_command_line(splash.is_some());
     storage.command_line.fill(0);
-    storage.command_line[..COMMAND_LINE.len()].copy_from_slice(COMMAND_LINE);
+    storage.command_line[..command_line.len()].copy_from_slice(command_line);
     storage.module = XenithModule {
         address: initrd.address,
         length: initrd.byte_len as u64,
@@ -173,7 +210,7 @@ unsafe fn run(
     storage.info.modules = &storage.module;
     storage.info.module_count = 1;
     storage.info.command_line = storage.command_line.as_ptr();
-    storage.info.command_line_length = COMMAND_LINE.len() as u32;
+    storage.info.command_line_length = command_line.len() as u32;
     storage.info.boot_cpu_apic_id = boot_apic_id();
 
     for _ in 0..MEMORY_MAP_RETRIES {
@@ -204,10 +241,19 @@ unsafe fn run(
         };
         storage.info.memory_map = memory_storage.region_address as *const XenithMemoryRegion;
         storage.info.memory_map_count = region_count as u32;
+        if let Some(splash) = splash {
+            // SAFETY: direct framebuffer stores do not allocate or mutate the
+            // firmware memory map captured immediately above.
+            unsafe { splash.progress(66) };
+        }
         // SAFETY: no allocations or protocol calls intervene between map capture and exit.
         let status = unsafe { (boot_services.exit_boot_services)(image_handle, map_key) };
         if status == SUCCESS {
-            let stack_top = stack_address + KERNEL_STACK_PAGES as u64 * PAGE_SIZE;
+            if let Some(splash) = splash {
+                // SAFETY: ExitBootServices leaves the current mappings active
+                // until `xenith_uefi_jump` installs the kernel page tables.
+                unsafe { splash.progress(68) };
+            }
             // SAFETY: paging covers the trampoline, stack, handoff, and all kernel segments.
             unsafe { xenith_uefi_jump(page_tables.cr3(), kernel.entry, &storage.info, stack_top) }
         }
@@ -355,7 +401,7 @@ unsafe fn convert_memory_map(
         )
         .map_err(|_| LoaderError::MemoryMapCapacity)?;
     }
-    Ok(used)
+    normalize_memory_regions(&mut output[..used]).map_err(|_| LoaderError::MemoryMapLayout)
 }
 
 unsafe fn framebuffer(boot_services: &BootServices) -> XenithFramebuffer {

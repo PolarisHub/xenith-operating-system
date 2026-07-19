@@ -4,14 +4,14 @@ The next correctness milestones are ordered by runtime impact. Completed work
 such as COW fork, `/dev/pts`, SSDT loading, NIC interrupt mode, XenithFS flush
 barriers, and SMP bring-up is intentionally not repeated as future work.
 
-1. Remove the BIOS semantic `stage2_main` fallback by executing the complete
-   packaged stage2 body, then boot the BIOS El Torito entry end-to-end and
-   replace its fixed boot-drive/primary-master ATA contract with a firmware or
-   device-independent loader path.
-2. Boot the raw BIOS image and standalone/ISO UEFI application on at least two
-   external firmware implementations, then on physical hardware. Record exact
-   serial output, platform configuration, and artifact hashes without treating
-   internal firmware models as equivalent evidence.
+1. Remove the BIOS emulator's semantic `stage2_main` boundary by executing the
+   complete packaged Rust body after the now-exact EDD preload and mode-
+   transition stream.
+2. Extend the current VMware legacy-BIOS ISO/raw proof to at least one more
+   external firmware implementation, complete standalone/ISO UEFI cross-
+   firmware coverage, then test physical hardware. Record exact serial output,
+   platform configuration, and artifact hashes without treating internal
+   firmware models as equivalent evidence.
 3. Expand the emulator from its Xenith-specific firmware/device contract toward
    general 16/32/64-bit execution, including AP trampoline instructions, AHCI,
    e1000, PS/2 mouse, a live display backend, and bounded host networking.
@@ -36,7 +36,9 @@ barriers, and SMP bring-up is intentionally not repeated as future work.
    debugger contract to WHP and a bounded physical serial stop stub.
 10. Broaden WHP artifact coverage beyond one and two VPs, add debugger control,
     and evaluate another host hypervisor backend without weakening the pure
-    interpreter fallback or making acceleration a build/test dependency.
+    interpreter fallback or making acceleration a build/test dependency. Any
+    future increase beyond 64 logical CPUs must replace fixed-width CPU masks
+    and fixed per-CPU stores with dynamically sized equivalents.
 
 Optional QEMU/Limine paths may be retained only for cross-validation; they are
 not primary build or CI dependencies.

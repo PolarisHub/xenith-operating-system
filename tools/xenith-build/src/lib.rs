@@ -258,7 +258,7 @@ pub fn build_bootloader(layout: &Layout) -> Result<Vec<PathBuf>, BuildError> {
         ));
     }
     let stage2_len = fs::metadata(&stage2)?.len();
-    if stage2_len == 0 || !stage2_len.is_multiple_of(512) || stage2_len > 127 * 512 {
+    if stage2_len == 0 || !stage2_len.is_multiple_of(512) || stage2_len > 64 * 512 {
         return Err(BuildError::Usage(
             "stage2 violates the BIOS transfer bound".to_owned(),
         ));
@@ -605,6 +605,7 @@ pub fn build_images(
     let kernel = fs::read(kernel)?;
     let initrd = fs::read(initrd)?;
     let disk = xenith_iso::build_disk_image(&stage1, &stage2, &kernel, &initrd)?;
+    xenith_iso::validate_disk_image(&disk)?;
     let disk_path = layout.output.join("xenith.img");
     fs::write(&disk_path, &disk)?;
 
@@ -614,6 +615,25 @@ pub fn build_images(
         &kernel,
         &initrd,
         &xenith_iso::IsoConfig::default(),
+    )?;
+    let boot_images = xenith_iso::extract_el_torito_boot_images(&iso)?;
+    if boot_images.bios_disk.len() < disk.len()
+        || boot_images.bios_disk[..446] != disk[..446]
+        || boot_images.bios_disk[510..disk.len()] != disk[510..]
+        || boot_images.bios_disk[disk.len()..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(BuildError::Usage(
+            "ISO BIOS entry does not contain the built raw disk plus zero cylinder padding"
+                .to_owned(),
+        ));
+    }
+    xenith_iso::validate_efi_system_partition(
+        boot_images.efi_system_partition,
+        &bootx64,
+        &kernel,
+        &initrd,
     )?;
     let iso_path = layout.output.join("xenith.iso");
     fs::write(&iso_path, iso)?;

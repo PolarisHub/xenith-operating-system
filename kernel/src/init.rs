@@ -14,11 +14,14 @@ pub fn init(boot_info: &'static limine::BootInfo) {
 
     crate::console::init(boot_info);
     ::log::info!("console: ready");
+    crate::devices::framebuffer::splash_progress(70);
 
     crate::arch::init(boot_info);
+    crate::devices::framebuffer::splash_progress(74);
 
     crate::mm::init(boot_info);
     ::log::info!("mm: ready");
+    crate::devices::framebuffer::splash_progress(80);
 
     if let Some(rsdp) = PhysAddr::new(boot_info.rsdp).filter(|address| address.as_u64() != 0) {
         crate::acpi::init(rsdp);
@@ -26,6 +29,7 @@ pub fn init(boot_info: &'static limine::BootInfo) {
     } else {
         ::log::warn!("acpi: boot source supplied no RSDP");
     }
+    crate::devices::framebuffer::splash_progress(84);
 
     // Controller discovery follows ACPI, while exceptions were installed
     // earlier so faults during allocator bring-up remain diagnosable.
@@ -33,22 +37,29 @@ pub fn init(boot_info: &'static limine::BootInfo) {
     crate::arch::x86_64::interrupts::apic::init();
     crate::arch::x86_64::interrupts::ioapic::init();
     crate::time::init();
+    crate::devices::framebuffer::splash_progress(88);
 
     crate::sched::init(boot_info);
     crate::syscall::init();
-    crate::arch::x86_64::smp::init();
+    crate::arch::x86_64::smp::init(xenith_boot::BootInfo::new(boot_info));
     ::log::info!("scheduler: ready");
+    crate::devices::framebuffer::splash_progress(92);
 
     crate::devices::init(boot_info);
     crate::net::init();
     crate::fs::init(boot_info);
+    crate::devices::framebuffer::splash_progress(96);
     if crate::devices::framebuffer::upgrade_terminal() {
         ::log::info!("xenith.term: framebuffer VT100 renderer ready");
     }
+    crate::devices::framebuffer::splash_progress(98);
     if crate::user::init(boot_info) {
         ::log::info!("user: init spawned");
+        crate::devices::framebuffer::splash_progress(100);
     } else {
         ::log::error!("user: init launch failed");
+        crate::devices::framebuffer::dismiss_splash();
+        crate::kprintln!("xenith: failed to launch /init");
     }
 
     // Interrupts must be live before the first user task is dispatched: its

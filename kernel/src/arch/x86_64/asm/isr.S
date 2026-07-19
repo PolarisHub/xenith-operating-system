@@ -20,8 +20,8 @@
 //     [rsp+24] rsp      (the pre-fault stack pointer)
 //     [rsp+32] ss
 //
-// For the seven "error code" exceptions (#DF=8, #TS=10, #NP=11, #SS=12,
-// #GP=13, #PF=14, #AC=17) the CPU additionally pushes a 64-bit error code
+// For the eight "error code" exceptions (#DF=8, #TS=10, #NP=11, #SS=12,
+// #GP=13, #PF=14, #AC=17, #CP=21) the CPU additionally pushes a 64-bit error code
 // below `rip`, so the frame is shifted down by 8 bytes and `[rsp+0]` is the
 // error code rather than `rip`. Every other exception pushes no error code.
 //
@@ -55,11 +55,9 @@
 //
 // # Error-code vector set
 //
-// Only {8, 10, 11, 12, 13, 14, 17} push a real error code. The newer
-// CET/SEV-class vectors (21, 28, 29, 30) may push error codes on parts that
-// enable those features; Xenith does not enable CET/SEV at boot, so they
-// are treated as no-error here. If a future phase enables CET, vector 21's
-// stub must switch to the ERR macro.
+// Vectors {8, 10, 11, 12, 13, 14, 17, 21} push a real error code. #CP's
+// special code identifies the violated CET rule; its frame shape is fixed
+// even though Xenith currently keeps CET disabled.
 
     .section .text
     .code64
@@ -83,7 +81,7 @@ isr_\n:
     .endm
 
 // ISR_ERR n: for exceptions that DO push an error code (#DF, #TS, #NP, #SS,
-// #GP, #PF, #AC). The CPU's error code is already on top of the stack; only
+// #GP, #PF, #AC, #CP). The CPU's error code is already on top of the stack; only
 // the vector number needs to be pushed.
     .macro ISR_ERR n
     .global isr_\n
@@ -118,7 +116,7 @@ isr_\n:
     ISR_NOERR 18    // #MC  machine check
     ISR_NOERR 19    // #XM  SIMD floating-point exception
     ISR_NOERR 20    // #VE  virtualization exception
-    ISR_NOERR 21    // reserved (CET #CP if CET enabled — see file header)
+    ISR_ERR   21    // #CP  control-protection exception
     ISR_NOERR 22    // reserved
     ISR_NOERR 23    // reserved
     ISR_NOERR 24    // reserved
@@ -324,3 +322,19 @@ lapic_timer_isr:
     iretq
 
     .size   lapic_timer_isr, . - lapic_timer_isr
+
+// ---------------------------------------------------------------------------
+// Local-APIC spurious interrupt entry
+// ---------------------------------------------------------------------------
+//
+// A LAPIC spurious interrupt never enters the in-service register, so Intel
+// explicitly requires that software not send an EOI for it.  This stub also
+// calls no Rust code and touches no registers; the hardware IRET frame is
+// already complete for both same-CPL and ring-3 interruptions.
+    .p2align 4
+    .global lapic_spurious_isr
+    .type   lapic_spurious_isr, @function
+lapic_spurious_isr:
+    iretq
+
+    .size   lapic_spurious_isr, . - lapic_spurious_isr

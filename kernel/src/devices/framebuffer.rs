@@ -20,6 +20,7 @@
 //! outside the table render as an outlined replacement cell.
 
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console::{Color, Console};
 use crate::devices::fb_font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
@@ -70,6 +71,7 @@ pub struct FramebufferConsole {
     geom: FramebufferGeom,
     state: spin::Mutex<FbState>,
     terminal: spin::Mutex<Option<Terminal<FramebufferRenderer>>>,
+    splash_active: AtomicBool,
 }
 
 // SAFETY: `FramebufferConsole` is only ever mutated in two ways: (1) the
@@ -105,6 +107,7 @@ impl FramebufferConsole {
                 bg: Color::Black,
             }),
             terminal: spin::Mutex::new(None),
+            splash_active: AtomicBool::new(false),
         }
     }
 }
@@ -123,7 +126,13 @@ static mut FB_CONSOLE: FramebufferConsole = FramebufferConsole::uninit();
 /// `buffer` points at a writable 32 bpp framebuffer of `width`x`height`
 /// pixels with `pitch` bytes per row, mapped writable for the kernel's
 /// lifetime.
-pub unsafe fn init_in_place(buffer: *mut u8, pitch: u16, width: u16, height: u16) {
+pub unsafe fn init_in_place(
+    buffer: *mut u8,
+    pitch: u16,
+    width: u16,
+    height: u16,
+    preserve_splash: bool,
+) {
     let pitch = pitch as usize;
     let cols = (width as usize) / CHAR_W;
     let rows = (height as usize) / CHAR_H;
@@ -142,13 +151,17 @@ pub unsafe fn init_in_place(buffer: *mut u8, pitch: u16, width: u16, height: u16
             cols,
             rows,
         };
+        (*g).splash_active.store(preserve_splash, Ordering::Release);
     }
 
-    // Start with a clean screen and the cursor at the home position.
+    // Keep the UEFI artwork intact until the first real console write. Other
+    // boot paths retain the original clean-screen startup behaviour.
     // SAFETY: `static_ref` only requires that `init_in_place` has run, which
     // is exactly the invariant this function establishes above.
     let console = unsafe { static_ref() };
-    console.clear();
+    if !preserve_splash {
+        console.clear();
+    }
 }
 
 /// Borrow the singleton as a `&'static dyn Console`.
@@ -181,17 +194,102 @@ pub fn upgrade_terminal() -> bool {
     if geom.buffer.is_null() || geom.cols == 0 || geom.rows == 0 {
         return false;
     }
+    let mut terminal_slot = console.terminal.lock();
     let surface = GfxFramebuffer::new(geom.buffer, geom.pitch, geom.width, geom.height);
-    let Ok(terminal) = Terminal::new(FramebufferRenderer::new(surface)) else {
+    let renderer = FramebufferRenderer::new(surface);
+    let preserving = console.splash_active.load(Ordering::Acquire);
+    let terminal = if preserving {
+        Terminal::new_preserving(renderer)
+    } else {
+        Terminal::new(renderer)
+    };
+    let Ok(terminal) = terminal else {
+        if preserving {
+            console.splash_active.store(false, Ordering::Release);
+            console.clear_early_surface();
+        }
         return false;
     };
-    *console.terminal.lock() = Some(terminal);
+    *terminal_slot = Some(terminal);
     true
+}
+
+/// Return whether the firmware splash is still the active display surface.
+#[must_use]
+pub fn splash_active() -> bool {
+    // SAFETY: callers reach this only after console initialization. A zeroed
+    // pre-init singleton also reports false, so an unusually early query is
+    // harmless.
+    let console = unsafe { &*core::ptr::addr_of!(FB_CONSOLE) };
+    console.splash_active.load(Ordering::Acquire)
+}
+
+/// Update the progress indicator painted by the UEFI loader.
+///
+/// Only grayscale pixels are used here, so the update is correct for both
+/// RGBX and BGRX 32-bpp layouts even though the compatibility boot record no
+/// longer carries the original GOP channel masks.
+pub fn splash_progress(percent: u8) {
+    // SAFETY: `console::init` has populated the singleton before init stages
+    // call this function.
+    let console = unsafe { &*core::ptr::addr_of!(FB_CONSOLE) };
+    let _terminal_guard = console.terminal.lock();
+    if !console.splash_active.load(Ordering::Acquire) {
+        return;
+    }
+    let geom = &console.geom;
+    if geom.buffer.is_null() || geom.width < 640 || geom.height < 480 {
+        return;
+    }
+
+    let x = (usize::from(geom.width) - 640) / 2 + 58;
+    let y = (usize::from(geom.height) - 480) / 2 + 378;
+    let filled = 218 * usize::from(percent.min(100)) / 100;
+    fill_rect(geom, x, y, 220, 10, 0x009a_9a9a);
+    fill_rect(geom, x + 1, y + 1, 218, 8, 0x001a_1a1a);
+    if filled != 0 {
+        fill_rect(geom, x + 1, y + 1, filled, 8, 0x00ee_eeee);
+    }
+}
+
+/// Remove a still-visible splash and expose a clean terminal immediately.
+pub fn dismiss_splash() {
+    // SAFETY: see [`splash_progress`].
+    let console = unsafe { &*core::ptr::addr_of!(FB_CONSOLE) };
+    let mut terminal = console.terminal.lock();
+    if console.splash_active.swap(false, Ordering::AcqRel) {
+        if let Some(active) = terminal.as_mut() {
+            active.reset();
+        } else {
+            console.clear_early_surface();
+        }
+    }
 }
 
 // --- Pixel drawing ---------------------------------------------------------
 
 impl FramebufferConsole {
+    /// Clear and home the allocation-free renderer while the terminal lock is
+    /// held by the caller and no stateful terminal is installed.
+    fn clear_early_surface(&self) {
+        let geom = &self.geom;
+        if geom.cols == 0 || geom.buffer.is_null() {
+            return;
+        }
+        let bg = self.state.lock().bg;
+        let bg_rgb = bg_rgb_of(bg);
+        for y in 0..usize::from(geom.height) {
+            for x in 0..usize::from(geom.width) {
+                // SAFETY: bounded by the framebuffer's visible geometry.
+                unsafe { Self::put_pixel(geom, x, y, bg_rgb) };
+            }
+        }
+        let mut state = self.state.lock();
+        state.col = 0;
+        state.row = 0;
+        draw_cursor(geom, &state);
+    }
+
     /// Write a 32 bpp pixel at column `x`, row `y` (pixel coordinates).
     ///
     /// # Safety
@@ -277,6 +375,17 @@ impl FramebufferConsole {
     }
 }
 
+fn fill_rect(geom: &FramebufferGeom, x: usize, y: usize, width: usize, height: usize, rgb: u32) {
+    let end_x = x.saturating_add(width).min(usize::from(geom.width));
+    let end_y = y.saturating_add(height).min(usize::from(geom.height));
+    for py in y.min(end_y)..end_y {
+        for px in x.min(end_x)..end_x {
+            // SAFETY: both coordinates are clipped to the visible geometry.
+            unsafe { FramebufferConsole::put_pixel(geom, px, py, rgb) };
+        }
+    }
+}
+
 /// Pixel pointer at the start of text `row`'s first column.
 #[inline]
 fn y0_pixel(geom: &FramebufferGeom, row: usize) -> *mut u8 {
@@ -310,7 +419,13 @@ impl Console for FramebufferConsole {
     fn write_str(&self, text: &str) {
         let mut terminal = self.terminal.lock();
         if let Some(active) = terminal.as_mut() {
+            if self.splash_active.swap(false, Ordering::AcqRel) {
+                active.reset();
+            }
             active.write(text.as_bytes());
+            return;
+        }
+        if self.splash_active.load(Ordering::Acquire) {
             return;
         }
         drop(terminal);
@@ -323,7 +438,13 @@ impl Console for FramebufferConsole {
         let byte = if ch.is_ascii() { ch as u8 } else { b'?' };
         let mut terminal = self.terminal.lock();
         if let Some(active) = terminal.as_mut() {
+            if self.splash_active.swap(false, Ordering::AcqRel) {
+                active.reset();
+            }
             active.write(core::slice::from_ref(&byte));
+            return;
+        }
+        if self.splash_active.load(Ordering::Acquire) {
             return;
         }
         drop(terminal);
@@ -395,31 +516,14 @@ impl Console for FramebufferConsole {
 
     fn clear(&self) {
         let mut terminal = self.terminal.lock();
+        if self.splash_active.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(active) = terminal.as_mut() {
             active.reset();
             return;
         }
-        drop(terminal);
-
-        let geom = &self.geom;
-        if geom.cols == 0 || geom.buffer.is_null() {
-            return;
-        }
-        let bg = self.state.lock().bg;
-        let bg_rgb = bg_rgb_of(bg);
-        // Fill the whole visible area with the background colour.
-        let h = geom.height as usize;
-        let w = geom.width as usize;
-        for y in 0..h {
-            for x in 0..w {
-                // SAFETY: bounded by width/height.
-                unsafe { Self::put_pixel(geom, x, y, bg_rgb) };
-            }
-        }
-        let mut st = self.state.lock();
-        st.col = 0;
-        st.row = 0;
-        draw_cursor(geom, &st);
+        self.clear_early_surface();
     }
 
     fn set_color(&self, fg: Color, bg: Color) {

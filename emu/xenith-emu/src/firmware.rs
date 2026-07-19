@@ -2,10 +2,10 @@
 //!
 //! The main interpreter intentionally remains an x86-64 execution engine.  This
 //! module models the small firmware boundary that precedes long mode: reset,
-//! the BIOS boot-sector transfer, the two INT 13h EDD reads made by Xenith's
-//! stage1, E820/A20 services, and stage2's protected/long-mode transition.  It
-//! consumes and validates the actual stage1 and stage2 bytes from the disk; it
-//! does not substitute a second host-side image format.
+//! the BIOS boot-sector transfer, Xenith's INT 13h EDD reads, stage2 payload
+//! preloading, E820/A20/VBE services, and the protected/long-mode transition.
+//! It consumes and validates the actual stage1 and stage2 bytes from the disk;
+//! it does not substitute a second host-side image format.
 
 #[path = "firmware_exec.rs"]
 pub(crate) mod firmware_exec;
@@ -42,13 +42,13 @@ const KERNEL_STAGING_ADDRESS: u64 = 0x0200_0000;
 const KERNEL_STAGING_CAPACITY: u64 = 32 * 1024 * 1024;
 const INITRD_LOAD_ADDRESS: u64 = 0x0600_0000;
 const INITRD_CAPACITY: u64 = 64 * 1024 * 1024;
-const HANDOFF_INFO: u64 = 0x0007_0000;
-const HANDOFF_MODULE: u64 = 0x0007_0100;
-const HANDOFF_MODULE_PATH: u64 = 0x0007_0200;
-const HANDOFF_COMMAND_LINE: u64 = 0x0007_0300;
-const HANDOFF_MEMORY_MAP: u64 = 0x0007_1000;
-const LOW_TRAMPOLINE_START: u64 = 0x0008_0000;
-const LOW_TRAMPOLINE_END: u64 = 0x000A_0000;
+// Keep the semantic handoff in loader-reserved memory, clear of stage2's
+// 0x50000 E820 array and its retired 0x70000 INT 13h bounce buffer.
+const HANDOFF_INFO: u64 = 0x0005_1000;
+const HANDOFF_MODULE: u64 = 0x0005_1100;
+const HANDOFF_MODULE_PATH: u64 = 0x0005_1200;
+const HANDOFF_COMMAND_LINE: u64 = 0x0005_1300;
+const HANDOFF_MEMORY_MAP: u64 = 0x0005_2000;
 const KERNEL_PHYSICAL_MIN: u64 = 0x0010_0000;
 const KERNEL_PHYSICAL_LIMIT: u64 = KERNEL_STAGING_ADDRESS;
 const BOOT_DRIVE: u8 = 0x80;
@@ -321,7 +321,7 @@ fn validate_stage1(stage1: &[u8]) -> Result<(), FirmwareError> {
     for (needle, reason) in [
         (
             &[
-                0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7c, 0xfb,
+                0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7c, 0xfc, 0xfb,
             ][..],
             "missing real-mode entry sequence",
         ),
@@ -352,7 +352,10 @@ fn validate_stage1(stage1: &[u8]) -> Result<(), FirmwareError> {
 fn validate_stage2(stage2: &[u8]) -> Result<(), FirmwareError> {
     for (needle, reason) in [
         (
-            &[0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xd0, 0xbc, 0x00, 0x7c][..],
+            &[
+                0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0x66, 0xbc, 0x00, 0x7c, 0x00,
+                0x00,
+            ][..],
             "missing real-mode entry sequence",
         ),
         (
@@ -532,12 +535,10 @@ fn install_handoff(
 ) -> Result<u64, FirmwareError> {
     let memory_end = bus.len() as u64;
     let reservations = [
-        Reservation::new(0, LOW_TRAMPOLINE_START, BootMemoryKind::Reserved),
-        Reservation::new(
-            LOW_TRAMPOLINE_END,
-            0x0010_0000 - LOW_TRAMPOLINE_END,
-            BootMemoryKind::Reserved,
-        ),
+        // Match native stage2: the entire first MiB stays loader-reserved.
+        // In particular, the retired 0x70000 bounce page is never allocator
+        // owned and is available only through the BIOS startup contract.
+        Reservation::new(0, 0x0010_0000, BootMemoryKind::Reserved),
         Reservation::new(
             kernel_span.0,
             kernel_span.1 - kernel_span.0,

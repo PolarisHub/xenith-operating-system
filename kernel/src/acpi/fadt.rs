@@ -55,30 +55,30 @@ const PM1A_CNT_BLK: usize = 64;
 const PM1B_CNT_BLK: usize = 68;
 /// `RESET_REG` Generic Address Structure (12 bytes). Present in FADT
 /// revision >= 2; absent in ACPI 1.0.
-const RESET_REG: usize = 118;
+const RESET_REG: usize = 116;
 /// The byte to write to `RESET_REG` to force a platform reset.
-const RESET_VALUE: usize = 130;
+const RESET_VALUE: usize = 128;
 /// Extended 64-bit physical address of the DSDT. Present in revision >= 2;
 /// takes precedence over [`LEGACY_DSDT`] when non-zero.
-const X_DSDT: usize = 142;
+const X_DSDT: usize = 140;
 /// Extended GAS for the PM1a event block.
-const X_PM1A_EVT: usize = 150;
+const X_PM1A_EVT: usize = 148;
 /// Extended GAS for the PM1b event block.
-const X_PM1B_EVT: usize = 162;
+const X_PM1B_EVT: usize = 160;
 /// Extended GAS for the PM1a control block.
-const X_PM1A_CNT: usize = 174;
+const X_PM1A_CNT: usize = 172;
 /// Extended GAS for the PM1b control block.
-const X_PM1B_CNT: usize = 186;
+const X_PM1B_CNT: usize = 184;
 
 /// The minimum FADT length that contains the extended PM1b control GAS:
-/// `X_PM1B_CNT + 12 = 198`. Tables shorter than this are ACPI 1.0-shaped and
+/// `X_PM1B_CNT + 12 = 196`. Tables shorter than this are ACPI 1.0-shaped and
 /// only the legacy port fields are read.
-const MIN_LEN_EXTENDED: usize = 198;
+const MIN_LEN_EXTENDED: usize = 196;
 
 /// The minimum FADT length that contains `RESET_VALUE`: `RESET_VALUE + 1 =
-/// 131`. Guarding the reset read on this avoids touching the reserved bytes
+/// 129`. Guarding the reset read on this avoids touching the reserved bytes
 /// of an ACPI 1.0 FADT that predates `RESET_REG`.
-const MIN_LEN_RESET: usize = 131;
+const MIN_LEN_RESET: usize = 129;
 
 /// Errors raised by FADT parsing.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -326,6 +326,38 @@ fn pick_gas(extended: GenericAddress, legacy_port: u32, bit_width: u8) -> Generi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_gas(table: &mut [u8], offset: usize, space: u8, width: u8, address: u64) {
+        table[offset] = space;
+        table[offset + 1] = width;
+        table[offset + 3] = 2;
+        table[offset + 4..offset + 12].copy_from_slice(&address.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_acpi_extended_fields_at_spec_offsets() {
+        let table = Box::leak(Box::new([0u8; MIN_LEN_EXTENDED]));
+        table[0..4].copy_from_slice(b"FACP");
+        table[4..8].copy_from_slice(&(MIN_LEN_EXTENDED as u32).to_le_bytes());
+        table[LEGACY_DSDT..LEGACY_DSDT + 4].copy_from_slice(&0x0012_3000u32.to_le_bytes());
+        table[PM1A_CNT_BLK..PM1A_CNT_BLK + 4].copy_from_slice(&0x404u32.to_le_bytes());
+        write_gas(table, RESET_REG, 1, 8, 0x0cf9);
+        table[RESET_VALUE] = 0x06;
+        table[X_DSDT..X_DSDT + 8].copy_from_slice(&0x0000_0000_1234_5000u64.to_le_bytes());
+        write_gas(table, X_PM1A_EVT, 1, 16, 0x0440);
+        write_gas(table, X_PM1A_CNT, 1, 16, 0x0444);
+
+        // SAFETY: the leaked byte array contains a complete packed header
+        // followed by every FADT field the parser reads.
+        let header = unsafe { &*(table.as_ptr() as *const SdtHeader) };
+        let fadt = Fadt::parse(header).unwrap();
+
+        assert_eq!(fadt.dsdt_address.as_u64(), 0x0000_0000_1234_5000);
+        assert_eq!(fadt.reset_reg.address, 0x0cf9);
+        assert_eq!(fadt.reset_value, 0x06);
+        assert_eq!(fadt.pm1a_evt_gas.address, 0x0440);
+        assert_eq!(fadt.pm1a_cnt_gas.address, 0x0444);
+    }
 
     /// `pick_gas` prefers an extended GAS with a non-zero address over the
     /// legacy port, and otherwise wraps the legacy port in a SystemIo GAS.

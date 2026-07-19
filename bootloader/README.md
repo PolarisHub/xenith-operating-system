@@ -10,7 +10,7 @@ root. It produces:
 
 - `bootloader/build/stage1.bin`: exact 512-byte BIOS sector with `55 aa` signature;
 - `bootloader/build/stage2.elf`: linked diagnostic BIOS loader image;
-- `bootloader/build/stage2.bin`: sector-padded flat image, at most 127 sectors;
+- `bootloader/build/stage2.bin`: sector-padded flat image, at most 64 sectors;
 - `bootloader/build/BOOTX64.EFI`: PE32+ UEFI application.
 
 No assembler, C compiler, objcopy, NASM, xorriso, or Limine tool is invoked. The only
@@ -36,24 +36,36 @@ The BIOS path consumes the `XENITHIM` v1 image emitted by `tools/xenith-iso`:
 | 64, 128, 192 | 64-byte stage2, kernel, and initrd entries |
 
 Each entry is `kind:u32`, `flags:u32`, `start_lba:u64`, `sector_count:u64`,
-`byte_len:u64`, payload FNV-1a-64, and a 24-byte NUL-padded name. Stage1 reads LBA 1
-with INT 13h EDD, requires entry zero to be stage2, loads 1..127 sectors to physical
-`0x8000`, and transfers control there. Stage2 revalidates the complete manifest and
-the kernel/initrd payload hashes.
+`byte_len:u64`, payload FNV-1a-64, and a 24-byte NUL-padded name. Stage1 prefers
+INT 13h EDD packet reads and falls back to geometry-validated single-sector CHS
+reads. It requires entry zero to be stage2, loads 1..64 sectors to physical
+`0x8000` without crossing the 64 KiB DMA boundary, and transfers control there.
+Stage2 revalidates the complete manifest and the kernel/initrd payload hashes.
 
-Stage2 obtains E820, enables A20, installs protected and long mode, and builds identity
-and HHDM mappings for the first 4 GiB plus the conventional Xenith kernel mapping at
-`0xffffffff80000000`. It reads LBA48 sectors using the legacy primary-master ATA ports,
-loads a validated x86_64 `ET_EXEC` kernel below 32 MiB, places an initrd of at most
-64 MiB at 96 MiB, locates the RSDP, carves loader/kernel/module reservations into the
-memory map, and jumps to the ELF entry.
+Stage2 enables A20 and preloads the kernel and initramfs from the firmware-provided
+boot drive. It prefers EDD chunks of at most 64 sectors and falls back to
+single-sector CHS reads, using a conventional-memory bounce buffer and explicit
+protected-mode copy windows for the high staging addresses. It optionally selects
+a 32-bpp VBE framebuffer, obtains E820, installs protected and long mode, and
+builds identity and HHDM mappings for the first 4 GiB plus the conventional Xenith
+kernel mapping at `0xffffffff80000000`. It loads a validated x86_64 `ET_EXEC`
+kernel below 32 MiB, places an initrd of at most 64 MiB at 96 MiB, locates the
+RSDP, carves loader/kernel/module reservations into the memory map, and jumps to
+the ELF entry.
 
-The currently linked BIOS hardware path is intentionally bounded to a PC-compatible
-BIOS boot disk at drive `0x80` exposed as legacy primary-master ATA PIO. AHCI-only,
-NVMe-only, USB-only, drive `0x81`, and BIOS El Torito 2048-byte-sector boot are not yet
-runtime paths. The raw-image layout contract is implemented and structurally tested;
-firmware execution remains unvalidated. `stage1,stage2` ISO pair mode is packaging-only
-until a dedicated El Torito shim handles its preload/sector semantics.
+The firmware-read path retains the BIOS-provided drive number and supports the
+hard-disk-emulated El Torito image as well as a raw BIOS disk. Legacy
+primary-master ATA PIO is retained only as a drive-`0x80` fallback if firmware
+preloading fails. The current raw and ISO paths have external VMware legacy-BIOS
+and QEMU/SeaBIOS runtime proof; physical hardware and arbitrary firmware remain
+separate validation boundaries.
+
+The BIOS handoff sets the exact `xenith.boot=bios` command-line token and marks
+the first MiB reserved. Once all synchronous INT 13h payload reads are done,
+the bounce range at `0x70000..0x77fff` is retired. If the kernel's physical
+allocator cannot supply another low AP-trampoline frame, the token permits
+serialized AP startup to reuse physical page `0x70000`; that page never enters
+the general allocator and is not reused after an AP startup timeout.
 
 ## UEFI contract
 

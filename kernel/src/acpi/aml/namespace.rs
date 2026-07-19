@@ -19,11 +19,32 @@ pub struct Method {
     pub(crate) body: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegionTerm {
+    Integer(u64),
+    Reference(String),
+    Add {
+        left: alloc::boxed::Box<Self>,
+        right: alloc::boxed::Box<Self>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationRegionBounds {
+    Resolved {
+        offset: u64,
+        length: u64,
+    },
+    Deferred {
+        offset: RegionTerm,
+        length: RegionTerm,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperationRegion {
     pub space: RegionSpace,
-    pub offset: u64,
-    pub length: u64,
+    pub bounds: OperationRegionBounds,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +137,32 @@ impl Namespace {
         }
         Err(AmlError::LimitExceeded("alias depth"))
     }
+
+    /// Resolve an AML name reference using the namespace's upward-search
+    /// rules. `candidate` is the canonical path produced relative to the
+    /// current scope; if it is absent, progressively enclosing scopes are
+    /// searched for the same final NameSeg.
+    pub(crate) fn search_existing(&self, candidate: &str) -> Option<String> {
+        if self.get(candidate).is_some() {
+            return Some(candidate.to_string());
+        }
+        let mut segments: Vec<String> = split_canonical(candidate)
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        let leaf = segments.pop()?;
+        while !segments.is_empty() {
+            segments.pop();
+            let mut next = segments.clone();
+            next.push(leaf.clone());
+            let path = canonical_from_segments(&next);
+            if self.get(&path).is_some() {
+                return Some(path);
+            }
+        }
+        let root = alloc::format!("\\{leaf}");
+        self.get(&root).map(|_| root)
+    }
 }
 
 pub(crate) fn split_canonical(path: &str) -> Vec<&str> {
@@ -181,4 +228,25 @@ pub fn normalize_path(path: &str) -> Result<String, AmlError> {
 
 pub(crate) fn valid_name_char(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upward_search_finds_previously_declared_enclosing_name() {
+        let mut namespace = Namespace::default();
+        namespace
+            .insert(
+                "\\_SB_.ECFG".into(),
+                NamespaceObject::Value(AmlValue::Integer(0xffc0_0000)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            namespace.search_existing("\\_SB_.PCI0.ISA_.ECFG"),
+            Some("\\_SB_.ECFG".into())
+        );
+    }
 }

@@ -40,6 +40,13 @@ stages:
 cargo run -p xenith-emu -- --bios-image build/xenith.img --disk-read-only --memory 256M --smp 2 --serial stdio --max-instructions 240000000
 ```
 
+To select the x86 hard-disk-emulation entry from the actual El Torito catalog
+and validate its ISO extent before entering the same BIOS runner, use:
+
+```text
+cargo run -p xenith-emu -- --bios-iso build/xenith.iso --disk-read-only --memory 256M --smp 2 --serial stdio --max-instructions 240000000
+```
+
 This path starts from architectural reset state, installs an inspectable reset
 ROM stub, and transfers the actual MBR to `0x7c00`. A bounded interpreter
 fetches and executes the packaged stage1 bytes, services its EDD reads, executes
@@ -54,7 +61,8 @@ fallback: the host validates and reads its payloads, loads the kernel ELF,
 constructs the native `XenithBootInfo`, and enters the kernel. This proves the
 current packaged Xenith stage1 and stage2 instruction streams through the
 long-mode Rust-call boundary; it is not an arbitrary BIOS or general 16/32-bit
-firmware interpreter.
+firmware interpreter. The `--bios-iso` path has this same explicit semantic
+boundary; ISO catalog selection does not turn it into external-firmware proof.
 
 ## Packaged UEFI ISO execution
 
@@ -116,6 +124,19 @@ MAC, immediate reset, an always-up link, an empty receive ring, and
 deterministic transmit completion/INTx. It brings the production RTL8139
 driver online and provides a bounded transmit sink, but it has no host network
 backend or inbound-frame source.
+
+Repository SMP coverage includes the explicitly invoked artifact gates
+`two_processor_kernel_brings_ap_online_and_reaches_shell` and
+`three_processor_kernel_brings_every_ap_online_and_reaches_shell`. Fast
+topology tests construct 1-, 3-, and 64-CPU machines, verify their MADTs, and
+exercise SIPI delivery to every one of the 63 APs at the supported maximum.
+These checks preserve the distinction between a complete boot gate and a
+focused machine-model test.
+
+The BIOS-ISO artifact gate also boots three CPUs with the native stage2 memory
+contract: the whole first MiB remains reserved, so the test requires the exact
+`xenith.boot=bios` handoff to select the retired `0x70000` bounce page and then
+requires both APs to execute before the shell appears.
 
 ## Host input and displays
 

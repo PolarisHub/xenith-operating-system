@@ -69,6 +69,9 @@ pub use registers::{Cr0, Cr3, Cr4};
 /// * Confirm we are in long mode (EFER.LME), enable EFER.NXE, and confirm
 ///   that paging is on (CR0.PG). Limine performs the transition for the BSP,
 ///   but Xenith owns NX because its page tables use the no-execute bit.
+/// * Clear inherited CR4.CET and CR4.PKS state. Xenith does not provision
+///   shadow stacks, indirect-branch tracking, or a supervisor protection-key
+///   policy, so retaining firmware enablement would be unsafe after handoff.
 /// * Enable global pages and, when CPUID advertises them, SMEP/SMAP. User-copy
 ///   assembly opens tightly bounded SMAP windows with STAC/CLAC.
 /// * Clear CR0.EM and set CR0.MP so x87/MMX/SSE instructions do not trap, and
@@ -90,6 +93,17 @@ pub fn early_init() {
     // `early_init` itself safe because the invariants (ring 0, one bring-up
     // call per CPU, post-loader handoff) are established by the boot contract, not
     // by something the caller can check at runtime.
+
+    // CET and supervisor protection keys are OS-owned facilities. Firmware
+    // may have used them before handoff, but Xenith does not initialise their
+    // MSRs or shadow-stack mappings. Disable both before any later CR4 feature
+    // write can accidentally preserve inherited policy. Clearing an
+    // unsupported/reserved CR4 bit is safe because such a bit reads as zero.
+    let mut cr4 = Cr4::read();
+    cr4.remove(Cr4::CET | Cr4::PKS);
+    // SAFETY: this write only clears the unsupported CET/PKS enables and
+    // preserves every other architecturally named bit read from CR4.
+    unsafe { cr4.write() };
 
     // Long-mode + paging sanity. EFER.LME bit 8 is "IA-32e mode enable";
     // CR0.PG bit 31 is "paging enable". Limine sets both before jumping to
@@ -198,6 +212,10 @@ pub fn init(_boot_info: &'static limine::BootInfo) {
     percpu::init_for_bsp();
     fpu::init();
     idt::install_exception_handlers();
+    // The SVR is enabled later during controller bring-up. Publish its 0xFF
+    // gate now so the BSP and every AP that loads this shared IDT always have
+    // a valid target before their local APIC can deliver a spurious vector.
+    idt::install_lapic_spurious_handler();
     idt::load();
 
     ::log::info!("arch: descriptor tables and CPU state ready");

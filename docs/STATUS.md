@@ -29,8 +29,12 @@ a boot result, and an internal firmware model is not a physical-machine result.
 - XenithFS shares its disk format with `xenith-mkfs` and `xenith-fsck`. Journal
   commit ordering and filesystem sync issue block-device flush barriers;
   focused memory-disk tests cover persistent-tree replay and remount.
-- SMP supports up to 64 logical CPUs. MADT topology drives INIT-SIPI-SIPI, APs
-  install CPU-local descriptor/per-CPU/FPU/scheduler state, and reschedule plus
+- SMP supports configured topologies from 1 through 64 logical CPUs. MADT
+  topology drives serialized INIT-SIPI-SIPI startup through one reusable low
+  trampoline page; the BSP repatches it only after the preceding AP's online
+  acknowledgement. A timeout quarantines that page and stops further AP
+  startup so a late AP cannot consume another CPU's state. APs install
+  CPU-local descriptor/per-CPU/FPU/scheduler state, and reschedule plus
   TLB-shootdown IPIs coordinate per-CPU run queues. Both x2APIC and legacy
   xAPIC register backends are implemented.
 - `xenith-build all` owns bootloader, kernel, userspace, initramfs, raw-image,
@@ -38,6 +42,14 @@ a boot result, and an internal firmware model is not a physical-machine result.
   NASM, a system C compiler/linker, or GDB. The ISO contains a BIOS
   hard-disk-emulation image and a FAT16 EFI System Partition with exact
   `BOOTX64.EFI`, kernel, and initramfs payload verification.
+- BIOS stage2 keeps payload I/O behind the firmware boot-drive contract: it
+  reads the kernel and initramfs through bounded EDD packets or a geometry-
+  validated, single-sector CHS fallback into conventional memory, copies each
+  chunk to its high staging address through explicit real/protected-mode
+  transitions, and verifies both manifest checksums. Its direct primary-master
+  ATA reader remains only as the drive-`0x80` fallback.
+  Optional VBE discovery selects a 32-bpp linear framebuffer up to 1024x768;
+  failed or absent VBE falls back to VGA text.
 - `xenith-emu` provides deterministic 1-to-64-CPU execution, direct and
   manifest-image loaders, exact packaged BIOS-stage execution to the Rust
   stage2 boundary, actual packaged `BOOTX64.EFI` PE32+ execution, paging,
@@ -75,17 +87,19 @@ the current build.
 | `xenith_built_c_utility_executes_in_ring3` | C source compiled by Xenith's compiler/assembler/linker executes at CPL3 | PASS (2026-07-19) |
 | `manifest_image_reaches_userspace_shell` | The packaged manifest, checksums, kernel, initramfs, and attached ATA image reach the shell | PASS (2026-07-19) |
 | `bios_firmware_image_reaches_userspace_shell` | Exact packaged BIOS stage streams execute through their long-mode call boundary, then the explicit semantic stage2 body reaches the shell | PASS (2026-07-19) |
+| `bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell` | The ISO's validated x86 catalog entry executes the packaged BIOS stages, preserves the native reserved-low-memory handoff, exercises the `0x70000` AP-trampoline fallback, brings an odd three-CPU topology online, and reaches the shell | PASS (2026-07-19) |
 | `uefi_iso_executes_packaged_pe_and_reaches_userspace_shell` | The platform-`0xEF` entry, FAT16 payloads, actual `BOOTX64.EFI`, strict services, `ExitBootServices`, and native handoff reach the shell with `semantic_loader_fallback=false` | PASS (2026-07-19) |
 | `two_processor_kernel_brings_ap_online_and_reaches_shell` | The deterministic interpreter observes guest INIT-SIPI-SIPI, brings CPU 1 online, and reaches userspace | PASS (2026-07-19) |
+| `three_processor_kernel_brings_every_ap_online_and_reaches_shell` | The deterministic interpreter observes serialized startup of both APs, brings all three CPUs online, and reaches userspace | PASS (2026-07-19) |
 | `built_kernel_supports_bidirectional_dwarf_line_lookup` | The packaged kernel's symbols and line tables resolve address-to-source and source-to-address | PASS (2026-07-19) |
 | `gdb_rsp_tcp_bridge_controls_a_live_emulator` | The bounded GDB RSP bridge controls registers, memory, breakpoints, continue, and single-step on a live interpreter | PASS (2026-07-19) |
 | `whp_boots_built_kernel_to_userspace_shell` | A real WHP virtual processor executes the direct kernel handoff to the shell | PASS (2026-07-19) |
 | `whp_brings_second_processor_online_and_reaches_userspace_shell` | Two real WHP VPs execute and the guest brings its AP online before reaching the shell | PASS (2026-07-19) |
 
-## Validation snapshot — 2026-07-19
+## Validation snapshot - 2026-07-19
 
 - Complete workspace check and the selected native workspace test suite: PASS.
-- Kernel host suite: 431 passed, 0 failed.
+- Kernel host suite: 459 passed, 0 failed.
 - Strict native, custom-target kernel/userspace, and standalone bootloader
   Clippy with warnings denied: PASS.
 - Standalone bootloader checks/tests and root plus bootloader formatting: PASS.
@@ -93,6 +107,26 @@ the current build.
   `BOOTX64.EFI`, userspace ELFs, initramfs, raw image, hybrid ISO, and artifact
   inventory through the repository-owned toolchain.
 - Every runtime gate in the table above: PASS against the refreshed artifacts.
+
+External VMware Workstation 17.6.3 legacy-BIOS cold boots also passed on
+2026-07-19 against the exact current ISO with 512 MiB RAM and 1, 3, 4, 8, 16,
+and 24 vCPUs. The respective cores-per-socket settings were 1, 1, 2, 4, 8,
+and 12; 24 was the host's logical-CPU limit. Every configuration reported the
+requested online/discovered count, reached `xenith$`, and had no guest failure,
+CPU-disabled, AP-timeout, panic, or triple-fault marker.
+
+QEMU 11.0.50 with SeaBIOS 1.17 cold-booted the exact current ISO at every
+integer CPU count from 1 through 64. All 64 runs reported the exact requested
+online/discovered count and reached `xenith$`. The current raw image also
+passed at 64 CPUs, and a 6-CPU topology with 2 sockets by 3 cores passed with
+non-contiguous APIC IDs. The tested hashes were:
+
+- `xenith.iso`: `0949DB89FEF66AAA2A83A96858A5D97F12D5561C76ADD0580352954C9ACC110F`
+- `xenith.img`: `074298C35B258A57D483D769C5F638D2620FBE505A968A0700BD3E629289FE20`
+- `kernel.elf`: `1A1727FE75D9D7D8BA3D6B7C89903BC6D9AF1802663E33FA93021DA3FA9868BD`
+- `stage1.bin`: `A46C1CDD3774064FEFAE8EB5379245900D773A4425FF16B8AA428A39328607C0`
+- `stage2.bin`: `ED6B02B71122043DF7C645DC1B676FFA4B2A7A20C0DF7C788D9AC34EC9B9C4CD`
+- `BOOTX64.EFI`: `18330D4CB053F5A6CE616C94F870F1AB14D3CEC6ECD49B3E03209FA5CE31D9AF`
 
 Native unit/integration tests also exercise the debugger protocol and GDB RSP
 bridge, CPL-aware walks and interrupt entry, ATA/PCI/HPET/RTL8139 devices,
@@ -102,15 +136,23 @@ ordering.
 
 ## Remaining boundaries
 
-- No external BIOS/UEFI implementation or physical PC boot is recorded for the
-  current artifacts. Physical AHCI, RTL8139/e1000, legacy xAPIC, display, input,
-  ACPI, and cache-flush behavior therefore remain hardware-validation work.
+- VMware Workstation legacy BIOS and QEMU/SeaBIOS now prove the current raw disk
+  and BIOS El Torito entry, including firmware EDD/CHS payload preloading and
+  VBE linear-framebuffer handoff. This does not establish physical-PC
+  compatibility or coverage across arbitrary firmware; physical
+  AHCI/NVMe/USB boot, NICs, display/input, ACPI quirks, and cache-flush behavior
+  remain hardware-validation work.
+- The supported configured CPU range is 1 through 64, including the BSP. CPU
+  masks and several per-CPU stores are fixed around `MAX_CPUS=64`; supporting
+  more than 64 requires dynamically sized CPU sets and per-CPU storage rather
+  than a larger configuration value alone.
 - The BIOS runner executes the exact packaged stage1 and stage2 instruction
   streams only through the real long-mode `call stage2_main` boundary. The Rust
-  stage2 payload/ELF/handoff body is an explicit semantic fallback. The loader
-  accepts boot drive `0x80` and reads legacy primary-master ATA PIO; a complete
-  BIOS El Torito boot, AHCI/NVMe/USB boot, drive `0x81`, and arbitrary option
-  ROM or firmware execution are not implemented.
+  stage2 checksum/ELF/handoff body is an explicit semantic fallback. The real
+  loader uses the firmware-provided hard-disk boot drive through EDD or CHS,
+  including El Torito emulation, and retains primary-master ATA PIO only when
+  firmware preload fails on drive `0x80`. Arbitrary option ROMs and firmware
+  are not emulated.
 - The UEFI runner executes the packaged PE instructions without a semantic
   loader fallback, but implements only the protocols, services, PE form, and
   memory model reached by Xenith's loader. It is not a general UEFI firmware.

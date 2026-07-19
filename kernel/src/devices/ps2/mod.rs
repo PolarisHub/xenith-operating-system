@@ -646,6 +646,17 @@ pub const MOUSE_VECTOR: u8 = 0x2C;
 static KEYBOARD_IOAPIC: AtomicBool = AtomicBool::new(false);
 static MOUSE_IOAPIC: AtomicBool = AtomicBool::new(false);
 
+/// Legacy I/O APIC redirection entries carry only an eight-bit physical
+/// destination. Never silently alias a wider x2APIC ID onto another CPU.
+#[inline]
+const fn ioapic_destination(apic_id: u32) -> Option<u8> {
+    if apic_id <= u8::MAX as u32 {
+        Some(apic_id as u8)
+    } else {
+        None
+    }
+}
+
 fn finish_irq(via_ioapic: bool) {
     if via_ioapic {
         crate::arch::x86_64::interrupts::apic::send_eoi();
@@ -678,7 +689,9 @@ extern "C" fn xenith_ps2_mouse_irq_rust() {
 ///
 /// Dedicated assembly gates preserve the interrupted register file. Routing
 /// prefers the I/O APIC and uses the remapped 8259 only as a compatibility
-/// fallback when no I/O APIC owns the legacy GSI.
+/// fallback when no I/O APIC owns the legacy GSI. A local APIC ID above 255
+/// cannot be represented by either route while LAPIC LINT0 is masked, so PS/2
+/// IRQs remain disabled on that CPU instead of being misdelivered.
 ///
 /// # Safety of calling
 ///
@@ -690,37 +703,46 @@ pub fn register_irq_handlers() {
         idt.set_interrupt_handler(u16::from(MOUSE_VECTOR), xenith_ps2_mouse_irq);
     }
 
+    KEYBOARD_IOAPIC.store(false, Ordering::Release);
+    MOUSE_IOAPIC.store(false, Ordering::Release);
+
+    let apic_id = crate::arch::x86_64::interrupts::apic::current_id();
+    let destination = ioapic_destination(apic_id);
     if crate::arch::x86_64::interrupts::ioapic::count() != 0 {
-        let apic_id = crate::arch::x86_64::interrupts::apic::current_id();
-        if apic_id > u32::from(u8::MAX) {
-            ::log::warn!(
-                "xenith.ps2: x2APIC id {} cannot be represented by IOAPIC destination",
-                apic_id
-            );
+        if let Some(destination) = destination {
+            let keyboard_routed = crate::arch::x86_64::interrupts::ioapic::route_isa(
+                KEYBOARD_IRQ,
+                KEYBOARD_VECTOR,
+                destination,
+            )
+            .is_some();
+            let mouse_routed = crate::arch::x86_64::interrupts::ioapic::route_isa(
+                MOUSE_IRQ,
+                MOUSE_VECTOR,
+                destination,
+            )
+            .is_some();
+            KEYBOARD_IOAPIC.store(keyboard_routed, Ordering::Release);
+            MOUSE_IOAPIC.store(mouse_routed, Ordering::Release);
         }
-        let destination = apic_id as u8;
-        let keyboard_routed = crate::arch::x86_64::interrupts::ioapic::route(
-            u32::from(KEYBOARD_IRQ),
-            KEYBOARD_VECTOR,
-            destination,
-        )
-        .is_some();
-        let mouse_routed = crate::arch::x86_64::interrupts::ioapic::route(
-            u32::from(MOUSE_IRQ),
-            MOUSE_VECTOR,
-            destination,
-        )
-        .is_some();
-        KEYBOARD_IOAPIC.store(keyboard_routed, Ordering::Release);
-        MOUSE_IOAPIC.store(mouse_routed, Ordering::Release);
     }
 
-    if !KEYBOARD_IOAPIC.load(Ordering::Acquire) {
-        crate::arch::x86_64::interrupts::pic::unmask_irq(KEYBOARD_IRQ);
-    }
-    if !MOUSE_IOAPIC.load(Ordering::Acquire) {
-        crate::arch::x86_64::interrupts::pic::unmask_irq(2);
-        crate::arch::x86_64::interrupts::pic::unmask_irq(MOUSE_IRQ);
+    if destination.is_some() {
+        if !KEYBOARD_IOAPIC.load(Ordering::Acquire) {
+            crate::arch::x86_64::interrupts::pic::unmask_irq(KEYBOARD_IRQ);
+        }
+        if !MOUSE_IOAPIC.load(Ordering::Acquire) {
+            crate::arch::x86_64::interrupts::pic::unmask_irq(2);
+            crate::arch::x86_64::interrupts::pic::unmask_irq(MOUSE_IRQ);
+        }
+    } else {
+        crate::arch::x86_64::interrupts::pic::mask_irq(KEYBOARD_IRQ);
+        crate::arch::x86_64::interrupts::pic::mask_irq(MOUSE_IRQ);
+        ::log::warn!(
+            "xenith.ps2: local APIC id {} exceeds the IOAPIC's 8-bit destination and \
+             legacy PIC delivery is unavailable; PS/2 IRQs remain disabled",
+            apic_id
+        );
     }
     ::log::info!(
         "xenith.ps2: IRQ 1 -> vector {:#04x}, IRQ 12 -> vector {:#04x}",
@@ -736,6 +758,14 @@ pub fn register_irq_handlers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ioapic_destination_rejects_wide_x2apic_ids_without_truncation() {
+        assert_eq!(ioapic_destination(0), Some(0));
+        assert_eq!(ioapic_destination(255), Some(255));
+        assert_eq!(ioapic_destination(256), None);
+        assert_eq!(ioapic_destination(u32::MAX), None);
+    }
 
     #[test]
     fn config_bits_are_disjoint() {

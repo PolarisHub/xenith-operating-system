@@ -242,7 +242,20 @@ pub struct Terminal<R: TerminalRenderer> {
 }
 
 impl<R: TerminalRenderer> Terminal<R> {
-    pub fn new(mut renderer: R) -> Result<Self, TerminalError> {
+    pub fn new(renderer: R) -> Result<Self, TerminalError> {
+        Self::new_with_initial_paint(renderer, true)
+    }
+
+    /// Construct a terminal without touching the renderer yet.
+    ///
+    /// The UEFI boot path uses this while its splash is still visible. The
+    /// first real console write resets the terminal, which paints the normal
+    /// background and cursor immediately before rendering that output.
+    pub fn new_preserving(renderer: R) -> Result<Self, TerminalError> {
+        Self::new_with_initial_paint(renderer, false)
+    }
+
+    fn new_with_initial_paint(mut renderer: R, paint: bool) -> Result<Self, TerminalError> {
         let (columns, rows) = renderer.dimensions();
         if columns == 0 || rows == 0 {
             return Err(TerminalError::ZeroSizedRenderer);
@@ -252,12 +265,14 @@ impl<R: TerminalRenderer> Terminal<R> {
             .ok_or(TerminalError::GeometryOverflow)?;
         let cells = alloc::vec![Cell::default(); count];
         let alternate_cells = alloc::vec![Cell::default(); count];
-        for row in 0..rows {
-            for column in 0..columns {
-                renderer.draw_cell(column, row, Cell::default());
+        if paint {
+            for row in 0..rows {
+                for column in 0..columns {
+                    renderer.draw_cell(column, row, Cell::default());
+                }
             }
+            renderer.set_cursor(0, 0, true);
         }
-        renderer.set_cursor(0, 0, true);
         Ok(Self {
             renderer,
             columns,
@@ -863,4 +878,49 @@ fn indexed_color(mut index: u8, bold: bool) -> GfxColor {
     }
     let gray = 8 + (index - 232) * 10;
     GfxColor::new(gray, gray, gray)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{Cell, Terminal, TerminalRenderer};
+
+    struct CountingRenderer {
+        draws: Arc<AtomicUsize>,
+        cursors: Arc<AtomicUsize>,
+    }
+
+    impl TerminalRenderer for CountingRenderer {
+        fn dimensions(&self) -> (usize, usize) {
+            (4, 2)
+        }
+
+        fn draw_cell(&mut self, _column: usize, _row: usize, _cell: Cell) {
+            self.draws.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn set_cursor(&mut self, _column: usize, _row: usize, _visible: bool) {
+            self.cursors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn preserving_constructor_does_not_touch_the_existing_framebuffer() {
+        let draws = Arc::new(AtomicUsize::new(0));
+        let cursors = Arc::new(AtomicUsize::new(0));
+        let renderer = CountingRenderer {
+            draws: Arc::clone(&draws),
+            cursors: Arc::clone(&cursors),
+        };
+
+        let mut terminal = Terminal::new_preserving(renderer).expect("valid test geometry");
+        assert_eq!(draws.load(Ordering::Relaxed), 0);
+        assert_eq!(cursors.load(Ordering::Relaxed), 0);
+
+        terminal.reset();
+        assert_eq!(draws.load(Ordering::Relaxed), 8);
+        assert_eq!(cursors.load(Ordering::Relaxed), 1);
+    }
 }

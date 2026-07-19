@@ -34,10 +34,12 @@ integration: all
 	cargo test -p xenith-integration --test shell shell_executes_builtins_and_coreutils_via_ps2 -- --ignored --exact
 	cargo test -p xenith-emu --test image_boot manifest_image_reaches_userspace_shell -- --ignored --exact
 	cargo test -p xenith-emu --test image_boot bios_firmware_image_reaches_userspace_shell -- --ignored --exact
+	cargo test -p xenith-emu --test image_boot bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell -- --ignored --exact
 	cargo test -p xenith-emu --test image_boot uefi_iso_executes_packaged_pe_and_reaches_userspace_shell -- --ignored --exact
 	cargo test -p xenith-emu --test cli_input input_script_proves_shell_pipeline_and_redirection -- --ignored --exact
 	cargo test -p xenith-emu --test c_toolchain xenith_built_c_utility_executes_in_ring3 -- --ignored --exact
 	cargo test -p xenith-emu --test smp_boot two_processor_kernel_brings_ap_online_and_reaches_shell -- --ignored --exact
+	cargo test -p xenith-emu --test smp_boot three_processor_kernel_brings_every_ap_online_and_reaches_shell -- --ignored --exact
 
 clippy:
 	cargo clippy --workspace --exclude xenith-kernel --exclude xenith-init --exclude xenith-sh --exclude xenith-coreutils --exclude xenith-editor --exclude xenith-net --exclude xenith-examples --exclude xenith-libc --all-targets -- -D warnings

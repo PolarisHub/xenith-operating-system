@@ -62,6 +62,9 @@ const RSDP_V1_LEN: usize = 20;
 /// total.
 const RSDP_V2_MIN_LEN: usize = 36;
 
+/// Bytes through the ACPI 2.0 `Length` field (offset 20, width 4).
+const RSDP_V2_PREFIX_LEN: usize = 24;
+
 /// The parsed Root System Description Pointer.
 ///
 /// This is a value-type copy of the fields the table walk needs. It does not
@@ -169,16 +172,6 @@ unsafe fn read_bytes(phys: PhysAddr, out: &mut [u8]) {
     }
 }
 
-/// Read a little-endian `u32` from `phys`.
-///
-/// # Safety
-/// Same contract as [`read_bytes`] for a 4-byte region.
-unsafe fn read_u32(phys: PhysAddr) -> u32 {
-    let mut buf = [0u8; 4];
-    unsafe { read_bytes(phys, &mut buf) };
-    u32::from_le_bytes(buf)
-}
-
 /// Read a little-endian `u64` from `phys`.
 ///
 /// # Safety
@@ -200,6 +193,11 @@ fn checksum_zero(buf: &[u8]) -> bool {
     // arithmetic.
     let sum: u8 = buf.iter().copied().fold(0u8, |a, b| a.wrapping_add(b));
     sum == 0
+}
+
+fn extended_length(prefix: &[u8]) -> Option<usize> {
+    let bytes: [u8; 4] = prefix.get(20..24)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes) as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +323,11 @@ pub fn find_and_parse(rsdp_phys: PhysAddr) -> Result<Rsdp, RsdpError> {
 
     // ACPI 2.0+: read the full extended structure and validate the second
     // checksum over the whole thing.
-    let length = unsafe { read_u32(phys + 8) } as usize;
+    let mut extended_prefix = [0u8; RSDP_V2_PREFIX_LEN];
+    // SAFETY: revision >= 2 guarantees the RSDP includes the 24-byte prefix
+    // through its Length field.
+    unsafe { read_bytes(phys, &mut extended_prefix) };
+    let length = extended_length(&extended_prefix).ok_or(RsdpError::BadLength)?;
     if length < RSDP_V2_MIN_LEN {
         return Err(RsdpError::BadLength);
     }
@@ -384,6 +386,18 @@ mod tests {
         assert!(checksum_zero(&buf));
         // Any other buffer fails.
         assert!(!checksum_zero(&[1u8; 4]));
+    }
+
+    #[test]
+    fn extended_length_comes_from_offset_twenty() {
+        let mut prefix = [0u8; RSDP_V2_PREFIX_LEN];
+        // Populate the legacy checksum/OEM bytes at offset 8 so reading the
+        // old, incorrect offset cannot accidentally produce the right value.
+        prefix[8..12].copy_from_slice(&[0x42, b'V', b'M', b'W']);
+        prefix[20..24].copy_from_slice(&(RSDP_V2_MIN_LEN as u32).to_le_bytes());
+
+        assert_eq!(extended_length(&prefix), Some(RSDP_V2_MIN_LEN));
+        assert_eq!(extended_length(&prefix[..23]), None);
     }
 
     /// `has_xsdt` is exactly "the 64-bit XSDT address is non-zero". ACPI 1.0

@@ -65,12 +65,19 @@ To execute the packaged BIOS stage streams instead:
 cargo run -p xenith-emu -- --bios-image build/xenith.img --disk-read-only --memory 256M --smp 2 --serial stdio --max-instructions 240000000
 ```
 
+Use `--bios-iso build/xenith.iso` instead to validate and select the x86
+hard-disk-emulation entry from the ISO's El Torito catalog before executing the
+same stage streams.
+
 The BIOS runner executes the actual stage1 instructions from `0x7c00`, services
-their EDD reads, and executes the actual stage2 assembly through E820, A20,
-protected mode, page-table creation, long mode, and its real
-`call stage2_main`. Unsupported stage instructions fail closed. The
+the selected EDD or CHS path, and executes stage2's bounded firmware payload
+preloads and repeated real/protected-mode bounce-buffer copies before E820,
+page-table creation, long mode, and its real `call stage2_main`. Unsupported
+stage instructions fail closed. The
 freestanding Rust `stage2_main` body remains an explicit semantic fallback for
-ATA payload reads, ELF loading, handoff construction, and kernel entry.
+checksum/ELF loading, handoff construction, and kernel entry. That
+boundary also applies to `--bios-iso`; this emulator gate is not evidence of a
+complete external-firmware ISO boot.
 
 To execute the packaged UEFI application from the ISO:
 
@@ -172,6 +179,27 @@ accepts the direct kernel/initramfs handoff, not the packaged BIOS or UEFI
 paths; only one and two vCPUs have artifact-backed runtime proof. VMM debugging,
 host networking, and a live GUI are not implemented.
 
+## VMware Workstation legacy BIOS
+
+Create a custom VM with guest type **Other / Other 64-bit**, select **BIOS**
+firmware, assign any supported count from 1 through 64 vCPUs (subject to the
+host and VMware limits) and 512 MiB RAM, and mount `build/xenith.iso` as the
+CD/DVD boot medium. Xenith's current architectural limit is 64 logical CPUs;
+configurations above 64 are not supported. NAT is optional; Xenith does not
+require networking to boot. The IDE/SCSI controller choice shown by VMware's
+disk wizard does not affect an ISO boot.
+
+Power on with the virtual CD connected. The tested legacy-BIOS path selects a
+VBE framebuffer when available and reaches `Xenith shell 0.1` / `xenith$`.
+If VBE is unavailable, the loader deliberately falls back to VGA text.
+VMware Workstation 17.6.3 cold boots of the current ISO passed with 1, 3, 4,
+8, 16, and 24 vCPUs. The corresponding cores-per-socket values were 1, 1, 2,
+4, 8, and 12; 24 was the tested host's logical-CPU limit.
+
+The ISO is the normal VMware path. Booting `build/xenith.img` directly requires
+a VMDK wrapper that maps the raw image; VMware does not accept the raw `.img`
+as a virtual disk by itself.
+
 ## Raw image and ISO layout
 
 - `build/xenith.img` is the manifest-based BIOS disk consumed by Xenith
@@ -190,6 +218,11 @@ before using a platform imaging tool.
 
 The packaged execution gates prove Xenith's exact BIOS stage streams and its
 exact UEFI application under the repository's deterministic service models.
-They do not prove arbitrary firmware, option ROMs, physical storage/display/
-input devices, or physical hardware. QEMU/Limine scripts remain optional
+Separately, VMware Workstation 17.6.3 legacy BIOS cold boots on 2026-07-19
+proved the current ISO at 1, 3, 4, 8, 16, and 24 vCPUs. QEMU 11.0.50 with
+SeaBIOS 1.17 proved every integer ISO CPU count from 1 through 64, the raw image
+at 64 CPUs, and a 2-socket by 3-core topology with non-contiguous APIC IDs.
+Every tested configuration brought the requested CPUs online and reached
+`xenith$`. These results do not prove arbitrary firmware, option ROMs,
+physical devices, or physical hardware. QEMU/Limine scripts remain optional
 cross-validation aids and are not required by the primary build/test path.

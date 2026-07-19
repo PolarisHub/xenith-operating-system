@@ -42,6 +42,7 @@ use xenith_bitflags::bitflags;
 use xenith_types::{PhysAddr, VirtAddr};
 
 pub use crate::acpi::madt::MadtIoApicEntry;
+use crate::acpi::madt::{IsaIrqPolarity, IsaIrqTriggerMode};
 use crate::sync::SpinLock;
 
 // ---------------------------------------------------------------------------
@@ -618,6 +619,20 @@ impl IoApic {
     /// The entry is written masked, then unmasked, so the line is never
     /// briefly live with a stale vector while the write completes.
     pub fn route(&self, gsi: u32, vector: u8, cpu: u8) -> Option<()> {
+        self.route_with_mode(gsi, vector, cpu, PinPolarity::ActiveLow, TriggerMode::Level)
+    }
+
+    /// Route a GSI with an explicit electrical polarity and trigger mode.
+    /// Legacy ISA lines use active-high/edge while PCI INTx uses
+    /// active-low/level, so device owners must be able to select the mode.
+    pub fn route_with_mode(
+        &self,
+        gsi: u32,
+        vector: u8,
+        cpu: u8,
+        polarity: PinPolarity,
+        trigger: TriggerMode,
+    ) -> Option<()> {
         // Write the entry masked first so the hardware never fires the IRQ
         // at an intermediate (partially-written) state. Then unmask once
         // both halves are stable.
@@ -625,8 +640,8 @@ impl IoApic {
             vector,
             DeliveryMode::Fixed,
             DestMode::Physical,
-            PinPolarity::ActiveLow,
-            TriggerMode::Level,
+            polarity,
+            trigger,
             true,
             cpu,
         );
@@ -757,6 +772,28 @@ pub fn route(gsi: u32, vector: u8, cpu: u8) -> Option<()> {
     let reg = IOAPICS.lock();
     let io = reg.find(gsi)?;
     io.route(gsi, vector, cpu)
+}
+
+/// Route a legacy ISA IRQ through its ACPI Interrupt Source Override.
+///
+/// With no override (the VMware 8042 layout), ISA remains identity-mapped,
+/// active-high, and edge-triggered. A MADT type-2 entry can independently
+/// replace the GSI, polarity, and trigger mode. Using PCI's unconditional
+/// low/level defaults here leaves VMware's 8042 line asserted and causes an
+/// interrupt storm as soon as IF is enabled.
+pub fn route_isa(irq: u8, vector: u8, cpu: u8) -> Option<()> {
+    let route = crate::acpi::resolve_isa_irq(irq);
+    let polarity = match route.polarity {
+        IsaIrqPolarity::ActiveHigh => PinPolarity::ActiveHigh,
+        IsaIrqPolarity::ActiveLow => PinPolarity::ActiveLow,
+    };
+    let trigger = match route.trigger {
+        IsaIrqTriggerMode::Edge => TriggerMode::Edge,
+        IsaIrqTriggerMode::Level => TriggerMode::Level,
+    };
+    let reg = IOAPICS.lock();
+    let io = reg.find(route.gsi)?;
+    io.route_with_mode(route.gsi, vector, cpu, polarity, trigger)
 }
 
 /// Mask a GSI: block it from being delivered without disturbing its routing.

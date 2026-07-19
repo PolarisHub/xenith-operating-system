@@ -8,7 +8,7 @@ use core::slice;
 
 use xenith_boot_common::{
     append_region_with_reservations, BootMemoryKind, DiskEntry, DiskEntryKind, DiskManifest, Elf64,
-    Reservation, XenithBootInfo, XenithMemoryRegion, XenithModule, HHDM_OFFSET,
+    Reservation, XenithBootInfo, XenithFramebuffer, XenithMemoryRegion, XenithModule, HHDM_OFFSET,
     KERNEL_VIRTUAL_BASE,
 };
 use xenith_stage2::{
@@ -44,6 +44,16 @@ static mut MODULE: XenithModule = XenithModule {
 };
 static mut BOOT_INFO: XenithBootInfo = XenithBootInfo::empty();
 
+unsafe extern "C" {
+    static bios_framebuffer: XenithFramebuffer;
+    static bios_disk_mode: u8;
+    static bios_preload_error: u8;
+    static chs_lba: u32;
+    static chs_status: u8;
+    static chs_sectors_per_track: u8;
+    static chs_head_count: u16;
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct E820Entry {
@@ -54,17 +64,59 @@ struct E820Entry {
 }
 
 #[no_mangle]
-pub extern "C" fn stage2_main(boot_drive: u64, e820_count: u32) -> ! {
+pub extern "C" fn stage2_main(boot_drive: u64, e820_count: u32, bios_preloaded: u32) -> ! {
     serial_init();
     serial_write("xenith-stage2: long mode\r\n");
-    if boot_drive != 0x80 {
+    if boot_drive < 0x80 {
         fatal("unsupported BIOS disk");
     }
+    if bios_preloaded == 0 && boot_drive != 0x80 {
+        fatal("ATA fallback requires drive 80h");
+    }
+    if bios_preloaded == 0 {
+        // SAFETY: these single-byte assembly diagnostics are finalized before long mode.
+        let mode = unsafe { core::ptr::read_volatile(addr_of!(bios_disk_mode)) };
+        // SAFETY: same immutable loader diagnostic contract as `bios_disk_mode`.
+        let error = unsafe { core::ptr::read_volatile(addr_of!(bios_preload_error)) };
+        serial_write(match (mode, error) {
+            (0, _) | (_, 2) => "xenith-stage2: firmware disk interface unavailable\r\n",
+            (_, 3) => "xenith-stage2: CHS LBA exceeds 32 bits\r\n",
+            (_, 4) => "xenith-stage2: CHS cylinder exceeds firmware geometry\r\n",
+            (_, 5) => "xenith-stage2: CHS disk read failed\r\n",
+            _ => "xenith-stage2: firmware preload failed\r\n",
+        });
+        if error == 5 {
+            // SAFETY: CHS failure details are immutable once assembly enters long mode.
+            let lba = unsafe { core::ptr::read_volatile(addr_of!(chs_lba)) };
+            // SAFETY: same immutable diagnostic contract as `chs_lba`.
+            let status = unsafe { core::ptr::read_volatile(addr_of!(chs_status)) };
+            // SAFETY: geometry is captured once by the real-mode disk probe.
+            let sectors = unsafe { core::ptr::read_volatile(addr_of!(chs_sectors_per_track)) };
+            // SAFETY: same immutable geometry contract as `chs_sectors_per_track`.
+            let heads = unsafe { core::ptr::read_volatile(addr_of!(chs_head_count)) };
+            serial_write("xenith-stage2: CHS failure LBA=0x");
+            serial_write_hex(u64::from(lba), 8);
+            serial_write(" status=0x");
+            serial_write_hex(u64::from(status), 2);
+            serial_write(" geometry=0x");
+            serial_write_hex(u64::from(sectors), 2);
+            serial_write("x0x");
+            serial_write_hex(u64::from(heads), 4);
+            serial_write("\r\n");
+        }
+    }
 
-    // SAFETY: this static buffer is exclusively owned during single-core loader execution.
-    let manifest_buffer =
-        unsafe { slice::from_raw_parts_mut(addr_of_mut!(MANIFEST_SECTOR).cast::<u8>(), 512) };
-    ata_read(1, manifest_buffer).unwrap_or_else(|_| fatal("manifest disk read"));
+    let manifest_buffer = if bios_preloaded != 0 {
+        // SAFETY: stage1 placed the manifest at 0x600 and the transition page tables retain an
+        // identity mapping for the complete sector.
+        unsafe { slice::from_raw_parts_mut(0x600 as *mut u8, 512) }
+    } else {
+        // SAFETY: this static buffer is exclusively owned during single-core loader execution.
+        let buffer =
+            unsafe { slice::from_raw_parts_mut(addr_of_mut!(MANIFEST_SECTOR).cast::<u8>(), 512) };
+        ata_read(1, buffer).unwrap_or_else(|_| fatal("manifest disk read"));
+        buffer
+    };
     let manifest =
         DiskManifest::parse(manifest_buffer).unwrap_or_else(|_| fatal("manifest invalid"));
     let kernel_entry = manifest
@@ -81,7 +133,10 @@ pub extern "C" fn stage2_main(boot_drive: u64, e820_count: u32) -> ! {
     // SAFETY: the reserved staging interval is identity-mapped and bounded above.
     let kernel_storage =
         unsafe { slice::from_raw_parts_mut(KERNEL_STAGING_ADDRESS as *mut u8, kernel_sectors) };
-    ata_read(kernel_entry.start_lba, kernel_storage).unwrap_or_else(|_| fatal("kernel disk read"));
+    if bios_preloaded == 0 {
+        ata_read(kernel_entry.start_lba, kernel_storage)
+            .unwrap_or_else(|_| fatal("kernel disk read"));
+    }
     kernel_entry
         .verify_payload(&kernel_storage[..kernel_len])
         .unwrap_or_else(|_| fatal("kernel checksum"));
@@ -95,12 +150,21 @@ pub extern "C" fn stage2_main(boot_drive: u64, e820_count: u32) -> ! {
     // SAFETY: the fixed initrd interval is disjoint from stage2, kernel, and staging memory.
     let initrd_storage =
         unsafe { slice::from_raw_parts_mut(INITRD_LOAD_ADDRESS as *mut u8, initrd_sectors) };
-    ata_read(initrd_entry.start_lba, initrd_storage).unwrap_or_else(|_| fatal("initrd disk read"));
+    if bios_preloaded == 0 {
+        ata_read(initrd_entry.start_lba, initrd_storage)
+            .unwrap_or_else(|_| fatal("initrd disk read"));
+    }
     initrd_entry
         .verify_payload(&initrd_storage[..initrd_len])
         .unwrap_or_else(|_| fatal("initrd checksum"));
 
-    let map_count = build_memory_map(e820_count, kernel_span, initrd_entry.byte_len);
+    // SAFETY: assembly owns and finalizes this naturally aligned descriptor before entering
+    // long mode; it is immutable after the handoff begins.
+    let framebuffer = unsafe { core::ptr::read_unaligned(addr_of!(bios_framebuffer)) };
+    if framebuffer.address != 0 {
+        serial_write("xenith-stage2: VBE framebuffer ready\r\n");
+    }
+    let map_count = build_memory_map(e820_count, kernel_span, initrd_entry.byte_len, framebuffer);
     // SAFETY: all handoff statics remain reserved and immutable after this initialization.
     let boot_info = unsafe {
         MODULE = XenithModule {
@@ -114,6 +178,7 @@ pub extern "C" fn stage2_main(boot_drive: u64, e820_count: u32) -> ! {
         BOOT_INFO.hhdm_offset = HHDM_OFFSET;
         BOOT_INFO.memory_map = addr_of!(MEMORY_REGIONS).cast::<XenithMemoryRegion>();
         BOOT_INFO.memory_map_count = map_count as u32;
+        BOOT_INFO.framebuffer = framebuffer;
         BOOT_INFO.rsdp = find_rsdp().unwrap_or(0);
         BOOT_INFO.modules = addr_of!(MODULE);
         BOOT_INFO.module_count = 1;
@@ -167,11 +232,16 @@ fn load_kernel(elf: &Elf64<'_>, image: &[u8]) -> (u64, u64) {
     (physical_start, physical_end)
 }
 
-fn build_memory_map(e820_count: u32, kernel: (u64, u64), initrd_len: u64) -> usize {
+fn build_memory_map(
+    e820_count: u32,
+    kernel: (u64, u64),
+    initrd_len: u64,
+    framebuffer: XenithFramebuffer,
+) -> usize {
     let count = usize::try_from(e820_count)
         .unwrap_or(0)
         .min(MAX_E820_ENTRIES);
-    let reservations = [
+    let mut reservations = [
         Reservation::new(0, 0x10_0000, BootMemoryKind::Reserved),
         Reservation::new(
             kernel.0,
@@ -188,7 +258,24 @@ fn build_memory_map(e820_count: u32, kernel: (u64, u64), initrd_len: u64) -> usi
             initrd_len,
             BootMemoryKind::KernelAndModules,
         ),
+        Reservation::new(0, 0, BootMemoryKind::Framebuffer),
     ];
+    let mut reservation_count = 4;
+    if framebuffer.address != 0 {
+        reservations[reservation_count] = Reservation::new(
+            framebuffer.address,
+            u64::from(framebuffer.pitch) * u64::from(framebuffer.height),
+            BootMemoryKind::Framebuffer,
+        );
+        reservation_count += 1;
+    }
+    for index in 1..reservation_count {
+        let mut cursor = index;
+        while cursor != 0 && reservations[cursor].base < reservations[cursor - 1].base {
+            reservations.swap(cursor, cursor - 1);
+            cursor -= 1;
+        }
+    }
     let mut used = 0;
     for index in 0..count {
         // SAFETY: assembly capped the E820 array at 128 fixed-size records at 0x50000.
@@ -217,7 +304,7 @@ fn build_memory_map(e820_count: u32, kernel: (u64, u64), initrd_len: u64) -> usi
             entry.base,
             entry.length,
             kind,
-            &reservations,
+            &reservations[..reservation_count],
         )
         .unwrap_or_else(|_| fatal("memory map capacity"));
     }
@@ -357,6 +444,25 @@ fn serial_init() {
 
 fn serial_write(text: &str) {
     for byte in text.bytes() {
+        for _ in 0..100_000 {
+            // SAFETY: COM1 line-status reads are side-effect free.
+            if unsafe { in8(0x3fd) } & 0x20 != 0 {
+                break;
+            }
+        }
+        // SAFETY: COM1 was initialized by `serial_init`.
+        unsafe { out8(0x3f8, byte) };
+    }
+}
+
+fn serial_write_hex(value: u64, digits: u8) {
+    for index in (0..digits).rev() {
+        let nibble = ((value >> (u32::from(index) * 4)) & 0x0f) as u8;
+        let byte = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
         for _ in 0..100_000 {
             // SAFETY: COM1 line-status reads are side-effect free.
             if unsafe { in8(0x3fd) } & 0x20 != 0 {

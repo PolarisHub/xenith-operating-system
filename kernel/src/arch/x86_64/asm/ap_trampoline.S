@@ -1,8 +1,8 @@
 /*
  * AP startup trampoline.
  *
- * The SMP layer copies this complete, relocation-free block into a distinct
- * low physical page for every AP, patches the data symbols below, and issues
+ * The SMP layer copies this complete, relocation-free block into one reserved
+ * low physical page, repatches it serially for each AP, and issues
  * INIT-SIPI-SIPI. The AP enters at offset zero in 16-bit real mode, enables
  * PAE + long mode against the BSP page tables, and jumps to the Rust AP entry
  * on a permanent high-half bootstrap stack.

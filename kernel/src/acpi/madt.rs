@@ -3,10 +3,9 @@
 //! The MADT, signature `"APIC"`, is the ACPI table that enumerates the
 //! platform's interrupt controllers: every CPU's local APIC (LAPIC) and
 //! every I/O APIC (IOAPIC), plus the routing overrides that map legacy IRQs
-//! to Global System Interrupts. Xenith consumes exactly the two lists the
-//! rest of the kernel needs — LAPICs ([`MadtLapicEntry`]) and IOAPICs
-//! ([`MadtIoApicEntry`]) — and skips the routing-override entries it does
-//! not yet act on.
+//! to Global System Interrupts. Xenith retains LAPICs ([`MadtLapicEntry`]),
+//! IOAPICs ([`MadtIoApicEntry`]), and Interrupt Source Overrides
+//! ([`MadtInterruptSourceOverride`]).
 //!
 //! # Layout
 //!
@@ -24,7 +23,10 @@
 //!   `Enabled` flag (bit 0 of the 32-bit flags).
 //! * **Type 1 — I/O APIC** (12 bytes): one entry per IOAPIC. Fields carried
 //!   into [`MadtIoApicEntry`]: IOAPIC ID, 32-bit MMIO base, GSI base.
-//! * **Type 4 — Local APIC Address Override** (12 bytes): a 64-bit LAPIC
+//! * **Type 2 — Interrupt Source Override** (10 bytes): maps an ISA source
+//!   IRQ to a GSI and supplies its polarity/trigger flags. Xenith resolves
+//!   conforming flags to the ISA defaults (active-high, edge-triggered).
+//! * **Type 5 — Local APIC Address Override** (12 bytes): a 64-bit LAPIC
 //!   MMIO base that overrides the 32-bit field in the header. We honour it
 //!   so the LAPIC driver reaches the right register window on systems that
 //!   relocate it above 4 GiB.
@@ -32,10 +34,7 @@
 //!   32-bit ACPI processor UID, and enabled flag used on modern systems whose
 //!   processor identifiers do not fit in the legacy type-0 fields.
 //!
-//! Every other structure type (Interrupt Source Override, NMIs, SAPIC,
-//! GIC family, ...) is skipped. A future interrupt-routing phase
-//! will parse the Interrupt Source Override entries; until then they are
-//! inert bytes the walk strides past.
+//! Every other structure type (NMIs, SAPIC, GIC family, ...) is skipped.
 //!
 //! # Safety
 //!
@@ -91,6 +90,66 @@ pub struct MadtIoApicEntry {
     pub gsi_base: u32,
 }
 
+/// One Interrupt Source Override entry (MADT structure type 2).
+///
+/// ACPI currently defines only bus `0` (ISA). The raw bus and flags are kept
+/// so malformed firmware remains inspectable; [`Madt::resolve_isa_irq`]
+/// ignores non-ISA entries and safely resolves reserved electrical encodings
+/// to the ISA defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MadtInterruptSourceOverride {
+    /// Bus identifier. ACPI requires `0`, meaning ISA.
+    pub bus: u8,
+    /// Bus-relative interrupt source (legacy IRQ number).
+    pub source_irq: u8,
+    /// Global System Interrupt input signalled by this source.
+    pub gsi: u32,
+    /// Raw MPS INTI flags: polarity in bits 0..1, trigger in bits 2..3.
+    pub flags: u16,
+}
+
+/// Resolved electrical polarity for an ISA interrupt route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsaIrqPolarity {
+    /// The line is asserted high. This is the ISA bus default.
+    ActiveHigh,
+    /// The line is asserted low.
+    ActiveLow,
+}
+
+/// Resolved trigger mode for an ISA interrupt route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsaIrqTriggerMode {
+    /// The interrupt fires on an edge. This is the ISA bus default.
+    Edge,
+    /// The interrupt remains asserted as a level until acknowledged.
+    Level,
+}
+
+/// Fully resolved route for one legacy ISA IRQ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IsaIrqRoute {
+    /// GSI to program in the I/O APIC.
+    pub gsi: u32,
+    /// Electrical polarity after applying ACPI's ISA conforming default.
+    pub polarity: IsaIrqPolarity,
+    /// Trigger mode after applying ACPI's ISA conforming default.
+    pub trigger: IsaIrqTriggerMode,
+}
+
+impl IsaIrqRoute {
+    /// Identity-mapped ISA route used when firmware supplies no override.
+    #[inline]
+    #[must_use]
+    pub const fn identity(irq: u8) -> Self {
+        Self {
+            gsi: irq as u32,
+            polarity: IsaIrqPolarity::ActiveHigh,
+            trigger: IsaIrqTriggerMode::Edge,
+        }
+    }
+}
+
 /// Errors raised by MADT parsing.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MadtError {
@@ -114,14 +173,14 @@ impl fmt::Display for MadtError {
 
 /// The parsed MADT.
 ///
-/// Carries the LAPIC MMIO base (honouring a type-4 override) and `'static`
-/// slices of the LAPIC and IOAPIC entries, leaked from heap `Vec`s at parse
-/// time. The slices are `'static` so [`super::Tables`] can hold them by
-/// value and stay `Copy`.
+/// Carries the LAPIC MMIO base (honouring a type-5 override) and `'static`
+/// slices of the LAPIC, IOAPIC, and source-override entries, leaked from heap
+/// `Vec`s at parse time. The slices are `'static` so [`super::Tables`] can
+/// hold the MADT by reference and stay `Copy`.
 #[derive(Clone, Copy)]
 pub struct Madt {
-    /// The LAPIC MMIO physical base, after applying any type-4 override.
-    /// Defaults to the 32-bit value from the MADT header; a type-4 entry
+    /// The LAPIC MMIO physical base, after applying any type-5 override.
+    /// Defaults to the 32-bit value from the MADT header; a type-5 entry
     /// replaces it with a 64-bit address.
     pub local_apic_address: PhysAddr,
     /// Whether a dual 8259 legacy PIC is present (`PCAT_COMPAT`, MADT flags
@@ -129,16 +188,18 @@ pub struct Madt {
     pub pcat_compat: bool,
     lapics: &'static [MadtLapicEntry],
     ioapics: &'static [MadtIoApicEntry],
+    interrupt_source_overrides: &'static [MadtInterruptSourceOverride],
 }
 
 impl Madt {
     /// Parse a validated MADT [`SdtHeader`] into a [`Madt`].
     ///
     /// Walks the Interrupt Controller Structures from offset 44 to the end
-    /// of the table, collecting type-0 (LAPIC) and type-1 (IOAPIC) entries
-    /// and applying any type-4 LAPIC address override. The collected `Vec`s
-    /// are leaked into `'static` box slices so the result outlives the parse
-    /// and can be stored in [`super::Tables`].
+    /// of the table, collecting type-0 (LAPIC), type-1 (IOAPIC), and type-2
+    /// (Interrupt Source Override) entries and applying any type-5 LAPIC
+    /// address override. The collected `Vec`s are leaked into `'static` box
+    /// slices so the result outlives the parse and can be stored in
+    /// [`super::Tables`].
     pub fn parse(hdr: &'static SdtHeader) -> Result<&'static Self, MadtError> {
         let total = hdr.length as usize;
         if total < 44 {
@@ -151,6 +212,7 @@ impl Madt {
         let base = hdr as *const SdtHeader as *const u8;
         let mut lapics: Vec<MadtLapicEntry> = Vec::new();
         let mut ioapics: Vec<MadtIoApicEntry> = Vec::new();
+        let mut interrupt_source_overrides: Vec<MadtInterruptSourceOverride> = Vec::new();
 
         // Fixed prefix: 4-byte LAPIC address at offset 36, 4-byte flags at
         // offset 40. Read them as little-endian u32s through volatile loads.
@@ -228,7 +290,35 @@ impl Madt {
                         gsi_base,
                     });
                 },
-                4 => {
+                2 => {
+                    // Interrupt Source Override: 10 bytes. Bus at +2,
+                    // bus-relative source IRQ at +3, GSI (u32) at +4, and
+                    // MPS INTI polarity/trigger flags (u16) at +8.
+                    if entry_len < 10 {
+                        return Err(MadtError::BadEntryLength);
+                    }
+                    // SAFETY: offsets off+2 and off+3 lie in the validated
+                    // ten-byte entry.
+                    let bus = unsafe { core::ptr::read_volatile(base.add(off + 2)) };
+                    let source_irq = unsafe { core::ptr::read_volatile(base.add(off + 3)) };
+                    let mut gsi_bytes = [0u8; 4];
+                    for (i, slot) in gsi_bytes.iter_mut().enumerate() {
+                        // SAFETY: off+4+i lies in the validated entry.
+                        *slot = unsafe { core::ptr::read_volatile(base.add(off + 4 + i)) };
+                    }
+                    let mut flags_bytes = [0u8; 2];
+                    for (i, slot) in flags_bytes.iter_mut().enumerate() {
+                        // SAFETY: off+8+i lies in the validated entry.
+                        *slot = unsafe { core::ptr::read_volatile(base.add(off + 8 + i)) };
+                    }
+                    interrupt_source_overrides.push(MadtInterruptSourceOverride {
+                        bus,
+                        source_irq,
+                        gsi: u32::from_le_bytes(gsi_bytes),
+                        flags: u16::from_le_bytes(flags_bytes),
+                    });
+                },
+                5 => {
                     // Local APIC Address Override: 12 bytes. A 64-bit LAPIC
                     // physical base at offset +4 replaces the 32-bit header
                     // value. Applied even when the entry appears after some
@@ -268,9 +358,9 @@ impl Madt {
                         enabled: flags & 1 != 0,
                     });
                 },
-                // All other structure types (Interrupt Source Override,
-                // NMIs, SAPIC, GIC, ...) are skipped. The entry's
-                // own `Length` advances the walk past them cleanly.
+                // All other structure types (NMIs, SAPIC, GIC, ...) are
+                // skipped. The entry's own `Length` advances the walk past
+                // them cleanly.
                 _ => {},
             }
 
@@ -284,12 +374,15 @@ impl Madt {
         // heap allocation to `'static` at boot.
         let lapics_slice: &'static [MadtLapicEntry] = Box::leak(lapics.into_boxed_slice());
         let ioapics_slice: &'static [MadtIoApicEntry] = Box::leak(ioapics.into_boxed_slice());
+        let interrupt_source_overrides_slice: &'static [MadtInterruptSourceOverride] =
+            Box::leak(interrupt_source_overrides.into_boxed_slice());
 
         Ok(Box::leak(Box::new(Self {
             local_apic_address,
             pcat_compat,
             lapics: lapics_slice,
             ioapics: ioapics_slice,
+            interrupt_source_overrides: interrupt_source_overrides_slice,
         })))
     }
 
@@ -303,6 +396,68 @@ impl Madt {
     #[inline]
     pub fn ioapics(&self) -> &'static [MadtIoApicEntry] {
         self.ioapics
+    }
+
+    /// The Interrupt Source Override entries collected from the MADT.
+    #[inline]
+    pub fn interrupt_source_overrides(&self) -> &'static [MadtInterruptSourceOverride] {
+        self.interrupt_source_overrides
+    }
+
+    /// Resolve an ISA IRQ to the GSI and electrical mode firmware requires.
+    ///
+    /// Without a matching bus-0 override the route is identity-mapped,
+    /// active-high, and edge-triggered. ACPI's `00` (conforms-to-bus) flag
+    /// encodings resolve to those same ISA defaults. Reserved encodings and
+    /// non-zero reserved flag bits also fall back to the ISA electrical
+    /// defaults while retaining the override's unambiguous GSI mapping.
+    #[inline]
+    #[must_use]
+    pub fn resolve_isa_irq(&self, irq: u8) -> IsaIrqRoute {
+        resolve_isa_irq(self.interrupt_source_overrides, irq)
+    }
+}
+
+/// Resolve an ISA IRQ against a slice of MADT Interrupt Source Overrides.
+///
+/// This pure helper is also the pre-ACPI fallback path and is intentionally
+/// total: malformed or missing electrical flags never leak a reserved mode to
+/// the I/O APIC.
+#[must_use]
+pub fn resolve_isa_irq(overrides: &[MadtInterruptSourceOverride], irq: u8) -> IsaIrqRoute {
+    let Some(iso) = overrides
+        .iter()
+        .find(|entry| entry.bus == 0 && entry.source_irq == irq)
+    else {
+        return IsaIrqRoute::identity(irq);
+    };
+
+    // Flags above bit 3 must be zero. If firmware violates that contract,
+    // keep the GSI mapping but fail closed to the ISA electrical defaults.
+    if iso.flags & !0x000f != 0 {
+        return IsaIrqRoute {
+            gsi: iso.gsi,
+            ..IsaIrqRoute::identity(irq)
+        };
+    }
+
+    let polarity = match iso.flags & 0b11 {
+        0b11 => IsaIrqPolarity::ActiveLow,
+        // 00 conforms to ISA (active-high), 01 is explicitly active-high,
+        // and 10 is reserved so it safely falls back to the bus default.
+        _ => IsaIrqPolarity::ActiveHigh,
+    };
+    let trigger = match (iso.flags >> 2) & 0b11 {
+        0b11 => IsaIrqTriggerMode::Level,
+        // 00 conforms to ISA (edge), 01 is explicitly edge, and 10 is
+        // reserved so it safely falls back to the bus default.
+        _ => IsaIrqTriggerMode::Edge,
+    };
+
+    IsaIrqRoute {
+        gsi: iso.gsi,
+        polarity,
+        trigger,
     }
 }
 
@@ -368,5 +523,78 @@ mod tests {
         assert_eq!(madt.lapics()[0].apic_id, 0x1234_5678);
         assert_eq!(madt.lapics()[0].processor_uid, 0x9abc_def0);
         assert!(madt.lapics()[0].enabled);
+    }
+
+    #[test]
+    fn skips_type_four_nmi_and_applies_type_five_address_override() {
+        let table = Box::leak(Box::new([0u8; 62]));
+        table[0..4].copy_from_slice(b"APIC");
+        table[4..8].copy_from_slice(&62u32.to_le_bytes());
+        table[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
+
+        // Type 4 is a six-byte Local APIC NMI structure, not an address
+        // override. It must be skipped without applying the type-5 minimum.
+        table[44..50].copy_from_slice(&[4, 6, 0xff, 0, 1, 0]);
+        table[50] = 5;
+        table[51] = 12;
+        table[54..62].copy_from_slice(&0x0000_0001_fee0_0000u64.to_le_bytes());
+
+        // SAFETY: the leaked byte array contains a complete packed header.
+        let header = unsafe { &*(table.as_ptr() as *const SdtHeader) };
+        let madt = Madt::parse(header).unwrap();
+        assert_eq!(madt.local_apic_address.as_u64(), 0x0000_0001_fee0_0000);
+    }
+
+    #[test]
+    fn isa_route_without_override_uses_legacy_defaults() {
+        assert_eq!(resolve_isa_irq(&[], 1), IsaIrqRoute {
+            gsi: 1,
+            polarity: IsaIrqPolarity::ActiveHigh,
+            trigger: IsaIrqTriggerMode::Edge,
+        });
+    }
+
+    #[test]
+    fn parses_identity_override_and_resolves_conforming_flags() {
+        let table = Box::leak(Box::new([0u8; 54]));
+        table[0..4].copy_from_slice(b"APIC");
+        table[4..8].copy_from_slice(&54u32.to_le_bytes());
+        table[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
+        table[44..48].copy_from_slice(&[2, 10, 0, 1]);
+        table[48..52].copy_from_slice(&1u32.to_le_bytes());
+        table[52..54].copy_from_slice(&0u16.to_le_bytes());
+
+        // SAFETY: the leaked byte array contains a complete packed header.
+        let header = unsafe { &*(table.as_ptr() as *const SdtHeader) };
+        let madt = Madt::parse(header).unwrap();
+        assert_eq!(madt.interrupt_source_overrides(), &[
+            MadtInterruptSourceOverride {
+                bus: 0,
+                source_irq: 1,
+                gsi: 1,
+                flags: 0,
+            }
+        ]);
+        assert_eq!(madt.resolve_isa_irq(1), IsaIrqRoute::identity(1));
+    }
+
+    #[test]
+    fn resolves_non_identity_active_low_level_override() {
+        let table = Box::leak(Box::new([0u8; 54]));
+        table[0..4].copy_from_slice(b"APIC");
+        table[4..8].copy_from_slice(&54u32.to_le_bytes());
+        table[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
+        table[44..48].copy_from_slice(&[2, 10, 0, 12]);
+        table[48..52].copy_from_slice(&20u32.to_le_bytes());
+        table[52..54].copy_from_slice(&0x000fu16.to_le_bytes());
+
+        // SAFETY: the leaked byte array contains a complete packed header.
+        let header = unsafe { &*(table.as_ptr() as *const SdtHeader) };
+        let route = Madt::parse(header).unwrap().resolve_isa_irq(12);
+        assert_eq!(route, IsaIrqRoute {
+            gsi: 20,
+            polarity: IsaIrqPolarity::ActiveLow,
+            trigger: IsaIrqTriggerMode::Level,
+        });
     }
 }

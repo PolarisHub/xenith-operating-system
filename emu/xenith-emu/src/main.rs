@@ -121,6 +121,7 @@ fn run() -> Result<(), String> {
     let mut initrd = None;
     let mut image = None;
     let mut bios_image = None;
+    let mut bios_iso = None;
     let mut uefi_iso = None;
     let mut disk = None;
     let mut disk_output = None;
@@ -141,6 +142,7 @@ fn run() -> Result<(), String> {
             "--bios-image" => {
                 bios_image = Some(arguments.next().ok_or("--bios-image needs a path")?)
             },
+            "--bios-iso" => bios_iso = Some(arguments.next().ok_or("--bios-iso needs a path")?),
             "--uefi-iso" => uefi_iso = Some(arguments.next().ok_or("--uefi-iso needs a path")?),
             "--disk" => disk = Some(arguments.next().ok_or("--disk needs a path")?),
             "--disk-output" => {
@@ -218,23 +220,26 @@ fn run() -> Result<(), String> {
     let boot_sources = usize::from(kernel.is_some())
         + usize::from(image.is_some())
         + usize::from(bios_image.is_some())
+        + usize::from(bios_iso.is_some())
         + usize::from(uefi_iso.is_some());
     if boot_sources != 1 {
         return Err(
-            "select exactly one of --kernel <ELF>, --image <xenith.img>, --bios-image <xenith.img>, or --uefi-iso <xenith.iso>"
+            "select exactly one of --kernel <ELF>, --image <xenith.img>, --bios-image <xenith.img>, --bios-iso <xenith.iso>, or --uefi-iso <xenith.iso>"
                 .to_owned(),
         );
     }
-    if (image.is_some() || bios_image.is_some()) && (initrd.is_some() || disk.is_some()) {
+    if (image.is_some() || bios_image.is_some() || bios_iso.is_some())
+        && (initrd.is_some() || disk.is_some())
+    {
         return Err(
-            "--image and --bios-image supply their manifest initrd and attached ATA disk"
+            "--image, --bios-image, and --bios-iso supply their manifest initrd and attached ATA disk"
                 .to_owned(),
         );
     }
     if uefi_iso.is_some() && initrd.is_some() {
         return Err("--uefi-iso supplies its packaged initrd".to_owned());
     }
-    if (bios_image.is_some() || uefi_iso.is_some()) && !memory_explicit {
+    if (bios_image.is_some() || bios_iso.is_some() || uefi_iso.is_some()) && !memory_explicit {
         // Stage2 deliberately reserves its 32 MiB kernel staging window and
         // fixed 96 MiB initrd window. 256 MiB leaves the kernel's required
         // contiguous heap while preserving that real BIOS-loader layout.
@@ -287,6 +292,36 @@ fn run() -> Result<(), String> {
                 .attach_ata_disk(bytes, disk_read_only)
                 .map_err(|error| format!("attach disk failed: {error}"))?;
         }
+    } else if let Some(iso_path) = bios_iso.as_deref() {
+        let bytes = fs::read(iso_path)
+            .map_err(|error| format!("cannot read BIOS ISO {iso_path}: {error}"))?;
+        let manifest = machine
+            .load_bios_iso(&bytes, disk_read_only)
+            .map_err(|error| format!("BIOS ISO boot failed: {error}"))?;
+        let trace = machine
+            .bios_boot_trace()
+            .ok_or("BIOS ISO boot produced no transition trace")?;
+        eprintln!(
+            "xenith-emu: BIOS ISO reset={:#x} stage1={:#x} stage2=LBA{}+{}s@{:#x} E820={} long-mode={} kernel={:#x} handoff={:#x} semantic-fallback={}",
+            trace.reset_vector,
+            trace.stage1_load_address,
+            trace.stage2_lba,
+            trace.stage2_sectors,
+            trace.stage2_load_address,
+            trace.e820_entries,
+            trace.long_mode_entered,
+            trace.kernel_entry,
+            trace.handoff_address,
+            trace.semantic_stage2_loader_fallback,
+        );
+        eprintln!(
+            "xenith-emu: BIOS ISO disk={} sectors kernel=LBA{}+{}B initrd=LBA{}+{}B",
+            manifest.disk_sectors,
+            manifest.kernel_lba,
+            manifest.kernel_bytes,
+            manifest.initrd_lba,
+            manifest.initrd_bytes,
+        );
     } else if let Some(image_path) = bios_image.as_deref() {
         let bytes = fs::read(image_path)
             .map_err(|error| format!("cannot read BIOS image {image_path}: {error}"))?;
@@ -498,7 +533,7 @@ fn parse_size(value: &str) -> Result<usize, String> {
 }
 
 fn print_help() {
-    println!("xenith-emu (--kernel <ELF> [--initrd <CPIO>] | --image <xenith.img> | --bios-image <xenith.img> | --uefi-iso <xenith.iso>) [--disk <raw.img>] [--disk-read-only] [--disk-output <raw.img>] [--memory 128M] [--smp 1..64] [--framebuffer WIDTHxHEIGHT] [--framebuffer-dump <screen.ppm>] [--vga-dump <screen.txt>] [--serial stdio|none] [--input-script <PATH|->] [--max-instructions N] [--debug-listen 127.0.0.1:9000]");
+    println!("xenith-emu (--kernel <ELF> [--initrd <CPIO>] | --image <xenith.img> | --bios-image <xenith.img> | --bios-iso <xenith.iso> | --uefi-iso <xenith.iso>) [--disk <raw.img>] [--disk-read-only] [--disk-output <raw.img>] [--memory 128M] [--smp 1..64] [--framebuffer WIDTHxHEIGHT] [--framebuffer-dump <screen.ppm>] [--vga-dump <screen.txt>] [--serial stdio|none] [--input-script <PATH|->] [--max-instructions N] [--debug-listen 127.0.0.1:9000]");
 }
 
 #[cfg(test)]

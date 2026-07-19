@@ -23,8 +23,8 @@
 //! up the controllers after ACPI discovery. The aggregate [`init`] helper
 //! performs both parts in one call for an already-discovered platform:
 //!
-//! 1. Installs the 32 CPU-exception gates into the static IDT
-//!    ([`super::idt::install_exception_handlers`]).
+//! 1. Installs the 32 CPU-exception gates and the LAPIC spurious gate into
+//!    the static IDT ([`super::idt::install_exception_handlers`]).
 //! 2. Loads the IDT into the CPU ([`super::idt::load`]).
 //! 3. Remaps and masks the legacy PIC, enables x2APIC or its xAPIC fallback,
 //!    and discovers and masks the I/O APIC redirection tables.
@@ -102,6 +102,7 @@ pub fn init() {
     //    the stack frame and call `exceptions::rust_isr_dispatch`, which
     //    routes to the per-vector Rust handler.
     super::idt::install_exception_handlers();
+    super::idt::install_lapic_spurious_handler();
 
     // 2. Publish the table to the CPU. Until this `lidt` runs, any
     //    exception finds no IDT and triple-faults; after it, the handlers

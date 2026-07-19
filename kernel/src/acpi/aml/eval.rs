@@ -6,7 +6,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::namespace::{
-    canonical_from_segments, split_canonical, BuiltinMethod, Method, Namespace, NamespaceObject,
+    BuiltinMethod, Method, Namespace, NamespaceObject, OperationRegion, OperationRegionBounds,
+    RegionTerm,
 };
 use super::parser::{data_value, is_name_start, name_string, Cursor, MAX_BUFFER_SIZE};
 use super::region::RegionHandler;
@@ -14,6 +15,7 @@ use super::value::AmlValue;
 use super::AmlError;
 
 const MAX_METHOD_DEPTH: usize = 32;
+const MAX_REGION_RESOLUTION_DEPTH: usize = 32;
 const MAX_EXECUTION_STEPS: usize = 100_000;
 const MAX_LOOP_ITERATIONS: usize = 4096;
 
@@ -55,6 +57,7 @@ pub(crate) struct Evaluator<'a> {
     handler: &'a dyn RegionHandler,
     steps: usize,
     depth: usize,
+    region_stack: Vec<String>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -64,12 +67,14 @@ impl<'a> Evaluator<'a> {
             handler,
             steps: 0,
             depth: 0,
+            region_stack: Vec::new(),
         }
     }
 
     pub(crate) fn evaluate(&mut self, path: &str, args: &[AmlValue]) -> Result<AmlValue, AmlError> {
         let path = self
-            .resolve_existing(path)
+            .namespace
+            .search_existing(path)
             .ok_or_else(|| AmlError::NotFound(path.to_string()))?;
         self.evaluate_object(&path, args)
     }
@@ -81,28 +86,6 @@ impl<'a> Evaluator<'a> {
         } else {
             Ok(())
         }
-    }
-
-    fn resolve_existing(&self, candidate: &str) -> Option<String> {
-        if self.namespace.get(candidate).is_some() {
-            return Some(candidate.to_string());
-        }
-        let mut segments: Vec<String> = split_canonical(candidate)
-            .into_iter()
-            .map(ToString::to_string)
-            .collect();
-        let leaf = segments.pop()?;
-        while !segments.is_empty() {
-            segments.pop();
-            let mut next = segments.clone();
-            next.push(leaf.clone());
-            let path = canonical_from_segments(&next);
-            if self.namespace.get(&path).is_some() {
-                return Some(path);
-            }
-        }
-        let root = alloc::format!("\\{leaf}");
-        self.namespace.get(&root).map(|_| root)
     }
 
     fn evaluate_object(&mut self, path: &str, args: &[AmlValue]) -> Result<AmlValue, AmlError> {
@@ -444,7 +427,8 @@ impl<'a> Evaluator<'a> {
                 cursor.rewind_one();
                 let candidate = name_string(cursor, &frame.scope)?;
                 let path = self
-                    .resolve_existing(&candidate)
+                    .namespace
+                    .search_existing(&candidate)
                     .ok_or_else(|| AmlError::NotFound(candidate.clone()))?;
                 let arg_count = match self.namespace.get(&path) {
                     Some(NamespaceObject::Method(method)) => method.arg_count,
@@ -483,7 +467,8 @@ impl<'a> Evaluator<'a> {
             Target::Arg(index) => frame.args[*index].clone(),
             Target::Name(path) => {
                 let path = self
-                    .resolve_existing(path)
+                    .namespace
+                    .search_existing(path)
                     .ok_or_else(|| AmlError::NotFound(path.clone()))?;
                 self.evaluate_object(&path, &[])?
             },
@@ -508,7 +493,10 @@ impl<'a> Evaluator<'a> {
                 Ok(())
             },
             Target::Name(candidate) => {
-                let path = self.resolve_existing(&candidate).unwrap_or(candidate);
+                let path = self
+                    .namespace
+                    .search_existing(&candidate)
+                    .unwrap_or(candidate);
                 let object = self.namespace.get(&path).cloned();
                 match object {
                     Some(NamespaceObject::Field(field)) => {
@@ -526,55 +514,86 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn read_field(&self, field: &super::namespace::FieldUnit) -> Result<AmlValue, AmlError> {
-        let region = match self.namespace.get(&field.region) {
-            Some(NamespaceObject::OperationRegion(region)) => *region,
-            _ => return Err(AmlError::InvalidRegion),
-        };
+    fn read_field(&mut self, field: &super::namespace::FieldUnit) -> Result<AmlValue, AmlError> {
+        if field.bit_length == 0 || field.bit_length > 64 {
+            return Err(AmlError::InvalidField);
+        }
         let end = field
             .bit_offset
             .checked_add(field.bit_length)
             .ok_or(AmlError::InvalidField)?;
-        if field.bit_length == 0 || field.bit_length > 64 || end > region.length.saturating_mul(8) {
+        let first_byte = field.bit_offset / 8;
+        let last_byte = (end - 1) / 8;
+        let (region_path, region) = self.operation_region(&field.region)?;
+        let (space, region_offset, region_length) = self.resolve_region(&region_path, &region)?;
+        if last_byte >= region_length {
             return Err(AmlError::InvalidField);
         }
+
+        // A <= 64-bit field can touch at most nine bytes when it starts at an
+        // unaligned bit. Validate the complete byte span before issuing any
+        // region access, then cache each byte so volatile/read-clear regions
+        // are never read repeatedly for the individual bits they contain.
+        let first_address = region_offset
+            .checked_add(first_byte)
+            .ok_or(AmlError::InvalidRegion)?;
+        let _last_address = region_offset
+            .checked_add(last_byte)
+            .ok_or(AmlError::InvalidRegion)?;
+        let touched_bytes = last_byte
+            .checked_sub(first_byte)
+            .and_then(|span| span.checked_add(1))
+            .ok_or(AmlError::InvalidField)?;
+        let touched_bytes = usize::try_from(touched_bytes).map_err(|_| AmlError::InvalidField)?;
+        if touched_bytes > 9 {
+            return Err(AmlError::InvalidField);
+        }
+
+        let mut bytes = [0u8; 9];
+        for (index, byte) in bytes[..touched_bytes].iter_mut().enumerate() {
+            // The last-address preflight above proves this addition cannot
+            // overflow for any index in the validated span.
+            let address = first_address + index as u64;
+            *byte = self.handler.read(space, address, 8)? as u8;
+        }
+
         let mut value = 0u64;
         for output_bit in 0..field.bit_length {
-            let region_bit = field.bit_offset + output_bit;
-            let address = region
-                .offset
-                .checked_add(region_bit / 8)
-                .ok_or(AmlError::InvalidRegion)?;
-            let byte = self.handler.read(region.space, address, 8)? as u8;
-            value |= u64::from((byte >> (region_bit % 8)) & 1) << output_bit;
+            let cached_bit = (field.bit_offset % 8) + output_bit;
+            let byte = bytes[(cached_bit / 8) as usize];
+            value |= u64::from((byte >> (cached_bit % 8)) & 1) << output_bit;
         }
         Ok(AmlValue::Integer(value))
     }
 
-    fn write_field(&self, field: &super::namespace::FieldUnit, value: u64) -> Result<(), AmlError> {
-        let region = match self.namespace.get(&field.region) {
-            Some(NamespaceObject::OperationRegion(region)) => *region,
-            _ => return Err(AmlError::InvalidRegion),
-        };
+    fn write_field(
+        &mut self,
+        field: &super::namespace::FieldUnit,
+        value: u64,
+    ) -> Result<(), AmlError> {
+        if field.bit_length == 0 || field.bit_length > 64 {
+            return Err(AmlError::InvalidField);
+        }
         let end = field
             .bit_offset
             .checked_add(field.bit_length)
             .ok_or(AmlError::InvalidField)?;
-        if field.bit_length == 0 || field.bit_length > 64 || end > region.length.saturating_mul(8) {
+        let first_byte = field.bit_offset / 8;
+        let last_byte = (end - 1) / 8;
+        let (region_path, region) = self.operation_region(&field.region)?;
+        let (space, region_offset, region_length) = self.resolve_region(&region_path, &region)?;
+        if last_byte >= region_length {
             return Err(AmlError::InvalidField);
         }
         // UpdateRule is FieldFlags bits 6:5. Preserve (0) performs a byte RMW;
         // WriteAsOnes/WriteAsZeros choose the initial byte accordingly.
         let update_rule = (field.flags >> 5) & 0x03;
-        let first_byte = field.bit_offset / 8;
-        let last_byte = (end - 1) / 8;
         for byte_index in first_byte..=last_byte {
-            let address = region
-                .offset
+            let address = region_offset
                 .checked_add(byte_index)
                 .ok_or(AmlError::InvalidRegion)?;
             let mut byte = match update_rule {
-                0 => self.handler.read(region.space, address, 8)? as u8,
+                0 => self.handler.read(space, address, 8)? as u8,
                 1 => 0xff,
                 2 => 0,
                 _ => return Err(AmlError::InvalidField),
@@ -592,10 +611,91 @@ impl<'a> Evaluator<'a> {
                     byte &= !mask;
                 }
             }
-            self.handler
-                .write(region.space, address, 8, u64::from(byte))?;
+            self.handler.write(space, address, 8, u64::from(byte))?;
         }
         Ok(())
+    }
+
+    fn operation_region(&self, candidate: &str) -> Result<(String, OperationRegion), AmlError> {
+        let path = self
+            .namespace
+            .search_existing(candidate)
+            .ok_or(AmlError::InvalidRegion)?;
+        let path = self.namespace.resolve_alias(&path)?.to_string();
+        match self.namespace.get(&path) {
+            Some(NamespaceObject::OperationRegion(region)) => Ok((path, region.clone())),
+            _ => Err(AmlError::InvalidRegion),
+        }
+    }
+
+    fn resolve_region(
+        &mut self,
+        path: &str,
+        region: &OperationRegion,
+    ) -> Result<(super::region::RegionSpace, u64, u64), AmlError> {
+        let OperationRegionBounds::Deferred { offset, length } = &region.bounds else {
+            let OperationRegionBounds::Resolved { offset, length } = region.bounds else {
+                unreachable!();
+            };
+            if length == 0 || offset.checked_add(length - 1).is_none() {
+                return Err(AmlError::InvalidRegion);
+            }
+            return Ok((region.space, offset, length));
+        };
+        if self.region_stack.len() >= MAX_REGION_RESOLUTION_DEPTH
+            || self.region_stack.iter().any(|active| active == path)
+        {
+            return Err(AmlError::RecursionLimit);
+        }
+        self.region_stack.push(path.to_string());
+        let result = (|| {
+            let offset = self.evaluate_region_term(offset, 0)?;
+            let length = self.evaluate_region_term(length, 0)?;
+            if length == 0 || offset.checked_add(length - 1).is_none() {
+                return Err(AmlError::InvalidRegion);
+            }
+            Ok((region.space, offset, length))
+        })();
+        let popped = self.region_stack.pop();
+        debug_assert_eq!(popped.as_deref(), Some(path));
+        let resolved = result?;
+
+        // AML evaluates OperationRegion bounds once. Cache both bounds only
+        // after the complete evaluation succeeds; denied accesses, cycles,
+        // and malformed spans leave the deferred definition untouched.
+        match self.namespace.get_mut(path) {
+            Some(NamespaceObject::OperationRegion(stored)) => {
+                stored.bounds = OperationRegionBounds::Resolved {
+                    offset: resolved.1,
+                    length: resolved.2,
+                };
+            },
+            _ => return Err(AmlError::InvalidRegion),
+        }
+        Ok(resolved)
+    }
+
+    fn evaluate_region_term(&mut self, term: &RegionTerm, depth: usize) -> Result<u64, AmlError> {
+        if depth >= MAX_REGION_RESOLUTION_DEPTH {
+            return Err(AmlError::RecursionLimit);
+        }
+        self.tick()?;
+        match term {
+            RegionTerm::Integer(integer) => Ok(*integer),
+            RegionTerm::Reference(candidate) => {
+                let path = self
+                    .namespace
+                    .search_existing(candidate)
+                    .ok_or_else(|| AmlError::NotFound(candidate.clone()))?;
+                let value = self.evaluate_object(&path, &[])?;
+                to_integer(value)
+            },
+            RegionTerm::Add { left, right } => {
+                let left = self.evaluate_region_term(left, depth + 1)?;
+                let right = self.evaluate_region_term(right, depth + 1)?;
+                Ok(left.wrapping_add(right))
+            },
+        }
     }
 }
 
@@ -679,10 +779,60 @@ fn mid(value: AmlValue, index: usize, length: usize) -> Result<AmlValue, AmlErro
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::acpi::aml::namespace::NamespaceObject;
-    use crate::acpi::aml::region::DenyRegionHandler;
+    use crate::acpi::aml::namespace::{FieldUnit, NamespaceObject};
+    use crate::acpi::aml::region::{DenyRegionHandler, RegionSpace};
+
+    const TEST_REGION_BASE: u64 = 0x1000;
+    const TEST_REGION_BYTES: [u8; 9] = [0xe5, 0x5a, 0xc3, 0x17, 0x89, 0xfe, 0x40, 0xb6, 0x0d];
+
+    struct CountingRegionHandler {
+        reads: [AtomicUsize; TEST_REGION_BYTES.len()],
+        total_reads: AtomicUsize,
+    }
+
+    impl CountingRegionHandler {
+        fn new() -> Self {
+            Self {
+                reads: core::array::from_fn(|_| AtomicUsize::new(0)),
+                total_reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RegionHandler for CountingRegionHandler {
+        fn read(&self, space: RegionSpace, address: u64, width: u8) -> Result<u64, AmlError> {
+            self.total_reads.fetch_add(1, Ordering::Relaxed);
+            if space != RegionSpace::SystemMemory || width != 8 {
+                return Err(AmlError::InvalidRegion);
+            }
+            let index = address
+                .checked_sub(TEST_REGION_BASE)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|index| *index < TEST_REGION_BYTES.len())
+                .ok_or(AmlError::InvalidRegion)?;
+            self.reads[index].fetch_add(1, Ordering::Relaxed);
+            Ok(u64::from(TEST_REGION_BYTES[index]))
+        }
+
+        fn write(&self, _: RegionSpace, _: u64, _: u8, _: u64) -> Result<(), AmlError> {
+            Err(AmlError::RegionAccessDenied)
+        }
+    }
+
+    fn insert_region(namespace: &mut Namespace, name: &str, offset: u64, length: u64) {
+        namespace
+            .insert(
+                name.to_string(),
+                NamespaceObject::OperationRegion(OperationRegion {
+                    space: RegionSpace::SystemMemory,
+                    bounds: OperationRegionBounds::Resolved { offset, length },
+                }),
+            )
+            .unwrap();
+    }
 
     #[test]
     fn evaluates_arithmetic_method() {
@@ -704,5 +854,114 @@ mod tests {
             evaluator.evaluate("\\TEST", &[]).unwrap(),
             AmlValue::Integer(5)
         );
+    }
+
+    #[test]
+    fn read_field_reads_each_touched_byte_once() {
+        let handler = CountingRegionHandler::new();
+        let mut namespace = Namespace::default();
+        insert_region(
+            &mut namespace,
+            "\\REG0",
+            TEST_REGION_BASE,
+            TEST_REGION_BYTES.len() as u64,
+        );
+        let field = FieldUnit {
+            region: "\\REG0".to_string(),
+            bit_offset: 5,
+            bit_length: 64,
+            flags: 0,
+        };
+
+        let mut evaluator = Evaluator::new(&mut namespace, &handler);
+        let value = evaluator.read_field(&field).unwrap();
+        let expected = u64::from_le_bytes(core::array::from_fn(|index| {
+            (TEST_REGION_BYTES[index] >> 5) | (TEST_REGION_BYTES[index + 1] << 3)
+        }));
+        assert_eq!(value, AmlValue::Integer(expected));
+        assert_eq!(handler.total_reads.load(Ordering::Relaxed), 9);
+        for reads in &handler.reads {
+            assert_eq!(reads.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn read_field_rejects_invalid_bounds_before_region_access() {
+        let handler = CountingRegionHandler::new();
+        let mut namespace = Namespace::default();
+        insert_region(
+            &mut namespace,
+            "\\SAFE",
+            TEST_REGION_BASE,
+            TEST_REGION_BYTES.len() as u64,
+        );
+        insert_region(&mut namespace, "\\WRAP", u64::MAX - 1, 3);
+        namespace
+            .insert(
+                "\\OFFS".to_string(),
+                NamespaceObject::Field(FieldUnit {
+                    region: "\\SAFE".to_string(),
+                    bit_offset: 0,
+                    bit_length: 8,
+                    flags: 0,
+                }),
+            )
+            .unwrap();
+        namespace
+            .insert(
+                "\\DEFR".to_string(),
+                NamespaceObject::OperationRegion(OperationRegion {
+                    space: RegionSpace::SystemMemory,
+                    bounds: OperationRegionBounds::Deferred {
+                        offset: RegionTerm::Reference("\\OFFS".to_string()),
+                        length: RegionTerm::Integer(1),
+                    },
+                }),
+            )
+            .unwrap();
+        let mut evaluator = Evaluator::new(&mut namespace, &handler);
+
+        for field in [
+            FieldUnit {
+                region: "\\DEFR".to_string(),
+                bit_offset: 0,
+                bit_length: 0,
+                flags: 0,
+            },
+            FieldUnit {
+                region: "\\DEFR".to_string(),
+                bit_offset: 0,
+                bit_length: 65,
+                flags: 0,
+            },
+            FieldUnit {
+                region: "\\SAFE".to_string(),
+                bit_offset: 71,
+                bit_length: 2,
+                flags: 0,
+            },
+            FieldUnit {
+                region: "\\DEFR".to_string(),
+                bit_offset: u64::MAX,
+                bit_length: 1,
+                flags: 0,
+            },
+        ] {
+            assert_eq!(evaluator.read_field(&field), Err(AmlError::InvalidField));
+        }
+        assert_eq!(
+            evaluator.read_field(&FieldUnit {
+                region: "\\WRAP".to_string(),
+                bit_offset: 0,
+                bit_length: 24,
+                flags: 0,
+            }),
+            Err(AmlError::InvalidRegion)
+        );
+
+        assert_eq!(handler.total_reads.load(Ordering::Relaxed), 0);
+        for reads in &handler.reads {
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+        }
     }
 }

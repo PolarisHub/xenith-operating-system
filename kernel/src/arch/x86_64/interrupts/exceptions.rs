@@ -86,7 +86,7 @@ pub struct ExceptionContext {
     /// stub so the dispatch can identify the exception without decoding the
     /// stub's own address.
     pub vector: u64,
-    /// The error code: either pushed by the CPU (for the seven error-code
+    /// The error code: either pushed by the CPU (for the eight error-code
     /// exceptions) or a synthetic `0` pushed by the stub for uniformity.
     pub error_code: u64,
 
@@ -367,7 +367,7 @@ user_exc!(
     crate::user::signal::Signal::Fpe
 );
 exc!(virtualization, "#VE Virtualization Exception");
-exc!(reserved_21, "#Reserved vector 21");
+exc!(control_protection, "#CP Control Protection");
 exc!(reserved_22, "#Reserved vector 22");
 exc!(reserved_23, "#Reserved vector 23");
 exc!(reserved_24, "#Reserved vector 24");
@@ -433,7 +433,7 @@ pub extern "sysv64" fn rust_isr_dispatch(ctx: &mut ExceptionContext) {
         18 => machine_check(ctx),
         19 => simd_floating_point(ctx),
         20 => virtualization(ctx),
-        21 => reserved_21(ctx),
+        21 => control_protection(ctx),
         22 => reserved_22(ctx),
         23 => reserved_23(ctx),
         24 => reserved_24(ctx),

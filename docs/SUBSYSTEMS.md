@@ -18,4 +18,9 @@ Xenith is a monolithic kernel with narrow shared contracts.
 
 Host crates are deliberately outside the kernel layering. `xenith-x86` is shared by the assembler, disassembler, debugger, and interpreter. The bootloader shares only `xenith-abi`-compatible records and its own `no_std` parser library.
 
-SMP startup is complete for up to 64 logical CPUs: MADT topology drives INIT-SIPI-SIPI, each AP installs CPU-local descriptor/per-CPU/FPU/scheduler state, and reschedule/TLB IPIs coordinate per-CPU run queues and address-space invalidation.
+SMP accepts configured topologies from 1 through 64 logical CPUs. MADT topology
+drives serialized INIT-SIPI-SIPI through one acknowledgement-gated reusable
+trampoline page, each AP installs CPU-local descriptor/per-CPU/FPU/scheduler
+state, and reschedule/TLB IPIs coordinate per-CPU run queues and address-space
+invalidation. Supporting more than 64 requires dynamic CPU masks and per-CPU
+storage.

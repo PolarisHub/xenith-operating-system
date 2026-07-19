@@ -62,7 +62,8 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use xenith_bitflags::bitflags;
 
 use super::cpu::{cpuid, cpuid_with};
-use super::instructions::{read_cr0, read_cr4, write_cr0, write_cr4};
+use super::instructions::{read_cr0, write_cr0};
+use super::Cr4;
 
 // ---------------------------------------------------------------------------
 // CPUID leaf and bit constants
@@ -77,12 +78,6 @@ const LEAF_XSAVE: u32 = 0x0000_000D;
 
 /// CPUID leaf 1, used for the XSAVE / OSXSAVE feature bits in ECX[26..27].
 const LEAF_FEATURE_INFO: u32 = 0x0000_0001;
-
-/// CR4.OSXSAVE is bit 18. The `Cr4` flag type in [`registers`](super::registers)
-/// does not name this bit, so we manipulate it through the raw
-/// [`read_cr4`]/[`write_cr4`] wrappers with this literal. Setting it enables
-/// `xsave`/`xrstor`/`xsetbv`/`xgetbv`; without it those instructions #GP.
-const CR4_OSXSAVE: u64 = 1 << 18;
 
 /// CR0.TS (Task Switched) is bit 3. We program it through the raw
 /// [`read_cr0`]/[`write_cr0`] wrappers rather than the `Cr0` flag type so this
@@ -594,15 +589,12 @@ pub fn enable_xsave(info: &FpuInfo) {
         return;
     }
 
-    // Set CR4.OSXSAVE (bit 18) via the raw wrappers. We bypass the `Cr4`
-    // flag type because its bit-18 slot is not named `OSXSAVE` in
-    // `registers.rs`; touching that file is out of this module's scope, so we
-    // program the architectural bit directly.
-    //
+    // Set CR4.OSXSAVE (bit 18) through the typed control-register flags.
     // SAFETY: Ring 0; bit 18 is OSXSAVE on every XSAVE-capable part. Setting
     // it before `xsetbv` is the required ordering (xsetbv #GPs without it).
-    let cr4 = unsafe { read_cr4() };
-    unsafe { write_cr4(cr4 | CR4_OSXSAVE) };
+    let mut cr4 = Cr4::read();
+    cr4.insert(Cr4::OSXSAVE);
+    unsafe { cr4.write() };
 
     // Program XCR0 with the desired component bitmap. The value is a subset
     // of CPUID.0DH:EAX, which `probe` already verified, so xsetbv will not

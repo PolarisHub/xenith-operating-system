@@ -372,15 +372,20 @@ bitflags! {
         /// SMX Enable (bit 14). Safer Mode Extensions; unused by Xenith.
         const SMXE = 1 << 14;
 
+        /// FSGSBASE Enable (bit 16). When set, `rdfsbase`/`wrfsbase`/
+        /// `rdgsbase`/`wrgsbase` are non-privileged. The kernel enables this
+        /// if present so the per-CPU base can be accessed without `rdmsr`.
+        const FSGSBASE = 1 << 16;
+
         /// PCID Enable (bit 17). When set, CR3 carries a 12-bit PCID and
         /// CR3 writes can be made non-flushing. The kernel enables PCID if
         /// the CPU advertises it, to cut TLB flushes on context switch.
         const PCIDE = 1 << 17;
 
-        /// FSGSBASE Enable (bit 18). When set, `rdfsbase`/`wrfsbase`/
-        /// `rdgsbase`/`wrgsbase` are non-privileged. The kernel enables this
-        /// if present so the per-CPU base can be accessed without `rdmsr`.
-        const FSGSBASE = 1 << 18;
+        /// XSAVE and Processor Extended States Enable (bit 18). Enables
+        /// `xsave`/`xrstor` and `xgetbv`/`xsetbv`; set by the FPU initialiser
+        /// only after CPUID advertises XSAVE support.
+        const OSXSAVE = 1 << 18;
 
         /// Supervisor Mode Execution Prevention (bit 20). When set, ring 0
         /// cannot execute from a user page. The kernel sets this for
@@ -396,14 +401,15 @@ bitflags! {
         /// register and the page-table PK field. Unused by Xenith today.
         const PKE = 1 << 22;
 
-        /// OS Protection Keys Enable (bit 23). Enables PKRU register access
-        /// for ring 0. Unused by Xenith today.
-        const OSPKE = 1 << 23;
+        /// Control-flow Enforcement Technology (bit 23). This is the master
+        /// enable for shadow stacks and indirect-branch tracking. Xenith does
+        /// not initialise CET state and clears inherited firmware enablement.
+        const CET = 1 << 23;
 
-        /// Supervisor Mode Shadow Stacks (bit 7 of the CET sub-field, but
-        /// exposed as a CR4 bit on CET-capable parts). Named so `read`
-        /// preserves it if the firmware enabled CET.
-        const CET = 1 << 24;
+        /// Protection Keys for Supervisor Pages (bit 24). Enables IA32_PKRS
+        /// enforcement for supervisor mappings. Xenith does not provision a
+        /// PKRS policy and clears inherited firmware enablement.
+        const PKS = 1 << 24;
     }
 }
 
@@ -439,5 +445,20 @@ impl Cr4 {
     pub unsafe fn write(self) {
         // SAFETY: Forwarded to `write_cr4`; the caller vouches for the value.
         unsafe { write_cr4(self.bits()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cr4;
+
+    #[test]
+    fn cr4_extended_feature_bits_match_the_architecture() {
+        assert_eq!(Cr4::FSGSBASE.bits(), 1 << 16);
+        assert_eq!(Cr4::PCIDE.bits(), 1 << 17);
+        assert_eq!(Cr4::OSXSAVE.bits(), 1 << 18);
+        assert_eq!(Cr4::PKE.bits(), 1 << 22);
+        assert_eq!(Cr4::CET.bits(), 1 << 23);
+        assert_eq!(Cr4::PKS.bits(), 1 << 24);
     }
 }

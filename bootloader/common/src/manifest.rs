@@ -12,7 +12,7 @@ pub const DISK_ENTRY_OFFSET: usize = 64;
 pub const DISK_ENTRY_COUNT: usize = 3;
 pub const MANIFEST_CHECKSUM_OFFSET: usize = 32;
 pub const MANIFEST_CHECKSUM_SIZE: usize = 8;
-pub const MAX_STAGE2_SECTORS: u64 = 127;
+pub const MAX_STAGE2_SECTORS: u64 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManifestError {
@@ -298,11 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn enforces_the_single_edd_read_limit() {
+    fn enforces_the_stage1_transfer_limit() {
         let mut raw = valid_manifest();
-        raw[80..88].copy_from_slice(&128_u64.to_le_bytes());
-        raw[88..96].copy_from_slice(&(128 * 512_u64).to_le_bytes());
-        raw[24..32].copy_from_slice(&256_u64.to_le_bytes());
+        raw[80..88].copy_from_slice(&65_u64.to_le_bytes());
+        raw[88..96].copy_from_slice(&(65 * 512_u64).to_le_bytes());
+        raw[24..32].copy_from_slice(&128_u64.to_le_bytes());
         raw[32..40].fill(0);
         let checksum = fnv1a64_with_zeroed_range(&raw, 32, 8);
         raw[32..40].copy_from_slice(&checksum.to_le_bytes());

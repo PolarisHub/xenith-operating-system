@@ -32,6 +32,10 @@ const INITRD_NAME: &[u8] = b"INITRD.CPIO;1";
 const MBR_PARTITION_TABLE_OFFSET: usize = 446;
 const MBR_PARTITION_ENTRY_SIZE: usize = 16;
 const XENITH_PARTITION_TYPE: u8 = 0xda;
+const BIOS_CHS_HEADS: u64 = 16;
+const BIOS_CHS_SECTORS_PER_TRACK: u64 = 63;
+const BIOS_CHS_CYLINDER_SECTORS: u64 = BIOS_CHS_HEADS * BIOS_CHS_SECTORS_PER_TRACK;
+const BIOS_CHS_MAX_CYLINDERS: u64 = 1_024;
 
 /// User-configurable ISO metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,7 +199,13 @@ pub fn extract_el_torito_boot_images(image: &[u8]) -> Result<ElToritoBootImages<
             "El Torito validation entry is invalid",
         ));
     }
-    if catalog[32] != 0x88 || catalog[33] != 4 || read_u16_le(catalog, 38) != 1 {
+    if catalog[32] != 0x88
+        || catalog[33] != 4
+        || read_u16_le(catalog, 34) != 0
+        || catalog[36] != XENITH_PARTITION_TYPE
+        || catalog[37] != 0
+        || read_u16_le(catalog, 38) != 1
+    {
         return Err(ImageError::InvalidInput(
             "El Torito BIOS hard-disk entry is invalid",
         ));
@@ -235,7 +245,7 @@ pub fn extract_el_torito_boot_images(image: &[u8]) -> Result<ElToritoBootImages<
         ));
     }
     let bios_disk = byte_extent(image, bios_lba, bios_len)?;
-    validate_disk_image(bios_disk)?;
+    validate_bios_boot_image(bios_disk)?;
     let efi_system_partition = byte_extent(image, efi_lba, efi_len)?;
     Ok(ElToritoBootImages {
         boot_catalog_lba: catalog_lba,
@@ -245,6 +255,74 @@ pub fn extract_el_torito_boot_images(image: &[u8]) -> Result<ElToritoBootImages<
         bios_disk,
         efi_system_partition,
     })
+}
+
+fn validate_bios_boot_image(image: &[u8]) -> Result<crate::DiskManifest, ImageError> {
+    if image.len() < crate::DISK_SECTOR_SIZE * 2
+        || !image.len().is_multiple_of(crate::DISK_SECTOR_SIZE)
+    {
+        return Err(ImageError::InvalidInput(
+            "El Torito BIOS image is truncated or unaligned",
+        ));
+    }
+    let manifest =
+        crate::parse_manifest(&image[crate::DISK_SECTOR_SIZE..crate::DISK_SECTOR_SIZE * 2])?;
+    let declared_bytes = manifest
+        .image_sectors
+        .checked_mul(crate::DISK_SECTOR_SIZE as u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(ImageError::ImageTooLarge("BIOS manifest disk"))?;
+    if declared_bytes > image.len() {
+        return Err(ImageError::InvalidInput(
+            "El Torito BIOS image is shorter than its manifest disk",
+        ));
+    }
+    let validated = validate_disk_image(&image[..declared_bytes])?;
+    if image[declared_bytes..].iter().any(|byte| *byte != 0) {
+        return Err(ImageError::InvalidInput(
+            "El Torito BIOS cylinder padding is not zero",
+        ));
+    }
+    let emulated_sectors = u64::try_from(image.len() / crate::DISK_SECTOR_SIZE)
+        .map_err(|_| ImageError::ImageTooLarge("BIOS hard-disk boot image"))?;
+    let expected_sectors = validated
+        .image_sectors
+        .div_ceil(BIOS_CHS_CYLINDER_SECTORS)
+        .checked_mul(BIOS_CHS_CYLINDER_SECTORS)
+        .ok_or(ImageError::ImageTooLarge("BIOS hard-disk boot image"))?;
+    if emulated_sectors != expected_sectors {
+        return Err(ImageError::InvalidInput(
+            "El Torito BIOS image is not cylinder aligned",
+        ));
+    }
+    validate_bios_partition(image, emulated_sectors)?;
+    Ok(validated)
+}
+
+fn validate_bios_partition(image: &[u8], image_sectors: u64) -> Result<(), ImageError> {
+    let table = image
+        .get(MBR_PARTITION_TABLE_OFFSET..MBR_PARTITION_TABLE_OFFSET + 64)
+        .ok_or(ImageError::InvalidInput("BIOS disk MBR is truncated"))?;
+    let entry = &table[..MBR_PARTITION_ENTRY_SIZE];
+    let sector_count = image_sectors
+        .checked_sub(1)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(ImageError::ImageTooLarge("BIOS hard-disk boot image"))?;
+    if entry[0] != 0x80
+        || entry[1..4] != lba_to_chs(1)
+        || entry[4] != XENITH_PARTITION_TYPE
+        || entry[5..8] != lba_to_chs(u64::from(sector_count))
+        || read_u32_le(entry, 8) != 1
+        || read_u32_le(entry, 12) != sector_count
+        || table[MBR_PARTITION_ENTRY_SIZE..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(ImageError::InvalidInput(
+            "El Torito BIOS partition table is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn require_descriptor(descriptor: &[u8], kind: u8) -> Result<(), ImageError> {
@@ -355,13 +433,23 @@ fn prepare_bios_boot_image(bios_disk: &[u8]) -> Result<Vec<u8>, ImageError> {
             "BIOS disk stage1 overlaps the MBR partition table",
         ));
     }
-    let sector_count = manifest
+    let emulated_sectors = manifest
         .image_sectors
+        .div_ceil(BIOS_CHS_CYLINDER_SECTORS)
+        .checked_mul(BIOS_CHS_CYLINDER_SECTORS)
+        .filter(|sectors| *sectors <= BIOS_CHS_CYLINDER_SECTORS * BIOS_CHS_MAX_CYLINDERS)
+        .ok_or(ImageError::ImageTooLarge("BIOS CHS boot image"))?;
+    let sector_count = emulated_sectors
         .checked_sub(1)
         .and_then(|count| u32::try_from(count).ok())
         .ok_or(ImageError::ImageTooLarge("BIOS hard-disk boot image"))?;
     let last_lba = u64::from(sector_count);
+    let emulated_bytes = emulated_sectors
+        .checked_mul(crate::DISK_SECTOR_SIZE as u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(ImageError::ImageTooLarge("BIOS hard-disk boot image"))?;
     let mut image = bios_disk.to_vec();
+    image.resize(emulated_bytes, 0);
     let entry = &mut image
         [MBR_PARTITION_TABLE_OFFSET..MBR_PARTITION_TABLE_OFFSET + MBR_PARTITION_ENTRY_SIZE];
     entry[0] = 0x80;
@@ -374,15 +462,13 @@ fn prepare_bios_boot_image(bios_disk: &[u8]) -> Result<Vec<u8>, ImageError> {
 }
 
 fn lba_to_chs(lba: u64) -> [u8; 3] {
-    const HEADS: u64 = 255;
-    const SECTORS_PER_TRACK: u64 = 63;
-    let cylinder = lba / (HEADS * SECTORS_PER_TRACK);
+    let cylinder = lba / BIOS_CHS_CYLINDER_SECTORS;
     if cylinder > 1_023 {
         return [0xfe, 0xff, 0xff];
     }
-    let within_cylinder = lba % (HEADS * SECTORS_PER_TRACK);
-    let head = within_cylinder / SECTORS_PER_TRACK;
-    let sector = within_cylinder % SECTORS_PER_TRACK + 1;
+    let within_cylinder = lba % BIOS_CHS_CYLINDER_SECTORS;
+    let head = within_cylinder / BIOS_CHS_SECTORS_PER_TRACK;
+    let sector = within_cylinder % BIOS_CHS_SECTORS_PER_TRACK + 1;
     [
         head as u8,
         (sector as u8) | (((cylinder >> 8) as u8) << 6),
@@ -741,21 +827,32 @@ mod tests {
 
         let bios_start = layout.bios_boot_image_lba as usize * ISO_BLOCK_SIZE;
         let embedded_bios = &iso[bios_start..bios_start + layout.bios_boot_image_bytes as usize];
-        let manifest = validate_disk_image(embedded_bios).unwrap();
+        let manifest = validate_bios_boot_image(embedded_bios).unwrap();
         assert_eq!(
             &embedded_bios[crate::DISK_SECTOR_SIZE..crate::DISK_SECTOR_SIZE + 8],
             b"XENITHIM"
         );
         assert_eq!(manifest.entries[1].byte_len, kernel.len() as u64);
+        assert_eq!(&embedded_bios[..446], &bios_disk[..446]);
+        assert_eq!(&embedded_bios[510..bios_disk.len()], &bios_disk[510..]);
+        assert!(embedded_bios[bios_disk.len()..]
+            .iter()
+            .all(|byte| *byte == 0));
         let partition = &embedded_bios
             [MBR_PARTITION_TABLE_OFFSET..MBR_PARTITION_TABLE_OFFSET + MBR_PARTITION_ENTRY_SIZE];
         assert_eq!(partition[0], 0x80);
+        assert_eq!(&partition[1..4], &lba_to_chs(1));
         assert_eq!(partition[4], XENITH_PARTITION_TYPE);
+        assert_eq!(
+            &partition[5..8],
+            &lba_to_chs((embedded_bios.len() / crate::DISK_SECTOR_SIZE - 1) as u64)
+        );
         assert_eq!(read_u32_le(partition, 8), 1);
         assert_eq!(
             read_u32_le(partition, 12),
-            manifest.image_sectors as u32 - 1
+            (embedded_bios.len() / crate::DISK_SECTOR_SIZE) as u32 - 1
         );
+        assert_eq!(embedded_bios.len() / crate::DISK_SECTOR_SIZE, 1_008);
 
         let efi_start = layout.efi_boot_image_lba as usize * ISO_BLOCK_SIZE;
         let embedded_efi = &iso[efi_start..efi_start + layout.efi_boot_image_bytes as usize];
@@ -808,6 +905,44 @@ mod tests {
         assert!(matches!(
             build_iso_image(&disk, b"MZ", &[1], &[1], &config),
             Err(ImageError::InvalidVolumeId(_))
+        ));
+    }
+
+    #[test]
+    fn extractor_rejects_corrupt_bios_catalog_and_partition_metadata() {
+        let disk = crate::build_disk_image(&[0; 512], &[0xea; 700], &[1], &[2]).unwrap();
+        let (iso, layout) =
+            build_iso_image_with_layout(&disk, b"MZefi", &[1], &[2], &IsoConfig::default())
+                .unwrap();
+
+        let catalog_offset = layout.boot_catalog_lba as usize * ISO_BLOCK_SIZE;
+        let mut corrupt_catalog = iso.clone();
+        corrupt_catalog[catalog_offset + 36] = 0;
+        assert!(matches!(
+            extract_el_torito_boot_images(&corrupt_catalog),
+            Err(ImageError::InvalidInput(
+                "El Torito BIOS hard-disk entry is invalid"
+            ))
+        ));
+
+        let bios_offset = layout.bios_boot_image_lba as usize * ISO_BLOCK_SIZE;
+        let mut corrupt_partition = iso.clone();
+        corrupt_partition[bios_offset + MBR_PARTITION_TABLE_OFFSET] = 0;
+        assert!(matches!(
+            extract_el_torito_boot_images(&corrupt_partition),
+            Err(ImageError::InvalidInput(
+                "El Torito BIOS partition table is invalid"
+            ))
+        ));
+
+        let mut corrupt_padding = iso;
+        let padding_offset = bios_offset + layout.bios_boot_image_bytes as usize - 1;
+        corrupt_padding[padding_offset] = 1;
+        assert!(matches!(
+            extract_el_torito_boot_images(&corrupt_padding),
+            Err(ImageError::InvalidInput(
+                "El Torito BIOS cylinder padding is not zero"
+            ))
         ));
     }
 

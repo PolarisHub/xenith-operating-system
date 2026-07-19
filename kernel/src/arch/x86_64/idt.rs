@@ -398,6 +398,27 @@ pub fn install_timer_handler(vector: u8) {
     idt.set_interrupt_handler(u16::from(vector), asm::irq::lapic_timer_isr);
 }
 
+/// Install the architectural local-APIC spurious-interrupt gate.
+///
+/// This gate must be present before the APIC software-enable bit is set in
+/// the SVR. The handler is intentionally a bare `iretq`: a spurious interrupt
+/// never enters the LAPIC in-service register and therefore must not receive
+/// an EOI. The global table is shared by the BSP and every AP, so installing
+/// the gate during BSP architecture setup also covers each AP before it loads
+/// this IDT and enables its local controller.
+pub fn install_lapic_spurious_handler() {
+    let mut idt = IDT.lock();
+    install_lapic_spurious_handler_into(&mut idt);
+}
+
+#[inline]
+fn install_lapic_spurious_handler_into(idt: &mut Idt) {
+    idt.set_interrupt_handler(
+        u16::from(super::interrupts::apic::SPURIOUS_VECTOR),
+        asm::irq::lapic_spurious_isr,
+    );
+}
+
 /// Install the two fixed SMP inter-processor interrupt gates.
 ///
 /// The shared IDT is live on every CPU; publishing these entries before the
@@ -436,5 +457,47 @@ pub fn load() {
     // static, so its address is stable for the CPU's lifetime.
     unsafe {
         idt.load();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lapic_spurious_gate_targets_bare_iret_stub() {
+        let mut idt = Idt::new();
+        install_lapic_spurious_handler_into(&mut idt);
+
+        let entry = idt.entry(u16::from(super::super::interrupts::apic::SPURIOUS_VECTOR));
+        let offset_low = entry.offset_low;
+        let offset_mid = entry.offset_mid;
+        let offset_high = entry.offset_high;
+        let type_attr = entry.type_attr;
+        let handler =
+            u64::from(offset_low) | (u64::from(offset_mid) << 16) | (u64::from(offset_high) << 32);
+
+        assert!(entry.is_present());
+        assert_eq!(type_attr, ATTR_INTERRUPT_KERNEL);
+        assert_eq!(
+            handler,
+            asm::irq::lapic_spurious_isr as *const () as usize as u64
+        );
+    }
+
+    #[test]
+    fn lapic_spurious_stub_returns_without_eoi() {
+        let source = include_str!("asm/isr.S");
+        let body = source
+            .split_once("lapic_spurious_isr:")
+            .expect("spurious stub label")
+            .1
+            .split_once(".size   lapic_spurious_isr")
+            .expect("spurious stub size")
+            .0;
+
+        assert!(body.lines().any(|line| line.trim() == "iretq"));
+        assert!(!body.contains("call"));
+        assert!(!body.to_ascii_lowercase().contains("eoi"));
     }
 }

@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use super::namespace::{
     canonical_from_segments, split_canonical, valid_name_char, BuiltinMethod, FieldUnit, Method,
-    Namespace, NamespaceObject, OperationRegion,
+    Namespace, NamespaceObject, OperationRegion, OperationRegionBounds, RegionTerm,
 };
 use super::region::RegionSpace;
 use super::value::AmlValue;
@@ -418,18 +418,23 @@ impl Loader {
                 let name = name_string(cursor, scope)?;
                 let space = RegionSpace::from(cursor.read_u8()?);
                 let region_scope = super::namespace::parent_scope(&name);
-                let offset = self.static_integer(cursor, &region_scope, depth + 1)?;
-                let length = self.static_integer(cursor, &region_scope, depth + 1)?;
-                if length == 0 {
+                let offset = self.region_term(cursor, &region_scope, depth + 1)?;
+                let length = self.region_term(cursor, &region_scope, depth + 1)?;
+                if matches!(length, RegionTerm::Integer(0)) {
                     return Err(AmlError::InvalidRegion);
                 }
+                let bounds = match (offset, length) {
+                    (RegionTerm::Integer(offset), RegionTerm::Integer(length)) => {
+                        offset
+                            .checked_add(length - 1)
+                            .ok_or(AmlError::InvalidRegion)?;
+                        OperationRegionBounds::Resolved { offset, length }
+                    },
+                    (offset, length) => OperationRegionBounds::Deferred { offset, length },
+                };
                 self.namespace.define(
                     name,
-                    NamespaceObject::OperationRegion(OperationRegion {
-                        space,
-                        offset,
-                        length,
-                    }),
+                    NamespaceObject::OperationRegion(OperationRegion { space, bounds }),
                 )?;
             },
             0x81 => self.field(cursor, scope)?,
@@ -448,27 +453,69 @@ impl Loader {
         Ok(())
     }
 
-    fn static_integer(
+    fn region_term(
         &self,
         cursor: &mut Cursor<'_>,
         scope: &str,
         depth: usize,
-    ) -> Result<u64, AmlError> {
-        let mut value = data_value(cursor, scope, depth)?;
-        for _ in 0..16 {
-            match value {
-                AmlValue::Integer(integer) => return Ok(integer),
-                AmlValue::Reference(ref path) => {
-                    let resolved = self.namespace.resolve_alias(path)?;
-                    value = match self.namespace.get(resolved) {
-                        Some(NamespaceObject::Value(value)) => value.clone(),
-                        _ => return Err(AmlError::TypeMismatch("static integer")),
-                    };
-                },
-                _ => return Err(AmlError::TypeMismatch("static integer")),
-            }
+    ) -> Result<RegionTerm, AmlError> {
+        if depth >= MAX_PARSE_DEPTH {
+            return Err(AmlError::LimitExceeded("operation-region expression depth"));
         }
-        Err(AmlError::LimitExceeded("static reference depth"))
+        let offset = cursor.offset();
+        let opcode = cursor.read_u8()?;
+        let integer = match opcode {
+            0x00 => Some(0),
+            0x01 => Some(1),
+            0xff => Some(u64::MAX),
+            0x0a => Some(u64::from(cursor.read_u8()?)),
+            0x0b => Some(u64::from(cursor.read_u16()?)),
+            0x0c => Some(u64::from(cursor.read_u32()?)),
+            0x0e => Some(cursor.read_u64()?),
+            _ => None,
+        };
+        if let Some(integer) = integer {
+            return Ok(RegionTerm::Integer(integer));
+        }
+
+        if opcode == 0x72 {
+            let left = self.region_term(cursor, scope, depth + 1)?;
+            let right = self.region_term(cursor, scope, depth + 1)?;
+            if cursor.read_u8()? != 0x00 {
+                return Err(AmlError::InvalidTarget);
+            }
+            return Ok(RegionTerm::Add {
+                left: alloc::boxed::Box::new(left),
+                right: alloc::boxed::Box::new(right),
+            });
+        }
+
+        if is_name_start(opcode) {
+            cursor.rewind_one();
+            let candidate = name_string(cursor, scope)?;
+            let path = self
+                .namespace
+                .search_existing(&candidate)
+                .ok_or_else(|| AmlError::NotFound(candidate.clone()))?;
+            let resolved = self.namespace.resolve_alias(&path)?.to_string();
+            let requires_arguments = match self.namespace.get(&resolved) {
+                Some(NamespaceObject::Method(method)) => method.arg_count,
+                Some(NamespaceObject::BuiltinMethod(BuiltinMethod::Osi)) => 1,
+                Some(NamespaceObject::External { arg_count, .. }) => *arg_count,
+                Some(_) => 0,
+                None => return Err(AmlError::NotFound(resolved)),
+            };
+            if requires_arguments != 0 {
+                // Method invocation operands are ambiguous without a complete
+                // namespace pre-pass. VMware's region expressions use only
+                // already-defined values and fields, so reject rather than
+                // guessing how many following bytes belong to this term.
+                return Err(AmlError::ArgumentCount);
+            }
+            return Ok(RegionTerm::Reference(resolved));
+        }
+
+        Err(AmlError::UnsupportedOpcode(opcode, offset))
     }
 
     fn named_scope(
@@ -522,7 +569,12 @@ impl Loader {
                     let segment = name_segment(&mut package)?;
                     let length = u64::try_from(package_length_value(&mut package)?)
                         .map_err(|_| AmlError::InvalidField)?;
-                    if length == 0 || length > 64 {
+                    // AML FieldLength is a PkgLength measured in bits and may
+                    // legitimately exceed the native integer width. Retain
+                    // the complete FieldUnit in the namespace; the evaluator
+                    // applies its narrower <= 64-bit access limit when code
+                    // actually reads or writes the field.
+                    if length == 0 {
                         return Err(AmlError::InvalidField);
                     }
                     let name = super::namespace::join_path(scope, &segment);
@@ -604,6 +656,105 @@ mod tests {
         assert!(matches!(
             namespace.get("\\DEV0"),
             Some(NamespaceObject::Value(AmlValue::Integer(42)))
+        ));
+    }
+
+    #[test]
+    fn wide_named_field_does_not_reject_definition_block() {
+        // OperationRegion (REG0, SystemMemory, 0, 64)
+        // Field (REG0, ByteAcc, NoLock, Preserve) { WIDE, 256 }
+        // Name (DONE, One)
+        let aml = [
+            0x5b, 0x80, b'R', b'E', b'G', b'0', 0x00, 0x00, 0x0a, 0x40, 0x5b, 0x81, 0x0c, b'R',
+            b'E', b'G', b'0', 0x00, b'W', b'I', b'D', b'E', 0x40, 0x10, 0x08, b'D', b'O', b'N',
+            b'E', 0x01,
+        ];
+
+        let namespace = Loader::load(&aml).unwrap();
+        let Some(NamespaceObject::OperationRegion(region)) = namespace.get("\\REG0") else {
+            panic!("literal operation region was not retained");
+        };
+        assert_eq!(region.bounds, OperationRegionBounds::Resolved {
+            offset: 0,
+            length: 64
+        });
+        let Some(NamespaceObject::Field(field)) = namespace.get("\\WIDE") else {
+            panic!("wide field was not retained");
+        };
+        assert_eq!(field.bit_length, 256);
+        assert!(matches!(
+            namespace.get("\\DONE"),
+            Some(NamespaceObject::Value(AmlValue::Integer(1)))
+        ));
+    }
+
+    #[test]
+    fn zero_length_named_field_remains_invalid() {
+        let aml = [
+            0x5b, 0x81, 0x0b, b'R', b'E', b'G', b'0', 0x00, b'Z', b'E', b'R', b'O', 0x00,
+        ];
+        assert!(matches!(Loader::load(&aml), Err(AmlError::InvalidField)));
+    }
+
+    #[test]
+    fn preserves_field_reference_and_add_region_bounds() {
+        // OperationRegion (OEMD, SystemMemory, 0, 8)
+        // Field (OEMD, ByteAcc, NoLock, Preserve) { ECFG, 8 }
+        // OperationRegion (LPCS, SystemMemory, ECFG, 0x500)
+        // OperationRegion (EICH, SystemMemory, Add (ECFG, 0x4000), 0x4000)
+        let aml = [
+            0x5b, 0x80, b'O', b'E', b'M', b'D', 0x00, 0x0a, 0x00, 0x0a, 0x08, 0x5b, 0x81, 0x0b,
+            b'O', b'E', b'M', b'D', 0x00, b'E', b'C', b'F', b'G', 0x08, 0x5b, 0x80, b'L', b'P',
+            b'C', b'S', 0x00, b'E', b'C', b'F', b'G', 0x0b, 0x00, 0x05, 0x5b, 0x80, b'E', b'I',
+            b'C', b'H', 0x00, 0x72, b'E', b'C', b'F', b'G', 0x0b, 0x00, 0x40, 0x00, 0x0b, 0x00,
+            0x40,
+        ];
+
+        let namespace = Loader::load(&aml).unwrap();
+        let Some(NamespaceObject::OperationRegion(lpcs)) = namespace.get("\\LPCS") else {
+            panic!("reference-backed operation region was not retained");
+        };
+        assert_eq!(lpcs.bounds, OperationRegionBounds::Deferred {
+            offset: RegionTerm::Reference("\\ECFG".to_string()),
+            length: RegionTerm::Integer(0x500),
+        });
+        let Some(NamespaceObject::OperationRegion(eich)) = namespace.get("\\EICH") else {
+            panic!("Add-backed operation region was not retained");
+        };
+        assert!(matches!(&eich.bounds, OperationRegionBounds::Deferred {
+            offset: RegionTerm::Add { .. },
+            length: RegionTerm::Integer(0x4000),
+        }));
+    }
+
+    #[test]
+    fn unsupported_region_expression_remains_fail_closed() {
+        // Subtract is a valid general TermArg but is outside the deliberately
+        // narrow definition-block subset used for deferred region bounds.
+        let aml = [
+            0x5b, 0x80, b'R', b'E', b'G', b'0', 0x00, 0x74, 0x0a, 2, 0x0a, 1, 0x00, 0x0a, 1,
+        ];
+        assert!(matches!(
+            Loader::load(&aml),
+            Err(AmlError::UnsupportedOpcode(0x74, _))
+        ));
+    }
+
+    #[test]
+    fn literal_region_span_uses_exact_last_byte_overflow_check() {
+        let valid = [
+            0x5b, 0x80, b'L', b'A', b'S', b'T', 0x00, 0x0e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x01,
+        ];
+        assert!(Loader::load(&valid).is_ok());
+
+        let overflowing = [
+            0x5b, 0x80, b'O', b'V', b'E', b'R', 0x00, 0x0e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x0a, 0x02,
+        ];
+        assert!(matches!(
+            Loader::load(&overflowing),
+            Err(AmlError::InvalidRegion)
         ));
     }
 }
