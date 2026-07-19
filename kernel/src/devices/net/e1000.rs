@@ -507,13 +507,13 @@ impl PciDriver for E1000PciDriver {
         let interrupt = adapter.interrupt_handle();
         if let Some(index) = super::attach(Adapter::E1000(adapter)) {
             let interrupt_mode =
-                super::configure_intx(device, index, super::IrqDevice::E1000(interrupt));
+                super::configure_interrupt(device, index, super::IrqDevice::E1000(interrupt));
             ::log::info!(
                 "e1000: {} attached, MAC {}, link={}, service={}",
                 device.address,
                 mac,
                 if link { "up" } else { "down" },
-                if interrupt_mode { "INTx" } else { "poll" }
+                interrupt_mode.label()
             );
         }
         Ok(())

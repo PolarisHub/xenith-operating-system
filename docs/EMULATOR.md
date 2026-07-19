@@ -15,20 +15,26 @@ cargo run -p xenith-emu -- --image build/xenith.img --disk-read-only --memory 51
 ```
 
 The direct `--image` mode remains available for fast kernel work. To exercise
-the packaged BIOS path, use the deterministic firmware shim:
+the packaged BIOS path, use the strict Xenith BIOS stage runner:
 
 ```text
 cargo run -p xenith-emu -- --bios-image build/xenith.img --disk-read-only --memory 256M --serial stdio --max-instructions 100000000
 ```
 
 This path starts from architectural reset state, installs an inspectable reset
-ROM stub, transfers the actual MBR to `0x7c00`, performs stage1's two EDD reads,
-validates and loads the actual stage2 extent at `0x8000`, supplies E820/A20,
-reproduces stage2's protected/long-mode page tables and physical ELF loading,
-and enters the kernel with a native `XenithBootInfo`. The retained
-`BiosBootTrace` records every boundary. It is an explicit firmware-service and
-mode-transition shim, not a general 16/32-bit x86 interpreter or an external
-PC BIOS.
+ROM stub, and transfers the actual MBR to `0x7c00`. A bounded interpreter then
+fetches and executes the packaged Xenith stage1 bytes, services its two EDD
+reads, executes the stage2 real/protected/long-mode assembly, builds the actual
+page tables, and stops only after executing stage2's real `call stage2_main`
+instruction. Unknown instructions fail the boot instead of being skipped. The
+retained `BiosBootTrace` records per-stage instruction/byte counts and execution
+checksums as well as BIOS calls, E820, A20, and mode transitions.
+
+The freestanding Rust `stage2_main` body is the explicit remaining semantic
+fallback: the host validates/reads its payloads, loads the kernel ELF, constructs
+the native `XenithBootInfo`, and enters the kernel. Consequently this proves the
+current packaged Xenith stage1 and stage2 assembly stream through the long-mode
+call boundary, not an arbitrary BIOS or arbitrary 16/32-bit program.
 
 When `--serial stdio` is connected to an interactive terminal, a background
 reader forwards host input through the emulated PS/2 keyboard. The reader uses
@@ -58,7 +64,7 @@ The direct loader can install a 32-bpp linear framebuffer with `--framebuffer WI
 
 The PCI topology also exposes an RTL8139 with a stable locally administered MAC, immediate reset, an always-up link, empty receive ring, and deterministic transmit completion/INTx. It brings the production RTL8139 driver online and provides a bounded TX sink, but has no host network backend or inbound-frame source.
 
-There is still no general BIOS/UEFI implementation, arbitrary real/protected-mode instruction execution, full chipset reset sequence, host-backed networking, or AP startup. The purpose-built BIOS shim covers Xenith's packaged reset/stage1/stage2 contract only. The interpreter executes one CPU and rejects `--smp` values other than `1` instead of silently accepting an unused count.
+There is still no general BIOS/UEFI implementation, arbitrary real/protected-mode instruction execution, option-ROM execution, full chipset reset sequence, or host-backed networking. The purpose-built BIOS runner covers Xenith's current packaged stage1 and stage2 assembly contract only; `stage2_main`, UEFI, ISO catalog boot, external firmware, and physical hardware remain separate execution boundaries.
 
 `--debug-listen ADDRESS` exposes the bounded Xenith debug protocol. `xenith-debug` can resolve ELF symbols and DWARF source lines in both directions, set non-invasive address/symbol/`file:line[:column]` breakpoints, continue/step, inspect registers, and read/write mapped guest memory. Terminal/script input remains queued while the debugger is paused and is polled by its interrupt-aware step/continue loop; waiting for a debugger command does not tick the guest. It does not yet expose DWARF variables/types, inline call stacks, unwind-based backtraces, watchpoints, PIE relocation, GDB RSP, serial-hardware debugging, or VMM debugging.
 

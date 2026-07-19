@@ -247,6 +247,12 @@ impl MsixCapability {
             pba_offset: pba & !7,
         })
     }
+
+    /// Disable MSI-X while preserving table size and the function-mask bit.
+    pub fn disable(self, address: PciAddress) {
+        let control = address.read16(self.offset + 2);
+        address.write16(self.offset + 2, control & !(1 << 15));
+    }
 }
 
 #[cfg(test)]

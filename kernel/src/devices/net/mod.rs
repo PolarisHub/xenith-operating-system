@@ -125,6 +125,23 @@ pub(in crate::devices::net) enum IrqDevice {
     E1000(e1000::InterruptHandle),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::devices::net) enum InterruptMode {
+    Msi,
+    Intx,
+    Poll,
+}
+
+impl InterruptMode {
+    pub(in crate::devices::net) const fn label(self) -> &'static str {
+        match self {
+            Self::Msi => "MSI",
+            Self::Intx => "INTx",
+            Self::Poll => "poll",
+        }
+    }
+}
+
 impl IrqDevice {
     fn acknowledge_and_mask(self) -> u32 {
         match self {
@@ -324,6 +341,92 @@ fn pending_bit(adapter_index: usize) -> Option<u64> {
     (adapter_index < MAX_PENDING_ADAPTERS).then(|| 1u64 << adapter_index)
 }
 
+fn canonical_pci_address(
+    device: &crate::devices::pci::enumerate::PciDevice,
+) -> Option<crate::devices::pci::PciAddress> {
+    crate::devices::pci::PciAddress::new(
+        device.address.bus(),
+        device.address.device(),
+        device.address.function(),
+    )
+}
+
+pub(in crate::devices::net) fn configure_interrupt(
+    device: &crate::devices::pci::enumerate::PciDevice,
+    adapter_index: usize,
+    irq_device: IrqDevice,
+) -> InterruptMode {
+    match configure_msi(device, adapter_index, irq_device) {
+        Ok(true) => InterruptMode::Msi,
+        Ok(false) => {
+            if configure_intx(device, adapter_index, irq_device) {
+                InterruptMode::Intx
+            } else {
+                InterruptMode::Poll
+            }
+        },
+        Err(error) => {
+            ::log::warn!(
+                "net: malformed PCI capability list on {}; interrupts disabled: {:?}",
+                device.address,
+                error
+            );
+            InterruptMode::Poll
+        },
+    }
+}
+
+fn configure_msi(
+    device: &crate::devices::pci::enumerate::PciDevice,
+    adapter_index: usize,
+    irq_device: IrqDevice,
+) -> Result<bool, crate::devices::pci::capability::CapabilityError> {
+    use crate::devices::pci::capability::{
+        self, MsiCapability, MsixCapability, CAP_ID_MSI, CAP_ID_MSIX,
+    };
+
+    let Some(address) = canonical_pci_address(device) else {
+        return Ok(false);
+    };
+    let capabilities = capability::walk(address)?;
+    if let Some(msix) = capabilities.find(CAP_ID_MSIX) {
+        // Xenith does not yet own a per-device vector allocator or map MSI-X
+        // tables through BAR bounds. Disable inherited MSI-X state before
+        // selecting either coherent single-message MSI or legacy INTx.
+        MsixCapability::read(address, msix)?.disable(address);
+    }
+    let Some(capability) = capabilities.find(CAP_ID_MSI) else {
+        return Ok(false);
+    };
+    let msi = MsiCapability::read(address, capability)?;
+    msi.disable(address);
+
+    let apic_id = crate::arch::x86_64::interrupts::apic::current_id();
+    let Ok(destination) = u8::try_from(apic_id) else {
+        return Ok(false);
+    };
+    if pending_bit(adapter_index).is_none() || !IRQ_BINDINGS.lock().can_push(adapter_index) {
+        return Ok(false);
+    }
+    {
+        let mut bindings = IRQ_BINDINGS.lock();
+        if !bindings.push(IrqBinding {
+            adapter_index,
+            device: irq_device,
+        }) {
+            return Ok(false);
+        }
+    }
+
+    let mut command = crate::devices::pci::PciCommand::from_bits_truncate(address.read_command());
+    command.insert(crate::devices::pci::PciCommand::INTERRUPT_DISABLE);
+    address.write_command(command.bits());
+    irq_device.enable();
+    msi.program_single(address, destination, NIC_VECTOR);
+    ::log::debug!("net: single-vector MSI selected for {}", device.address);
+    Ok(true)
+}
+
 /// Route a firmware-provided legacy INTx line and publish its device cause
 /// handle before the controller is enabled. Failure deliberately leaves the
 /// adapter's interrupt mask clear; the autonomous poller remains authoritative.
@@ -371,11 +474,7 @@ pub(in crate::devices::net) fn configure_intx(
         }
     }
 
-    let Some(address) = crate::devices::pci::PciAddress::new(
-        device.address.bus(),
-        device.address.device(),
-        device.address.function(),
-    ) else {
+    let Some(address) = canonical_pci_address(device) else {
         return false;
     };
     let mut command = crate::devices::pci::PciCommand::from_bits_truncate(address.read_command());

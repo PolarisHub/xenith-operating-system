@@ -42,16 +42,20 @@ image as the guest's primary-master ATA disk, use:
 cargo run -p xenith-emu -- --image build/xenith.img --disk-read-only --memory 512M --serial stdio --max-instructions 100000000
 ```
 
-To preserve the packaged BIOS stages and native Xenith handoff, select the
-firmware shim instead:
+To preserve and execute the packaged BIOS stages, select the strict Xenith BIOS
+stage runner instead:
 
 ```text
 cargo run -p xenith-emu -- --bios-image build/xenith.img --disk-read-only --memory 256M --serial stdio --max-instructions 100000000
 ```
 
-The shim records reset, MBR, EDD, stage2, E820, A20, protected-mode,
-long-mode, and kernel-handoff evidence. It executes Xenith's exact image
-contract but is not a general-purpose BIOS or 16/32-bit interpreter.
+The runner fetches the actual stage1 instruction stream from `0x7c00`, services
+its EDD reads, and executes the actual stage2 assembly through E820, A20,
+protected mode, page-table creation, long mode, and the `call stage2_main`
+instruction. Unsupported instructions fail closed. Its trace records per-stage
+instruction/byte counts and execution checksums. The Rust `stage2_main` body's
+payload reads, ELF loading, and native handoff construction remain a clearly
+marked semantic fallback.
 
 Omit `--disk-read-only` to permit in-memory ATA writes. Writes never overwrite
 the input implicitly; add `--disk-output updated.img` to export the final disk
@@ -83,6 +87,6 @@ and is injected during subsequent step/continue execution.
 
 Writing a raw disk image to removable media is destructive and intentionally not automated by the repository. Resolve and verify the exact target device before using a platform imaging tool.
 
-The current BIOS loader is limited to boot drive `0x80` and primary-master ATA PIO. The purpose-built interpreter shim covers that reset/stage1/stage2 contract, while external BIOS implementations, UEFI, ISO catalog boot, and physical hardware remain separate validation boundaries. Consult [STATUS](STATUS.md) for recorded runtime proof.
+The current BIOS loader is limited to boot drive `0x80` and primary-master ATA PIO. The purpose-built runner proves the current packaged Xenith stage1 and stage2 assembly bytes through the long-mode call into `stage2_main`; it is not an arbitrary-firmware interpreter. The `stage2_main` Rust body, external BIOS implementations, option ROMs, UEFI, ISO catalog boot, and physical hardware remain separate execution boundaries. Consult [STATUS](STATUS.md) for recorded runtime proof.
 
 QEMU/Limine scripts are legacy optional cross-validation aids only. They are not required or invoked by the primary build/test path.

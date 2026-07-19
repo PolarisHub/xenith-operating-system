@@ -397,13 +397,13 @@ impl PciDriver for Rtl8139PciDriver {
         let interrupt = adapter.interrupt_handle();
         if let Some(index) = super::attach(Adapter::Rtl8139(adapter)) {
             let interrupt_mode =
-                super::configure_intx(device, index, super::IrqDevice::Rtl8139(interrupt));
+                super::configure_interrupt(device, index, super::IrqDevice::Rtl8139(interrupt));
             ::log::info!(
                 "rtl8139: {} attached, MAC {}, link={}, service={}",
                 device.address,
                 mac,
                 if link { "up" } else { "down" },
-                if interrupt_mode { "INTx" } else { "poll" }
+                interrupt_mode.label()
             );
         }
         Ok(())

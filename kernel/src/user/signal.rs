@@ -887,6 +887,15 @@ pub enum DispatchOutcome {
     KernelContext,
 }
 
+/// Exact syscall image that may be replayed after a caught signal returns.
+/// The architecture entry path supplies this only for a blocking operation
+/// that returned `EINTR` before transferring any data.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RestartContext {
+    pub syscall_number: u64,
+    pub syscall_ip: u64,
+}
+
 /// Pick the highest-priority deliverable signal from `pending`, honouring the
 /// blocked mask and the uncatchable-signal rules.
 ///
@@ -960,13 +969,23 @@ fn consume_delivered(guard: &mut SpinLockIRQGuard<'_, PendingState>, sig: Signal
 /// when nothing is pending is cheap (one blocked-mask read + one pending-set
 /// check) and leaves the frame unchanged.
 pub fn check_and_dispatch(state: &SignalState, ctx: &mut ExceptionContext) -> DispatchOutcome {
+    check_and_dispatch_with_restart(state, ctx, None)
+}
+
+/// Signal dispatch variant used by syscall return when a proven-safe restart
+/// image is available. `SA_RESTART` is ignored for every other path.
+pub fn check_and_dispatch_with_restart(
+    state: &SignalState,
+    ctx: &mut ExceptionContext,
+    restart: Option<RestartContext>,
+) -> DispatchOutcome {
     // Only deliver on the kernel-to-user transition. A signal raised while
     // in kernel mode stays pending until the next return-to-user.
     if (ctx.cs & RPL_MASK) != 3 {
         return DispatchOutcome::KernelContext;
     }
 
-    let (sig, mut pend) = match select_deliverable(state) {
+    let (sig, info, mut pend) = match select_deliverable(state) {
         Some(x) => x,
         None => return DispatchOutcome::NothingDeliverable,
     };
@@ -1006,7 +1025,10 @@ pub fn check_and_dispatch(state: &SignalState, ctx: &mut ExceptionContext) -> Di
             // enter the handler. Failure to write the frame (bad user stack)
             // falls back to the default action — a process with a broken
             // stack gets SIGSEGV semantics, not a kernel panic.
-            match build_signal_frame(state, ctx, sig, mask, flags) {
+            let restart = (flags & xenith_abi::SA_RESTART != 0)
+                .then_some(restart)
+                .flatten();
+            match build_signal_frame(state, ctx, sig, info, mask, flags, restart) {
                 Ok(()) => {
                     consume_delivered(&mut pend, sig);
                     drop(pend);
@@ -1040,62 +1062,7 @@ pub fn check_and_dispatch(state: &SignalState, ctx: &mut ExceptionContext) -> Di
 // The signal frame and the user-stack build
 // ---------------------------------------------------------------------------
 
-/// The on-stack record written before entering a user handler.
-///
-/// `repr(C)` so the layout is stable and [`sigreturn`] can read it back by
-/// offset. The handler receives a pointer to this record as its second
-/// argument (`ucontext_t *`-equivalent); the first argument is the signal
-/// number. The record is placed at the *top* of the freshly-built user stack,
-/// and the handler's return address (the trampoline entry) is pushed *below*
-/// it, so on entry the user stack looks like:
-///
-/// ```text
-///   new rsp -> [ return address = trampoline ]
-///              [ SignalFrame             ]  <- rsi points here
-///              [ ... user scratch ...    ]
-/// ```
-///
-/// Only the registers `iretq` needs (rip/rsp/rflags/cs/ss) plus the full GPR
-/// set are saved; the FPU/SSE state and `siginfo` proper are future additions
-/// and are deliberately omitted to keep the frame small and the bring-up
-/// path auditable.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SignalFrame {
-    /// The signal number, echoed back so the trampoline / `sigreturn` can
-    /// verify the record without parsing the stack.
-    pub signo: u64,
-    /// The blocked mask in effect *before* the handler was entered, so
-    /// [`sigreturn`] can restore it (the handler's `sa_mask` is unwound on
-    /// return).
-    pub saved_mask: SignalMask,
-    /// The CPU-pushed `iretq` state at the point of interruption.
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-    /// General-purpose registers, in the same order as
-    /// [`ExceptionContext`] (low-to-high) so a future `ptrace`/core-dump path
-    /// can copy them verbatim.
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-}
-
-const _: () = assert!(size_of::<SignalFrame>() == 22 * size_of::<u64>());
+const _: () = assert!(size_of::<SignalFrame>() == 34 * size_of::<u64>());
 
 /// Error returned by [`build_signal_frame`] when the user stack cannot hold
 /// the frame. Stored as a small enum (not a string) so the warning in
