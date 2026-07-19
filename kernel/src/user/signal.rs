@@ -37,6 +37,7 @@
 //! `RT_MIN..=RT_MAX` (32..=63). The whole range fits in one `u64`, so a
 //! signal set is a single word — atomic, copyable, and allocation-free.
 
+use alloc::vec::Vec;
 use core::mem::size_of;
 use core::slice;
 
@@ -70,9 +71,10 @@ const RT_COUNT: usize = (RT_MAX - RT_MIN + 1) as usize;
 
 /// Hard per-process limit across all pending real-time signal deliveries.
 ///
-/// The queue is embedded in [`SignalState`], so delivery remains allocation
-/// free and safe from interrupt context. Standard signals do not consume this
-/// capacity because they retain their existing one-bit coalescing semantics.
+/// Storage is fallibly preallocated when a process is created, so delivery
+/// remains allocation-free and safe from interrupt context. Standard signals
+/// do not consume this capacity because they retain their existing one-bit
+/// coalescing semantics.
 pub const REALTIME_QUEUE_CAPACITY: usize = RT_COUNT * 4;
 
 /// The syscall number the signal trampoline issues to request
@@ -589,10 +591,22 @@ pub enum AltStackError {
     AlreadyOnStack,
 }
 
+/// Allocation failure while creating out-of-line per-process signal storage.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SignalStateAllocError;
+
+impl core::fmt::Display for SignalStateAllocError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("out of memory while creating signal state")
+    }
+}
+
 /// The per-process signal state.
 ///
-/// Embedded in each `UserProcess` by composition. Three pieces of state are
-/// kept here:
+/// Embedded in each `UserProcess` by composition. Large fixed-capacity tables
+/// are stored in preallocated vectors so moving a process record cannot place
+/// multi-kilobyte temporaries on the fixed-size kernel stack. Three pieces of
+/// state are kept here:
 ///
 /// * `pending` — the set of signals that have been delivered to the process
 ///   but not yet dispatched to a handler or default action. IRQ-safe lock:
@@ -618,12 +632,18 @@ pub struct SignalState {
     /// The blocked-signal mask.
     blocked: SpinLockIRQ<SignalMask>,
     /// One disposition per signal number, index `n - 1`.
-    dispositions: SpinLock<[SignalAction; NSIG as usize]>,
+    dispositions: SpinLock<Vec<SignalAction>>,
     /// Alternate signal stack. Xenith currently schedules one userspace
     /// thread per process, so this process-owned slot is also the calling
     /// thread's slot; fork copies it and exec disables it.
     alt_stack: SpinLock<AltStack>,
 }
+
+// Keep process moves comfortably below the 16 KiB task stack. A previous
+// inline realtime array made SignalState larger than 9 KiB and a generated
+// clone temporary crossed the stack base before any Rust bounds check could
+// run. Large tables must remain behind their preallocated vector handles.
+const _: () = assert!(size_of::<SignalState>() <= 256);
 
 /// One queued real-time delivery and its stable payload.
 #[derive(Debug, Clone, Copy)]
@@ -640,78 +660,53 @@ struct PendingState {
     set: SignalSet,
     /// Arrival-ordered real-time deliveries. Selection still prioritizes the
     /// lowest deliverable signal number, then the oldest matching entry.
-    realtime: [Option<RealtimePending>; REALTIME_QUEUE_CAPACITY],
-    /// Number of occupied entries at the start of `realtime`.
-    realtime_len: usize,
+    realtime: Vec<RealtimePending>,
     /// Stable first payload retained for each coalesced standard signal.
-    standard_info: [xenith_abi::SigInfo; NSIG as usize],
-}
-
-impl Default for PendingState {
-    fn default() -> Self {
-        Self {
-            set: SignalSet::empty(),
-            realtime: [None; REALTIME_QUEUE_CAPACITY],
-            realtime_len: 0,
-            standard_info: [EMPTY_SIGINFO; NSIG as usize],
-        }
-    }
+    standard_info: Vec<xenith_abi::SigInfo>,
 }
 
 impl PendingState {
     /// Append one real-time delivery, returning its per-signal queue depth.
-    fn enqueue_realtime(
-        &mut self,
-        signal: Signal,
-        info: xenith_abi::SigInfo,
-    ) -> Option<u16> {
+    fn enqueue_realtime(&mut self, signal: Signal, info: xenith_abi::SigInfo) -> Option<u16> {
         debug_assert!(signal.is_realtime());
-        if self.realtime_len == REALTIME_QUEUE_CAPACITY {
+        if self.realtime.len() == REALTIME_QUEUE_CAPACITY {
             return None;
         }
 
-        let count = self.realtime[..self.realtime_len]
+        let count = self
+            .realtime
             .iter()
-            .flatten()
             .filter(|pending| pending.signal == signal)
             .count()
             + 1;
-        self.realtime[self.realtime_len] = Some(RealtimePending { signal, info });
-        self.realtime_len += 1;
+        debug_assert!(self.realtime.capacity() >= REALTIME_QUEUE_CAPACITY);
+        self.realtime.push(RealtimePending { signal, info });
         self.set.add(signal);
         Some(count as u16)
     }
 
     /// Oldest queued payload for one real-time signal.
     fn first_realtime_info(&self, signal: Signal) -> Option<xenith_abi::SigInfo> {
-        self.realtime[..self.realtime_len]
+        self.realtime
             .iter()
-            .flatten()
             .find(|pending| pending.signal == signal)
             .map(|pending| pending.info)
     }
 
     /// Remove the oldest queued instance of one real-time signal.
     fn consume_realtime(&mut self, signal: Signal) {
-        let Some(remove_at) = self.realtime[..self.realtime_len]
+        let Some(remove_at) = self
+            .realtime
             .iter()
-            .position(|entry| entry.is_some_and(|pending| pending.signal == signal))
+            .position(|pending| pending.signal == signal)
         else {
             debug_assert!(false, "pending real-time bit has no queued payload");
             self.set.remove(signal);
             return;
         };
 
-        for index in remove_at..self.realtime_len - 1 {
-            self.realtime[index] = self.realtime[index + 1];
-        }
-        self.realtime_len -= 1;
-        self.realtime[self.realtime_len] = None;
-        if !self.realtime[..self.realtime_len]
-            .iter()
-            .flatten()
-            .any(|pending| pending.signal == signal)
-        {
+        self.realtime.remove(remove_at);
+        if !self.realtime.iter().any(|pending| pending.signal == signal) {
             self.set.remove(signal);
         }
     }
@@ -719,21 +714,45 @@ impl PendingState {
 
 impl SignalState {
     /// Construct a fresh signal state: nothing pending, nothing blocked, all
-    /// dispositions `Default`. `const`-friendly enough to build at compile
-    /// time for a static idle-process if needed.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
+    /// dispositions `Default`. Every vector reserves its complete lifetime
+    /// bound here; delivery and disposition lookup never allocate.
+    pub fn try_new() -> Result<Self, SignalStateAllocError> {
+        let mut realtime = Vec::new();
+        realtime
+            .try_reserve_exact(REALTIME_QUEUE_CAPACITY)
+            .map_err(|_| SignalStateAllocError)?;
+
+        let mut standard_info = Vec::new();
+        standard_info
+            .try_reserve_exact(NSIG as usize)
+            .map_err(|_| SignalStateAllocError)?;
+        standard_info.resize(NSIG as usize, EMPTY_SIGINFO);
+
+        let mut dispositions = Vec::new();
+        dispositions
+            .try_reserve_exact(NSIG as usize)
+            .map_err(|_| SignalStateAllocError)?;
+        dispositions.resize(NSIG as usize, SignalAction::Default);
+
+        Ok(Self {
             pending: SpinLockIRQ::new(PendingState {
                 set: SignalSet::empty(),
-                realtime: [None; REALTIME_QUEUE_CAPACITY],
-                realtime_len: 0,
-                standard_info: [EMPTY_SIGINFO; NSIG as usize],
+                realtime,
+                standard_info,
             }),
             blocked: SpinLockIRQ::new(SignalMask::empty()),
-            dispositions: SpinLock::new([SignalAction::Default; NSIG as usize]),
+            dispositions: SpinLock::new(dispositions),
             alt_stack: SpinLock::new(AltStack { sp: 0, size: 0 }),
-        }
+        })
+    }
+
+    /// Infallible convenience used only by host tests, where allocation
+    /// failure is already a test-process failure. Production process paths
+    /// call [`try_new`](Self::try_new) and propagate `ENOMEM`.
+    #[cfg(test)]
+    #[must_use]
+    fn new() -> Self {
+        Self::try_new().expect("allocate test signal state")
     }
 
     /// Install a handler disposition for `sig`. Refuses to install `Catch` or
@@ -810,50 +829,80 @@ impl SignalState {
         Ok(old)
     }
 
-    /// Snapshot the state inherited across `fork`: dispositions and the
-    /// blocked mask are copied, while pending deliveries start empty in the
-    /// child as required by process creation semantics.
-    #[must_use]
-    pub fn clone_for_fork(&self) -> Self {
-        let state = Self::new();
+    /// Copy the state inherited across `fork` into preallocated `state`.
+    /// Pending deliveries start empty in the child as required by process
+    /// creation semantics. This method performs no allocation.
+    pub fn copy_for_fork_into(&self, state: &Self) {
+        debug_assert!(!core::ptr::eq(self, state));
+        {
+            let mut pending = state.pending.lock();
+            pending.set = SignalSet::empty();
+            pending.realtime.clear();
+            pending.standard_info.fill(EMPTY_SIGINFO);
+        }
         *state.blocked.lock() = *self.blocked.lock();
-        *state.dispositions.lock() = *self.dispositions.lock();
-        *state.alt_stack.lock() = *self.alt_stack.lock();
         state
+            .dispositions
+            .lock()
+            .copy_from_slice(&self.dispositions.lock());
+        *state.alt_stack.lock() = *self.alt_stack.lock();
     }
 
-    /// Build the signal state for a successful `exec`. The blocked mask,
-    /// pending deliveries, and ignored dispositions survive; caught handlers
-    /// are reset because their code addresses belonged to the old image.
-    #[must_use]
-    pub fn clone_for_exec(&self) -> Self {
-        let state = Self::new();
+    /// Copy the successful-`exec` state into preallocated `state`. The blocked
+    /// mask, pending deliveries, and ignored dispositions survive; caught
+    /// handlers and the alternate stack reset with the old image. This method
+    /// performs no allocation.
+    pub fn copy_for_exec_into(&self, state: &Self) {
+        debug_assert!(!core::ptr::eq(self, state));
         *state.blocked.lock() = *self.blocked.lock();
         {
             let old_pending = self.pending.lock();
             let mut new_pending = state.pending.lock();
             new_pending.set = old_pending.set;
-            new_pending.realtime = old_pending.realtime;
-            new_pending.realtime_len = old_pending.realtime_len;
-            new_pending.standard_info = old_pending.standard_info;
+            new_pending.realtime.clear();
+            debug_assert!(new_pending.realtime.capacity() >= REALTIME_QUEUE_CAPACITY);
+            new_pending
+                .realtime
+                .extend_from_slice(&old_pending.realtime);
+            new_pending
+                .standard_info
+                .copy_from_slice(&old_pending.standard_info);
         }
         let old = self.dispositions.lock();
         let mut new = state.dispositions.lock();
+        new.fill(SignalAction::Default);
         for (destination, source) in new.iter_mut().zip(old.iter()) {
             if matches!(source, SignalAction::Ignore) {
                 *destination = SignalAction::Ignore;
             }
         }
-        drop(new);
-        drop(old);
-        state
+        *state.alt_stack.lock() = AltStack::default();
     }
-}
 
-impl Default for SignalState {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
+    /// Fallibly snapshot the state inherited across `fork`.
+    pub fn try_clone_for_fork(&self) -> Result<Self, SignalStateAllocError> {
+        let state = Self::try_new()?;
+        self.copy_for_fork_into(&state);
+        Ok(state)
+    }
+
+    /// Fallibly snapshot the state inherited across `exec`.
+    pub fn try_clone_for_exec(&self) -> Result<Self, SignalStateAllocError> {
+        let state = Self::try_new()?;
+        self.copy_for_exec_into(&state);
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    fn clone_for_fork(&self) -> Self {
+        self.try_clone_for_fork()
+            .expect("allocate fork signal snapshot")
+    }
+
+    #[cfg(test)]
+    fn clone_for_exec(&self) -> Self {
+        self.try_clone_for_exec()
+            .expect("allocate exec signal snapshot")
     }
 }
 
@@ -1000,8 +1049,8 @@ fn select_deliverable<'a>(
 
     // Standard signals first (low numbers), then real-time. `pop_lowest`
     // already walks in numeric order; we just skip blocked signals that are
-    // not uncatchable. We cannot pop-then-restore cleanly because popping
-    // mutates the count, so instead we scan bits without consuming.
+    // not uncatchable. Scan without consuming so the selected real-time FIFO
+    // entry remains stable while its frame or default action is prepared.
     let mut scan = g.set;
     while let Some(sig) = scan.pop_lowest() {
         let deliverable = sig.is_uncatchable() || !blocked.is_blocked(sig);
@@ -1620,7 +1669,37 @@ pub fn user_data_selector() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn signal_state_is_small_and_preallocates_every_bounded_table() {
+        let state = SignalState::new();
+        assert!(size_of::<SignalState>() <= 256);
+
+        let pending = state.pending.lock();
+        assert!(pending.realtime.is_empty());
+        assert!(pending.realtime.capacity() >= REALTIME_QUEUE_CAPACITY);
+        assert_eq!(pending.standard_info.len(), NSIG as usize);
+        assert!(pending.standard_info.capacity() >= NSIG as usize);
+        drop(pending);
+
+        let dispositions = state.dispositions.lock();
+        assert_eq!(dispositions.len(), NSIG as usize);
+        assert!(dispositions.capacity() >= NSIG as usize);
+        std::eprintln!("SignalState inline bytes={}", size_of::<SignalState>());
+    }
+
+    fn queued_info(signal: Signal, value: u64) -> xenith_abi::SigInfo {
+        xenith_abi::SigInfo {
+            signo: signal.as_number(),
+            code: xenith_abi::SI_USER,
+            sender_pid: 42,
+            value,
+            ..xenith_abi::SigInfo::default()
+        }
+    }
 
     fn test_frame() -> SignalFrame {
         SignalFrame {
@@ -1782,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn deliver_realtime_counts() {
+    fn deliver_realtime_reports_per_signal_depth() {
         let st = SignalState::new();
         assert_eq!(
             deliver_signal(&st, Signal::Rt(0)),
@@ -1792,6 +1871,86 @@ mod tests {
             deliver_signal(&st, Signal::Rt(0)),
             DeliverOutcome::RealtimeQueued { count: 2 }
         );
+    }
+
+    #[test]
+    fn realtime_payloads_are_fifo_with_numeric_priority_and_masking() {
+        let state = SignalState::new();
+        let low = Signal::Rt(0);
+        let high = Signal::Rt(1);
+        let high_first = queued_info(high, 10);
+        let low_only = queued_info(low, 20);
+        let high_second = queued_info(high, 30);
+        assert!(matches!(
+            deliver_signal_with_info(&state, high, high_first),
+            DeliverOutcome::RealtimeQueued { count: 1 }
+        ));
+        assert!(matches!(
+            deliver_signal_with_info(&state, low, low_only),
+            DeliverOutcome::RealtimeQueued { count: 1 }
+        ));
+        assert!(matches!(
+            deliver_signal_with_info(&state, high, high_second),
+            DeliverOutcome::RealtimeQueued { count: 2 }
+        ));
+
+        let mut mask = SignalMask::empty();
+        mask.block(low);
+        state.set_blocked(mask);
+        let (signal, info, mut pending) = select_deliverable(&state).unwrap();
+        assert_eq!((signal, info), (high, high_first));
+        consume_delivered(&mut pending, signal);
+        drop(pending);
+
+        state.set_blocked(SignalMask::empty());
+        let (signal, info, mut pending) = select_deliverable(&state).unwrap();
+        assert_eq!((signal, info), (low, low_only));
+        consume_delivered(&mut pending, signal);
+        drop(pending);
+
+        let (signal, info, mut pending) = select_deliverable(&state).unwrap();
+        assert_eq!((signal, info), (high, high_second));
+        consume_delivered(&mut pending, signal);
+        drop(pending);
+        assert!(select_deliverable(&state).is_none());
+    }
+
+    #[test]
+    fn realtime_queue_overflow_is_bounded_and_non_destructive() {
+        let state = SignalState::new();
+        let signal = Signal::Rt(0);
+        for index in 0..REALTIME_QUEUE_CAPACITY {
+            assert_eq!(
+                deliver_signal_with_info(&state, signal, queued_info(signal, index as u64)),
+                DeliverOutcome::RealtimeQueued {
+                    count: (index + 1) as u16
+                }
+            );
+        }
+        let rejected = queued_info(signal, 0xfeed);
+        assert_eq!(
+            deliver_signal_with_info(&state, signal, rejected),
+            DeliverOutcome::RealtimeQueueFull {
+                capacity: REALTIME_QUEUE_CAPACITY
+            }
+        );
+        assert_eq!(state.pending.lock().realtime.len(), REALTIME_QUEUE_CAPACITY);
+
+        let (selected, info, mut pending) = select_deliverable(&state).unwrap();
+        assert_eq!((selected, info.value), (signal, 0));
+        consume_delivered(&mut pending, selected);
+        drop(pending);
+        assert_eq!(
+            deliver_signal_with_info(&state, signal, rejected),
+            DeliverOutcome::RealtimeQueued {
+                count: REALTIME_QUEUE_CAPACITY as u16
+            }
+        );
+
+        let pending = state.pending.lock();
+        assert_eq!(pending.realtime.len(), REALTIME_QUEUE_CAPACITY);
+        assert_eq!(pending.realtime[0].info.value, 1);
+        assert_eq!(pending.realtime[REALTIME_QUEUE_CAPACITY - 1].info, rejected);
     }
 
     #[test]
@@ -1811,6 +1970,16 @@ mod tests {
             deliver_signal(&parent, Signal::Usr2),
             DeliverOutcome::NewlyPending
         );
+        let realtime_first = queued_info(Signal::Rt(0), 1);
+        let realtime_second = queued_info(Signal::Rt(0), 2);
+        assert_eq!(
+            deliver_signal_with_info(&parent, Signal::Rt(0), realtime_first),
+            DeliverOutcome::RealtimeQueued { count: 1 }
+        );
+        assert_eq!(
+            deliver_signal_with_info(&parent, Signal::Rt(0), realtime_second),
+            DeliverOutcome::RealtimeQueued { count: 2 }
+        );
         parent
             .sigaltstack(
                 0x400000,
@@ -1827,13 +1996,27 @@ mod tests {
         assert!(child.blocked_mask().is_blocked(Signal::Usr1));
         assert_eq!(child.disposition(Signal::Int), catch);
         assert!(child.pending.lock().set.is_empty());
+        assert!(child.pending.lock().realtime.is_empty());
         assert_eq!(child.sigaltstack(0x400000, None).unwrap().sp, 0x700000);
 
         let replaced = parent.clone_for_exec();
         assert!(replaced.blocked_mask().is_blocked(Signal::Usr1));
         assert_eq!(replaced.disposition(Signal::Int), SignalAction::Default);
         assert_eq!(replaced.disposition(Signal::Term), SignalAction::Ignore);
-        assert!(replaced.pending.lock().set.is_empty());
+        assert!(replaced.pending.lock().set.contains(Signal::Usr2));
+        assert_eq!(replaced.pending.lock().realtime.len(), 2);
+        let (signal, _, mut pending) = select_deliverable(&replaced).unwrap();
+        assert_eq!(signal, Signal::Usr2);
+        consume_delivered(&mut pending, signal);
+        drop(pending);
+        for expected in [realtime_first, realtime_second] {
+            let (signal, info, mut pending) = select_deliverable(&replaced).unwrap();
+            assert_eq!(signal, Signal::Rt(0));
+            assert_eq!(info, expected);
+            consume_delivered(&mut pending, signal);
+            drop(pending);
+        }
+        assert!(select_deliverable(&replaced).is_none());
         assert_eq!(
             replaced.sigaltstack(0x400000, None).unwrap().flags,
             xenith_abi::SS_DISABLE
@@ -1916,6 +2099,10 @@ mod tests {
         assert_eq!(
             deliver_signal_with_info(&state, Signal::Usr1, info),
             DeliverOutcome::NewlyPending
+        );
+        assert_eq!(
+            deliver_signal_with_info(&state, Signal::Usr1, queued_info(Signal::Usr1, 0xbeef)),
+            DeliverOutcome::AlreadyPending
         );
         let (signal, retained, _guard) = select_deliverable(&state).unwrap();
         assert_eq!(signal, Signal::Usr1);

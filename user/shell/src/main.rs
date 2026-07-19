@@ -489,29 +489,12 @@ fn run_pipeline(parsed: &ParsedLine, jobs: &mut JobTable, shell_process_group: i
             libuser::println!("sh: dup2: errno {}", error.0);
             failed = true;
         } else {
-            match spawn_stage(parsed, stage) {
+            match spawn_stage(parsed, stage, process_group) {
                 Ok(pid) => {
                     children[child_count] = pid;
                     child_count += 1;
-                    let group = if process_group == 0 {
-                        pid
-                    } else {
-                        process_group
-                    };
-                    if let Err(error) = libuser::syscall::setpgid(pid, group) {
-                        libuser::println!("sh: setpgid: errno {}", error.0);
-                        failed = true;
-                    } else if process_group == 0 {
-                        process_group = group;
-                        if !parsed.background() {
-                            if let Err(error) = libuser::terminal::set_foreground_process_group(
-                                libuser::io::STDIN,
-                                process_group,
-                            ) {
-                                libuser::println!("sh: tcsetpgrp: errno {}", error.0);
-                                failed = true;
-                            }
-                        }
+                    if process_group == 0 {
+                        process_group = pid;
                     }
                 },
                 Err(error) => {
@@ -552,6 +535,18 @@ fn run_pipeline(parsed: &ParsedLine, jobs: &mut JobTable, shell_process_group: i
             let _ = libuser::syscall::waitpid(pid, &mut status, 0);
         }
         return;
+    }
+
+    // Pipeline setup temporarily replaces the shell's fd 0 with a file or
+    // pipe endpoint. Transfer terminal ownership only after restoring the
+    // real controlling terminal, and only once every stage is in the group.
+    if !parsed.background() && !failed {
+        if let Err(error) =
+            libuser::terminal::set_foreground_process_group(libuser::io::STDIN, process_group)
+        {
+            libuser::println!("sh: tcsetpgrp: errno {}", error.0);
+            failed = true;
+        }
     }
 
     if failed {
@@ -604,7 +599,7 @@ fn run_pipeline(parsed: &ParsedLine, jobs: &mut JobTable, shell_process_group: i
     }
 }
 
-fn spawn_stage(parsed: &ParsedLine, stage: &Stage) -> libuser::Result<i64> {
+fn spawn_stage(parsed: &ParsedLine, stage: &Stage, process_group: i64) -> libuser::Result<i64> {
     let mut argv = [core::ptr::null(); MAX_ARGUMENTS + 1];
     for (index, slot) in argv.iter_mut().enumerate().take(stage.argument_count()) {
         *slot = parsed.pointer(stage.argument(index).expect("argument index checked"));
@@ -612,7 +607,12 @@ fn spawn_stage(parsed: &ParsedLine, stage: &Stage) -> libuser::Result<i64> {
     let command = parsed.bytes(stage.argument(0).expect("stage command exists"));
     let mut path = [0u8; 128];
     let path_length = command_path(command, &mut path)?;
-    libuser::syscall::spawn(&path[..path_length], argv.as_ptr(), core::ptr::null())
+    libuser::syscall::spawn_in_process_group(
+        &path[..path_length],
+        argv.as_ptr(),
+        core::ptr::null(),
+        process_group,
+    )
 }
 
 fn command_path(command: &[u8], path: &mut [u8]) -> libuser::Result<usize> {

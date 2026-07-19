@@ -483,7 +483,8 @@ pub fn sys_write(ctx: &SyscallContext) -> i64 {
 
 /// `open(path, flags, mode)` — open a file.
 ///
-/// Arguments: `args[0]` = path pointer, `args[1]` = flags, `args[2]` = mode.
+/// Arguments: `args[0]` = path pointer, `args[1]` = path length, `args[2]` =
+/// flags, `args[3]` = mode.
 ///
 /// Returns a non-negative file descriptor on success, or `-errno` on failure.
 /// Copies and validates the bounded UTF-8 path before delegating to
@@ -783,10 +784,9 @@ pub fn sys_nanosleep(ctx: &SyscallContext) -> i64 {
     let deadline = Instant::now() + dur;
     sched::sleep_until(deadline);
 
-    // We do not currently interrupt sleeps, so the remaining-time pointer
-    // (`rem`) is left untouched. A future signal-delivery path that
-    // interrupts `nanosleep` with `-EINTR` will write the unslept duration
-    // here.
+    // The current sleep queue is not signal-interruptible, so the
+    // remaining-time pointer (`rem`) is left untouched. Making this wait
+    // interruptible will also require writing the unslept duration here.
     let _ = rem_ptr;
     0
 }
@@ -796,8 +796,8 @@ pub fn sys_nanosleep(ctx: &SyscallContext) -> i64 {
 /// Arguments: none.
 ///
 /// Returns the child's pid in the parent, `0` in the child, or `-errno` on
-/// failure. The child receives an eager, isolated copy of every 4 KiB user
-/// mapping, inherited descriptors/signal dispositions, and the exact saved
+/// failure. The child receives copy-on-write user mappings with refcounted
+/// frames, inherited descriptors/signal dispositions, and the exact saved
 /// userspace register image with RAX changed to zero.
 pub fn sys_fork(ctx: &SyscallContext) -> i64 {
     match crate::user::process::fork(ctx.fork_return_context()) {
@@ -1763,18 +1763,31 @@ fn spawn_from_user(
     path_pointer: u64,
     path_length: usize,
     argv: u64,
+    group: crate::user::process::SpawnGroup,
 ) -> Result<crate::user::ProcessId, Errno> {
     let (path, owned_arguments) = process_request_from_user(path_pointer, path_length, argv)?;
     let arguments: Vec<&str> = owned_arguments.iter().map(String::as_str).collect();
-    crate::user::process::spawn(&path, &arguments).map_err(|error| {
+    crate::user::process::spawn_in_group(&path, &arguments, group).map_err(|error| {
         ::log::warn!("spawn {} failed: {}", path, error);
         process_errno(error)
     })
 }
 
 /// Spawn a child process without duplicating the caller's address space.
+///
+/// Argument 5 atomically selects process-group placement before the child can
+/// run: zero inherits, `u64::MAX` creates a child-led group, and any other
+/// value joins that same-session group. This closes the short-lived pipeline
+/// race inherent in a separate parent-side `setpgid` call.
 pub fn sys_spawn(ctx: &SyscallContext) -> i64 {
-    match spawn_from_user(ctx.arg(0), ctx.arg(1) as usize, ctx.arg(2)) {
+    let group = match ctx.arg(4) {
+        xenith_abi::SPAWN_GROUP_INHERIT => crate::user::process::SpawnGroup::Inherit,
+        xenith_abi::SPAWN_GROUP_NEW => crate::user::process::SpawnGroup::New,
+        process_group => {
+            crate::user::process::SpawnGroup::Join(crate::user::ProcessId(process_group))
+        },
+    };
+    match spawn_from_user(ctx.arg(0), ctx.arg(1) as usize, ctx.arg(2), group) {
         Ok(pid) => pid.as_u64() as i64,
         Err(error) => error.as_ret(),
     }
@@ -2156,6 +2169,14 @@ pub fn sys_net_info(ctx: &SyscallContext) -> i64 {
 #[cfg(test)]
 mod user_range_tests {
     use super::*;
+
+    #[test]
+    fn realtime_signal_queue_exhaustion_maps_to_eagain() {
+        assert_eq!(
+            process_errno(crate::user::ProcessError::SignalQueueFull),
+            Errno::Eagain
+        );
+    }
 
     #[test]
     fn inclusive_user_limit_accepts_its_final_byte() {

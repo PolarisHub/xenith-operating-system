@@ -371,9 +371,9 @@ impl SyscallContext {
 ///
 /// A handler receives the saved [`SyscallContext`] (read-only) and returns an
 /// `i64`: non-negative on success, `-errno` on failure (see [`Errno::as_ret`]).
-/// The handler must not block in a scheduler-aware way until the scheduler
-/// phase lands; for now the only "blocking" syscall that does real work is
-/// [`handlers::sys_nanosleep`], which busy-waits on the monotonic clock.
+/// Handlers may block through scheduler-aware subsystem operations; for
+/// example, [`handlers::sys_nanosleep`] parks the current task on the sleep
+/// queue instead of busy-waiting.
 pub type SyscallFn = fn(&SyscallContext) -> i64;
 
 // ---------------------------------------------------------------------------

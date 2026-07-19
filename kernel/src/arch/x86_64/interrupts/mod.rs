@@ -9,7 +9,7 @@
 //!   interrupts/
 //!     exceptions.rs  — ExceptionContext + per-vector Rust handlers + dispatch
 //!     handlers.rs    — dump_and_panic: shared terminal policy
-//!     apic.rs        — per-CPU x2APIC setup, timer, EOI, and IPI delivery
+//!     apic.rs        — per-CPU x2APIC/xAPIC setup, timer, EOI, and IPIs
 //!     ioapic.rs      — ACPI discovery and device-IRQ redirection
 //!     pic.rs         — legacy 8259 remap and quiescing
 //! ```
@@ -26,8 +26,8 @@
 //! 1. Installs the 32 CPU-exception gates into the static IDT
 //!    ([`super::idt::install_exception_handlers`]).
 //! 2. Loads the IDT into the CPU ([`super::idt::load`]).
-//! 3. Remaps and masks the legacy PIC, enables the local x2APIC, and discovers
-//!    and masks the I/O APIC redirection tables.
+//! 3. Remaps and masks the legacy PIC, enables x2APIC or its xAPIC fallback,
+//!    and discovers and masks the I/O APIC redirection tables.
 //!
 //! After controller initialization, exceptions and installed IRQ vectors have
 //! live dispatch paths. Device routes remain masked until their drivers claim

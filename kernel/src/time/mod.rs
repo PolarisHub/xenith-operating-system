@@ -25,8 +25,8 @@
 //! * [`hpet`] — the High Precision Event Timer. When present, its 64-bit
 //!   free-running main counter is the preferred monotonic clocksource (it
 //!   never wraps in practice and runs at a higher frequency than the LAPIC
-//!   accumulator). Brought up by a parallel phase; [`init`] prefers it when
-//!   available and falls back to the LAPIC clocksource otherwise.
+//!   accumulator). [`init`] brings it up when present and falls back to the
+//!   LAPIC clocksource otherwise.
 //!
 //! # Boot-time wiring
 //!

@@ -23,9 +23,9 @@
 //!   a kernel stack, a user stack, and the bookkeeping the scheduler needs to
 //!   suspend and resume it.
 //! * [`signal`] — signal (POSIX-style asynchronous notification) delivery and
-//!   disposition. When a signal is pending for a process the kernel arranges
-//!   to run the handler in ring 3 by patching the user's `IRETQ` frame on the
-//!   next entry to the kernel. (Stub until the signal phase.)
+//!   disposition. Pending signals are selected under an IRQ-safe lock and the
+//!   syscall return path builds a checked ring-3 handler frame plus the saved
+//!   integer and xstate context restored by `sigreturn`.
 //!
 //! # Layering
 //!
@@ -37,8 +37,8 @@
 //! * [`crate::mm::r#virtual`] for [`AddressSpace`](crate::mm::r#virtual::AddressSpace),
 //!   the user page-table root whose physical address [`ring3::jump_to_user`]
 //!   writes into CR3.
-//! * [`crate::sched`] (future) for the scheduler that decides *when* a given
-//!   process gets to run; `user` only provides the *how*.
+//! * [`crate::sched`] for the per-CPU scheduler that decides *when* a given
+//!   process runs; `user` provides the process image and return context.
 //!
 //! # Safety posture
 //!

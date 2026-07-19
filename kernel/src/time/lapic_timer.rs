@@ -14,8 +14,8 @@
 //!
 //! * **xAPIC** (legacy): the LAPIC's 4 KiB register window is memory-mapped at
 //!   a physical base reported by the MSR (default `0xFEE0_0000`). Registers
-//!   are 32-bit and sit on a 16-byte stride. We reach them through the Limine
-//!   HHDM direct map: `virt = HHDM_BASE + phys_base + offset`.
+//!   are 32-bit and sit on a 16-byte stride. We translate the physical page
+//!   through the bootloader-provided HHDM before issuing volatile accesses.
 //! * **x2APIC** (modern): the same registers are remapped to the MSR space at
 //!   `0x800 + (offset >> 4)`, accessed with `rdmsr`/`wrmsr`. The data width
 //!   widens to 64 bits and there is no MMIO window to map. x2APIC is
@@ -85,6 +85,8 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
+use xenith_types::PhysAddr;
+
 use super::clock::ClockSource;
 use crate::arch::x86_64::cpu::has_x2apic;
 use crate::arch::x86_64::instructions::{rdmsr, wrmsr};
@@ -94,12 +96,6 @@ use crate::arch::x86_64::msr::IA32_LAPIC_BASE;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// The Limine higher-half direct-map base. Adding a physical address to this
-/// yields the canonical virtual address that dereferences to that physical
-/// byte. Mirrors the constant in `arch::x86_64::interrupts::ioapic`; a shared
-/// `mm::phys_to_virt` will consolidate both call sites.
-const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
-
 // LAPIC register offsets (xAPIC MMIO byte offsets; x2APIC MSR index is
 // `0x800 + (offset >> 4)`). These are stable across every x86_64 part.
 /// Spurious Interrupt Vector Register. Bit 8 is the APIC software-enable.
@@ -107,7 +103,7 @@ const REG_SVR: u16 = 0x0F0;
 /// End-of-Interrupt register. A write of any value acknowledges the current
 /// interrupt; the LAPIC drops the IRR bit and allows further interrupts.
 const REG_EOI: u16 = 0x0B0;
-/// LVT Timer register. Vector in bits 0..7, mask in bit 17, mode in 18..19.
+/// LVT Timer register. Vector in bits 0..7, mask in bit 16, mode in 17..18.
 const REG_LVT_TIMER: u16 = 0x320;
 /// Timer Initial Count Register. Writing it (re)arms the timer.
 const REG_TICR: u16 = 0x380;
@@ -127,9 +123,8 @@ const APIC_BASE_ENABLE: u64 = 1 << 11;
 /// register interface from MMIO to MSRs and disables MMIO access.
 const APIC_BASE_X2APIC: u64 = 1 << 10;
 
-/// Mask of the LAPIC MMIO physical base in IA32_APIC_BASE (bits 12..=31; the
-/// base is always page-aligned and within the low 4 GiB on every PC).
-const APIC_BASE_PHYS_MASK: u64 = 0xFFFF_F000;
+/// Mask of the LAPIC MMIO physical base in IA32_APIC_BASE (bits 12..=35).
+const APIC_BASE_PHYS_MASK: u64 = 0x0000_000F_FFFF_F000;
 
 /// LVT Timer mask bit (bit 16). Set blocks timer-interrupt delivery.
 const LVT_MASK: u64 = 1 << 16;
@@ -183,8 +178,8 @@ const MAX_COUNT: u64 = 0xFFFF_FFFF;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
-    /// Legacy MMIO at `HHDM_BASE + apic_phys_base`, 32-bit registers on a
-    /// 16-byte stride.
+    /// Legacy MMIO translated through the active HHDM, with 32-bit registers
+    /// on a 16-byte stride.
     Xapic = 0,
     /// x2APIC MSR interface at `0x800 + (offset >> 4)`, 64-bit registers.
     X2apic = 1,
@@ -328,7 +323,6 @@ pub fn init() {
     // existing enable state. SAFETY: IA32_LAPIC_BASE is a valid MSR on every
     // x86_64 part; ring 0.
     let base_msr = unsafe { IA32_LAPIC_BASE.read() };
-    let phys_base = base_msr & APIC_BASE_PHYS_MASK;
 
     // Probe x2APIC once. CPUID is non-privileged; `has_x2apic` is a safe
     // wrapper that guards against parts without leaf 1.
@@ -337,13 +331,30 @@ pub fn init() {
     // Enable the APIC, selecting x2APIC if available. Setting bit 10 switches
     // the interface to MSRs and disables MMIO; we must do this before any
     // further access so the mode is consistent with what `write_reg` will use.
-    let mut new_msr = base_msr | APIC_BASE_ENABLE;
+    let mut new_msr = (base_msr | APIC_BASE_ENABLE) & !APIC_BASE_X2APIC;
     if x2 {
         new_msr |= APIC_BASE_X2APIC;
     }
     // SAFETY: enabling the APIC is a standard bring-up step; the MSR value
     // keeps the existing physical base and only sets the enable bits. Ring 0.
     unsafe { IA32_LAPIC_BASE.write(new_msr) };
+
+    // Refuse register access if the selected interface did not latch. The
+    // architectural LAPIC driver performs the same check earlier; retaining
+    // it here keeps this timer backend safe when initialized independently.
+    // SAFETY: same architectural MSR at CPL0.
+    let verify = unsafe { IA32_LAPIC_BASE.read() };
+    let expected_mode = if x2 { APIC_BASE_X2APIC } else { 0 };
+    if verify & APIC_BASE_ENABLE == 0 || verify & APIC_BASE_X2APIC != expected_mode {
+        LAPIC_READY.store(0, Ordering::Release);
+        ::log::error!(
+            "xenith.time.lapic: IA32_APIC_BASE refused {} enable (read back {:#x})",
+            if x2 { "x2APIC" } else { "xAPIC" },
+            verify
+        );
+        return;
+    }
+    let phys_base = verify & APIC_BASE_PHYS_MASK;
 
     if x2 {
         LAPIC_MODE.store(Mode::X2apic as u8, Ordering::Release);
@@ -352,8 +363,16 @@ pub fn init() {
         // "uninitialised". The value is never dereferenced in this mode.
         LAPIC_BASE_VIRT.store(0x1, Ordering::Release);
     } else {
+        if phys_base == 0 {
+            LAPIC_READY.store(0, Ordering::Release);
+            ::log::error!(
+                "xenith.time.lapic: invalid zero xAPIC base in IA32_APIC_BASE={:#x}",
+                verify
+            );
+            return;
+        }
         LAPIC_MODE.store(Mode::Xapic as u8, Ordering::Release);
-        let virt = HHDM_BASE + phys_base;
+        let virt = crate::mm::phys_to_virt(PhysAddr::new_truncate(phys_base)).as_u64();
         LAPIC_BASE_VIRT.store(virt, Ordering::Release);
     }
 
@@ -377,7 +396,7 @@ pub fn init() {
     write_reg(REG_TICR, 0);
 
     ::log::info!(
-        "xenith.time.lapic: APIC {} at phys 0x{:08x}, timer ready (masked)",
+        "xenith.time.lapic: APIC {} at phys {:#x}, timer ready (masked)",
         if x2 { "x2APIC" } else { "xAPIC" },
         phys_base,
     );

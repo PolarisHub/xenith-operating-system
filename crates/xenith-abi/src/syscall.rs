@@ -64,6 +64,13 @@ pub enum SyscallNumber {
     Sigaltstack = 53,
 }
 
+/// `spawn` argument 5: inherit the caller's process group.
+pub const SPAWN_GROUP_INHERIT: u64 = 0;
+
+/// `spawn` argument 5: create a process group led by the new child.
+/// Any other nonzero value requests an existing process group by id.
+pub const SPAWN_GROUP_NEW: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
 pub enum Errno {

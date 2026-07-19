@@ -36,9 +36,8 @@
 //! The saved RFLAGS is meaningful only on the CPU that captured it: it
 //! describes *that* core's interrupt-enable state at acquire time. A guard
 //! must therefore be dropped on the same CPU that created it. The guard is
-//! `!Send` to make that a compile-time guarantee; on a single-CPU bring-up
-//! kernel this is trivially satisfied, and once SMP lands the scheduler must
-//! not migrate a task that holds an IRQ guard.
+//! `!Send` to make that a compile-time guarantee, and the SMP scheduler does
+//! not migrate execution while a non-sendable guard remains live.
 //!
 //! # Arch dependency
 //!

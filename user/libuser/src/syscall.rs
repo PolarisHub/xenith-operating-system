@@ -327,12 +327,41 @@ pub fn clock_gettime() -> Result<Timespec> {
 }
 
 pub fn spawn(path: &[u8], argv: *const *const u8, envp: *const *const u8) -> Result<i64> {
+    spawn_with_group_argument(path, argv, envp, xenith_abi::SPAWN_GROUP_INHERIT as usize)
+}
+
+/// Spawn with process-group placement completed before the child is runnable.
+/// A zero group creates a new group led by the child; a positive value joins
+/// an existing group in the caller's session.
+pub fn spawn_in_process_group(
+    path: &[u8],
+    argv: *const *const u8,
+    envp: *const *const u8,
+    process_group: i64,
+) -> Result<i64> {
+    if process_group < 0 {
+        return Err(Error(xenith_abi::Errno::Einval as i32));
+    }
+    let group = if process_group == 0 {
+        xenith_abi::SPAWN_GROUP_NEW
+    } else {
+        process_group as u64
+    };
+    spawn_with_group_argument(path, argv, envp, group as usize)
+}
+
+fn spawn_with_group_argument(
+    path: &[u8],
+    argv: *const *const u8,
+    envp: *const *const u8,
+    group: usize,
+) -> Result<i64> {
     call(SyscallNumber::Spawn, [
         path.as_ptr() as usize,
         path.len(),
         argv as usize,
         envp as usize,
-        0,
+        group,
         0,
     ])
     .map(|pid| pid as i64)

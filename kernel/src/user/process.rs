@@ -99,6 +99,20 @@ impl fmt::Display for ProcessId {
 /// Conventional short name used by syscall and init code.
 pub type Pid = ProcessId;
 
+/// Atomic process-group placement requested while spawning a child.
+///
+/// Placement happens before the scheduler can run the new task, avoiding the
+/// parent-side `spawn`/`setpgid` race for short-lived pipeline stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpawnGroup {
+    /// Inherit the caller's process group.
+    Inherit,
+    /// Create a new process group led by the child.
+    New,
+    /// Join an existing process group in the caller's session.
+    Join(ProcessId),
+}
+
 /// All resources owned by one user process.
 pub struct UserProcess {
     pub pid: ProcessId,
@@ -137,6 +151,11 @@ pub struct UserProcess {
     /// through their ELF entry point and leave this as `None`.
     fork_resume: Option<ring3::UserContext>,
 }
+
+// Process records are moved through fixed-size kernel-stack locals during
+// spawn/fork/exec. Keep their inline footprint small; bounded signal payload
+// storage and other large tables must remain out of line.
+const _: () = assert!(core::mem::size_of::<UserProcess>() <= 1024);
 
 impl UserProcess {
     #[inline]
@@ -245,6 +264,15 @@ static PROCESS_TABLE: SpinLockIRQ<Vec<UserProcess>> = SpinLockIRQ::new(Vec::new(
 /// Spawn `path` with `argv`, returning once the process is installed on the
 /// scheduler run queue.  An empty `argv` is normalised to `[path]`.
 pub fn spawn(path: &str, argv: &[&str]) -> Result<ProcessId, ProcessError> {
+    spawn_in_group(path, argv, SpawnGroup::Inherit)
+}
+
+/// Spawn a child with process-group placement completed before publication.
+pub fn spawn_in_group(
+    path: &str,
+    argv: &[&str],
+    group: SpawnGroup,
+) -> Result<ProcessId, ProcessError> {
     if path.is_empty() || !path.starts_with('/') || path.as_bytes().contains(&0) {
         return Err(ProcessError::InvalidPath);
     }
@@ -256,20 +284,33 @@ pub fn spawn(path: &str, argv: &[&str]) -> Result<ProcessId, ProcessError> {
     let pid = allocate_pid()?;
     let parent = try_current_pid();
     let (fd_table, process_group, session) = if let Some(parent_pid) = parent {
-        PROCESS_TABLE
-            .lock()
+        let table = PROCESS_TABLE.lock();
+        let parent = table
             .iter()
             .find(|process| process.pid == parent_pid)
-            .map(|process| {
-                (
-                    process.fd_table.clone(),
-                    process.process_group,
-                    process.session,
-                )
-            })
-            .ok_or(ProcessError::NoCurrentProcess)?
+            .ok_or(ProcessError::NoCurrentProcess)?;
+        let session = parent.session;
+        let process_group = match group {
+            SpawnGroup::Inherit => parent.process_group,
+            SpawnGroup::New => pid,
+            SpawnGroup::Join(requested) => {
+                if requested.is_kernel()
+                    || !table.iter().any(|process| {
+                        process.process_group == requested && process.session == session
+                    })
+                {
+                    return Err(ProcessError::NoSuchProcess(requested));
+                }
+                requested
+            },
+        };
+        (parent.fd_table.clone(), process_group, session)
     } else {
-        (FdTable::new_process(), pid, pid)
+        let process_group = match group {
+            SpawnGroup::Inherit | SpawnGroup::New => pid,
+            SpawnGroup::Join(requested) => return Err(ProcessError::NoSuchProcess(requested)),
+        };
+        (FdTable::new_process(), process_group, pid)
     };
     let mut process_path = String::new();
     process_path
@@ -285,6 +326,7 @@ pub fn spawn(path: &str, argv: &[&str]) -> Result<ProcessId, ProcessError> {
     children
         .try_reserve(1)
         .map_err(|_| ProcessError::OutOfMemory)?;
+    let signals = SignalState::try_new().map_err(|_| ProcessError::OutOfMemory)?;
 
     let mut space = AddressSpace::new_empty().map_err(ProcessError::AddressSpace)?;
     let loaded = match elf::load_image(&image, &mut space) {
@@ -318,7 +360,7 @@ pub fn spawn(path: &str, argv: &[&str]) -> Result<ProcessId, ProcessError> {
         parent,
         children,
         exit_status: ExitStatus::Pending,
-        signals: SignalState::new(),
+        signals,
         stopped: false,
         wait_change: None,
         termination_signal: None,
@@ -377,6 +419,7 @@ pub fn spawn(path: &str, argv: &[&str]) -> Result<ProcessId, ProcessError> {
 pub fn fork(context: ring3::UserContext) -> Result<ProcessId, ProcessError> {
     let parent_pid = try_current_pid().ok_or(ProcessError::NoCurrentProcess)?;
     let pid = allocate_pid()?;
+    let child_signals = SignalState::try_new().map_err(|_| ProcessError::OutOfMemory)?;
 
     // Snapshot all inherited process resources while the table is stable.
     // Heap-backed metadata uses fallible reservation so OOM is reported to
@@ -416,12 +459,13 @@ pub fn fork(context: ring3::UserContext) -> Result<ProcessId, ProcessError> {
             .try_reserve_exact(parent.vm_regions.len())
             .map_err(|_| ProcessError::OutOfMemory)?;
         regions.extend_from_slice(&parent.vm_regions);
+        parent.signals.copy_for_fork_into(&child_signals);
         (
             parent.address_space,
             pages,
             path,
             parent.fd_table.clone(),
-            parent.signals.clone_for_fork(),
+            child_signals,
             parent.process_group,
             parent.session,
             parent.entry,
@@ -537,6 +581,10 @@ pub fn exec(path: &str, argv: &[&str]) -> Result<(), ProcessError> {
         }
     }
     validate_arguments(argv)?;
+    // Reserve every signal table before allocating an address space. The
+    // commit below only copies into this backing while holding PROCESS_TABLE,
+    // so it cannot fail or lose a signal delivered during exec.
+    let replacement_signals = SignalState::try_new().map_err(|_| ProcessError::OutOfMemory)?;
     let image = read_executable(path)?;
     let mut process_path = String::new();
     process_path
@@ -589,7 +637,8 @@ pub fn exec(path: &str, argv: &[&str]) -> Result<(), ProcessError> {
         process.mmap_hint = MMAP_BASE;
         process.fork_resume = None;
         process.fd_table.close_on_exec();
-        process.signals = process.signals.clone_for_exec();
+        process.signals.copy_for_exec_into(&replacement_signals);
+        process.signals = replacement_signals;
 
         // SAFETY: interrupts are disabled and `node` is this CPU's current,
         // scheduler-owned task. No other CPU can mutate its address-space or
@@ -921,6 +970,10 @@ pub fn signal_with_info(
 }
 
 /// Deliver a signal to every live member of a process group.
+///
+/// Real-time delivery is best-effort across members: the returned count is
+/// the number that accepted the signal. If members exist but every queue is
+/// full, [`ProcessError::SignalQueueFull`] is returned.
 pub fn signal_group(process_group: ProcessId, signal: Signal) -> Result<usize, ProcessError> {
     signal_group_inner(process_group, signal, None)
 }
@@ -1686,7 +1739,7 @@ impl fmt::Display for ProcessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPath => f.write_str("invalid executable path"),
-            Self::InvalidArgument => f.write_str("argument contains a NUL byte"),
+            Self::InvalidArgument => f.write_str("invalid process argument"),
             Self::TooManyArguments => f.write_str("too many process arguments"),
             Self::ArgumentListTooLong => f.write_str("process argument list is too long"),
             Self::ImageTooLarge => f.write_str("executable image is too large"),
@@ -1710,7 +1763,30 @@ impl fmt::Display for ProcessError {
 
 #[cfg(test)]
 mod job_control_tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn user_process_inline_record_fits_the_kernel_stack_budget() {
+        assert!(core::mem::size_of::<UserProcess>() <= 1024);
+        std::eprintln!(
+            "UserProcess inline bytes={}",
+            core::mem::size_of::<UserProcess>()
+        );
+    }
+
+    #[test]
+    fn realtime_queue_full_is_a_process_delivery_error() {
+        assert_eq!(
+            delivery_result(DeliverOutcome::RealtimeQueueFull { capacity: 128 }),
+            Err(ProcessError::SignalQueueFull)
+        );
+        assert_eq!(
+            delivery_result(DeliverOutcome::RealtimeQueued { count: 1 }),
+            Ok(DeliverOutcome::RealtimeQueued { count: 1 })
+        );
+    }
 
     #[test]
     fn wait_selectors_distinguish_pid_current_and_explicit_groups() {

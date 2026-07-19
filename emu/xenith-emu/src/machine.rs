@@ -31,6 +31,7 @@ const FRAMEBUFFER_INFO_PHYS: u64 = 0x0040_4000;
 const FRAMEBUFFER_POINTER_PHYS: u64 = 0x0040_5000;
 const FIRST_PAYLOAD_PHYS: u64 = 0x0100_0000;
 const KERNEL_STACK_TOP: u64 = 0xFFFF_FF7F_FFFF_F000;
+const KERNEL_ENTRY_STACK: u64 = KERNEL_STACK_TOP - 8;
 const KERNEL_STACK_PAGES: u64 = 32;
 const IOAPIC_PHYS: u64 = 0xFEC0_0000;
 const HPET_PHYS: u64 = 0xFED0_0000;
@@ -517,7 +518,7 @@ impl Machine {
         self.cpu.state.rip = image.entry();
         self.cpu
             .state
-            .set_register(Register::Rsp, KERNEL_STACK_TOP - 16);
+            .set_register(Register::Rsp, KERNEL_ENTRY_STACK);
         self.cpu
             .state
             .set_register(Register::Rdi, HHDM_BASE + BOOT_INFO_PHYS);
@@ -1236,6 +1237,53 @@ fn write_slice<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_kernel_elf(entry: u64) -> Vec<u8> {
+        const ELF_HEADER_SIZE: usize = 64;
+        const PROGRAM_HEADER_SIZE: usize = 56;
+        const PAYLOAD_OFFSET: usize = 128;
+        let mut elf = vec![0_u8; PAYLOAD_OFFSET + 1];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&entry.to_le_bytes());
+        elf[32..40].copy_from_slice(&(ELF_HEADER_SIZE as u64).to_le_bytes());
+        elf[52..54].copy_from_slice(&(ELF_HEADER_SIZE as u16).to_le_bytes());
+        elf[54..56].copy_from_slice(&(PROGRAM_HEADER_SIZE as u16).to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        let header = ELF_HEADER_SIZE;
+        elf[header..header + 4].copy_from_slice(&ProgramHeader::LOAD.to_le_bytes());
+        elf[header + 4..header + 8]
+            .copy_from_slice(&(ProgramHeader::READ | ProgramHeader::EXECUTE).to_le_bytes());
+        elf[header + 8..header + 16].copy_from_slice(&(PAYLOAD_OFFSET as u64).to_le_bytes());
+        elf[header + 16..header + 24].copy_from_slice(&entry.to_le_bytes());
+        elf[header + 32..header + 40].copy_from_slice(&1_u64.to_le_bytes());
+        elf[header + 40..header + 48].copy_from_slice(&1_u64.to_le_bytes());
+        elf[header + 48..header + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+        elf[PAYLOAD_OFFSET] = 0xf4;
+        elf
+    }
+
+    #[test]
+    fn direct_kernel_handoff_uses_sysv_function_entry_stack_alignment() {
+        let entry = 0xffff_ffff_8020_0000;
+        let mut machine = Machine::new(MachineConfig {
+            memory_bytes: 32 * 1024 * 1024,
+            mirror_serial: false,
+            ..MachineConfig::default()
+        });
+        machine
+            .load_kernel(&minimal_kernel_elf(entry), None)
+            .unwrap();
+        let rsp = machine.cpu.state.register(Register::Rsp);
+        assert_eq!(rsp, KERNEL_ENTRY_STACK);
+        assert_eq!(rsp & 0xf, 8);
+        assert_eq!(machine.cpu.state.rip, entry);
+    }
 
     #[test]
     fn flat_program_writes_serial() {

@@ -343,7 +343,7 @@ fn install_initial_page_tables(bus: &mut MemoryBus) -> Result<(), UefiError> {
     bus.write_u64_physical(INITIAL_PML4 + 256 * 8, INITIAL_PDPT | 3)?;
     bus.write_u64_physical(INITIAL_PDPT, INITIAL_PD | 3)?;
     for index in 0..512_u64 {
-        bus.write_u64_physical(INITIAL_PD + index * 8, index * 0x20_0000 | 0x83)?;
+        bus.write_u64_physical(INITIAL_PD + index * 8, (index * 0x20_0000) | 0x83)?;
     }
     Ok(())
 }

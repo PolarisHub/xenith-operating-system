@@ -22,7 +22,7 @@ receive `(signo, frame *)`. `SA_ONSTACK` selects the alternate stack unless it
 is already active. `SA_RESTART` is deliberately limited to a zero-progress
 `read` that returned `EINTR`; no other syscall is replayed.
 
-Path-taking calls pass `(pointer, byte_length)` and do not require a trailing NUL. `read_dir` writes fixed `DirectoryEntry` records with a bounded 256-byte name. `spawn` and `exec` accept a NUL-terminated pointer vector with at most 32 arguments and 255 bytes per argument.
+Path-taking calls pass `(pointer, byte_length)` and do not require a trailing NUL. `read_dir` writes fixed `DirectoryEntry` records with a bounded 256-byte name. `spawn` and `exec` accept a NUL-terminated pointer vector with at most 32 arguments and 255 bytes per argument. `spawn` argument 5 controls atomic process-group placement before the child becomes runnable: zero inherits, `u64::MAX` creates a child-led group, and any other nonzero value joins that same-session group. The ordinary `libuser::spawn` wrapper inherits; the shell uses `spawn_in_process_group` so short-lived pipeline stages cannot race a later `setpgid`.
 
 `brk(0)` queries a per-process, ELF-derived break; growth allocates zeroed
 read/write/non-executable pages and shrink releases complete trailing pages.

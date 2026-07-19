@@ -99,7 +99,7 @@ pub enum SyscallNumber {
     ReadDir = 26,
     /// `clock_gettime(out)` — read Xenith wall time.
     ClockGettime = 27,
-    /// `spawn(path, argv, envp)` — create a child from an ELF image.
+    /// `spawn(path, argv, envp, _, group)` — create and atomically group a child.
     Spawn = 28,
     Socket = 29,
     Bind = 30,

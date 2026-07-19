@@ -195,7 +195,7 @@ pub fn is_online(cpu: usize) -> bool {
     cpu < MAX_CPUS && online_mask() & (1u64 << cpu) != 0
 }
 
-/// Resolve a compact logical CPU id to its physical x2APIC destination id.
+/// Resolve a compact logical CPU id to its physical APIC destination id.
 #[must_use]
 pub fn cpu_apic_id(cpu: usize) -> Option<u32> {
     if cpu >= MAX_CPUS || PRESENT_CPUS.load(Ordering::Acquire) & (1u64 << cpu) == 0 {
@@ -305,11 +305,11 @@ pub fn init() {
     // BSP-only; they are also required before the first AP enables IF.
     idt::install_ipi_handlers(RESCHEDULE_VECTOR, TLB_SHOOTDOWN_VECTOR);
 
-    if !LAPIC.is_x2apic() {
+    if !LAPIC.is_enabled() {
         PRESENT_CPUS.store(1, Ordering::Release);
         ONLINE_CPUS.store(1, Ordering::Release);
         SMP_READY.store(true, Ordering::Release);
-        ::log::warn!("xenith.smp: x2APIC unavailable; continuing BSP-only");
+        ::log::warn!("xenith.smp: local APIC unavailable; continuing BSP-only");
         return;
     }
 
@@ -337,6 +337,14 @@ pub fn init() {
         .filter(|entry| entry.enabled)
     {
         if entry.apic_id == bsp_apic_id || cpu_for_apic_id(entry.apic_id).is_some() {
+            continue;
+        }
+        if !LAPIC.can_route_apic_id(entry.apic_id) {
+            ::log::warn!(
+                "xenith.smp: APIC id {} is not routable in {:?}; CPU ignored",
+                entry.apic_id,
+                LAPIC.mode()
+            );
             continue;
         }
         if next_cpu == MAX_CPUS {
@@ -377,16 +385,20 @@ pub fn init() {
             waited += 1;
         }
         if is_online(cpu) {
+            let apic_mode = if LAPIC.is_x2apic() { "x2APIC" } else { "xAPIC" };
             ::log::info!(
-                "xenith.smp: CPU {} online (x2APIC {}, startup page {:#04x})",
+                "xenith.smp: CPU {} online ({} {}, startup page {:#04x})",
                 cpu,
+                apic_mode,
                 entry.apic_id,
                 start_page
             );
         } else {
+            let apic_mode = if LAPIC.is_x2apic() { "x2APIC" } else { "xAPIC" };
             ::log::warn!(
-                "xenith.smp: CPU {} (x2APIC {}) did not acknowledge startup in {} ms",
+                "xenith.smp: CPU {} ({} {}) did not acknowledge startup in {} ms",
                 cpu,
+                apic_mode,
                 entry.apic_id,
                 AP_START_TIMEOUT_MS
             );
@@ -426,7 +438,7 @@ pub extern "C" fn xenith_ap_entry(cpu_id: u32, expected_apic_id: u32) -> ! {
     let actual_apic_id = apic::current_id();
     if actual_apic_id != expected_apic_id {
         ::log::error!(
-            "xenith.smp: CPU {} expected x2APIC {}, hardware reports {}",
+            "xenith.smp: CPU {} expected APIC {}, hardware reports {}",
             cpu,
             expected_apic_id,
             actual_apic_id

@@ -460,17 +460,16 @@ pub fn virt_to_phys(virt: VirtAddr) -> Option<PhysAddr> {
 }
 
 // ---------------------------------------------------------------------------
-// Frame allocator stub
+// Frame allocator bridge
 // ---------------------------------------------------------------------------
 
 /// The contract the page-table code needs from the physical frame allocator.
 ///
-/// This is a thin local trait rather than a reference to the real
-/// `mm::frame_alloc` module because that module lands in a parallel phase.
-/// When it does, the global pointer registered by `mm::init` will implement
-/// this trait and [`alloc_frame`] / [`free_frame`] will delegate to it. The
-/// trait is kept minimal — just "give me a 4 KiB frame" and "take this one
-/// back" — because that is all the paging code ever asks for.
+/// This thin local trait keeps page-table ownership independent of the
+/// concrete physical allocator. `mm::init` registers the live adapter once the
+/// bitmap/buddy allocator is ready, and [`alloc_frame`] / [`free_frame`]
+/// delegate through it. The contract stays minimal: one 4 KiB frame in or out,
+/// because that is all the paging code requires.
 pub trait FrameAllocator: Send + Sync {
     /// Return one unused 4 KiB physical frame, or `None` if the allocator is
     /// exhausted. The returned frame is zeroed by the caller as needed.

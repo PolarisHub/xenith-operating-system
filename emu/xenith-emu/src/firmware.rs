@@ -37,6 +37,7 @@ const PAGE_PD1: u64 = 0x4000;
 const PAGE_PD3: u64 = 0x6000;
 const PAGE_PDPT_HIGH: u64 = 0x7000;
 const STACK_TOP: u64 = 0x0004_f000;
+const KERNEL_ENTRY_STACK: u64 = STACK_TOP - 8;
 const KERNEL_STAGING_ADDRESS: u64 = 0x0200_0000;
 const KERNEL_STAGING_CAPACITY: u64 = 32 * 1024 * 1024;
 const INITRD_LOAD_ADDRESS: u64 = 0x0600_0000;
@@ -205,7 +206,10 @@ pub(crate) fn boot_bios_image(
 
     *cpu = Cpu::new();
     cpu.state.rip = entry;
-    cpu.state.set_register(Register::Rsp, STACK_TOP);
+    // The real stage2 calls the `extern "sysv64"` kernel entry. Preserve the
+    // ABI-visible post-call stack shape even though this bounded semantic
+    // handoff does not execute the final Rust indirect call itself.
+    cpu.state.set_register(Register::Rsp, KERNEL_ENTRY_STACK);
     cpu.state.set_register(Register::Rbp, 0);
     cpu.state.set_register(Register::Rdi, handoff);
     cpu.state.cr3 = PAGE_PML4;

@@ -668,6 +668,22 @@ mod tests {
         let (iso, layout) =
             build_iso_image_with_layout(&bios_disk, &bootx64, &kernel, &initrd, &config).unwrap();
 
+        let extracted = extract_el_torito_boot_images(&iso).unwrap();
+        assert_eq!(extracted.boot_catalog_lba, layout.boot_catalog_lba);
+        assert_eq!(extracted.bios_image_lba, layout.bios_boot_image_lba);
+        assert_eq!(extracted.efi_image_lba, layout.efi_boot_image_lba);
+        assert_eq!(
+            extracted.efi_load_sectors,
+            EFI_SYSTEM_PARTITION_SECTORS as u16
+        );
+        let expected_bios_disk = prepare_bios_boot_image(&bios_disk).unwrap();
+        assert_eq!(extracted.bios_disk, expected_bios_disk);
+        let files = crate::extract_efi_system_partition_files(extracted.efi_system_partition)
+            .expect("extract packaged UEFI payloads");
+        assert_eq!(files.bootx64, bootx64);
+        assert_eq!(files.kernel, kernel);
+        assert_eq!(files.initrd, initrd);
+
         assert_eq!(iso.len() % ISO_BLOCK_SIZE, 0);
         assert_eq!(iso.len() / ISO_BLOCK_SIZE, layout.total_blocks as usize);
         assert_eq!(layout.primary_volume_descriptor_lba, 16);

@@ -136,8 +136,8 @@ fn access_bytes(gas: &GenericAddress) -> u8 {
 
 /// The subset of the FADT the power sequencing path needs.
 ///
-/// Constructed once by the ACPI bring-up code (the FADT parser, landed by a
-/// parallel phase) and published with [`register_power_info`]. All fields are
+/// Constructed once by the ACPI bring-up code from the validated FADT and
+/// published with [`register_power_info`]. All fields are
 /// `Copy` so the struct can be stashed in a `spin::Once` and read lock-free
 /// from the shutdown path.
 #[derive(Copy, Clone, Debug)]

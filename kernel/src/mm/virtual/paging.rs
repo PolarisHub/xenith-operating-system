@@ -36,9 +36,9 @@
 //! not yet exist. They cannot invent physical frames out of thin air, so they
 //! take a [`FrameAllocator`] argument. The trait is deliberately minimal —
 //! "give me a 4 KiB frame" / "take this one back" — because that is the entire
-//! contract the walker needs. A real implementation lives in `mm::physical`;
-//! until that module lands, callers pass a concrete allocator (e.g. a stub that
-//! returns frames from a static reserved pool during early boot).
+//! contract the walker needs. The live bitmap/buddy implementation resides in
+//! `mm::physical`; focused tests may supply a bounded concrete allocator so
+//! table-walk behavior remains independently testable.
 //!
 //! # Safety
 //!

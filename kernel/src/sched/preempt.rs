@@ -73,8 +73,7 @@
 //!
 //! # Expected scheduler interface
 //!
-//! This module calls two functions in [`crate::sched::scheduler`], built in
-//! a parallel phase:
+//! This module calls two functions in [`crate::sched::scheduler`]:
 //!
 //! * `scheduler::tick()` — called once per LAPIC timer tick to update
 //!   scheduler state. Must be safe to call from the timer IRQ context
@@ -86,9 +85,8 @@
 //!   [`clear_need_resched`]) when it performs a switch, so a stale flag
 //!   cannot re-trigger a switch immediately on resume.
 //!
-//! If the scheduler exposes these under different names, only the two
-//! private wrappers at the bottom of this file need repointing; every other
-//! call site goes through them.
+//! Private wrappers at the bottom of this file keep those scheduler calls in
+//! one place so the IRQ and process-context invariants stay consistent.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 

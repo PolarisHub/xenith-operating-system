@@ -453,10 +453,10 @@ fn parse_hpet_address(hdr: &'static SdtHeader) -> Result<PhysAddr, AcpiError> {
 /// Publish the FADT's power-relevant subset to the shutdown subsystem.
 ///
 /// Translates the parsed [`Fadt`] into a [`FadtPowerInfo`] and registers it
-/// via [`super::shutdown::register_power_info`]. The `SLP_TYP` values for S5
-/// come from the `\_S5` AML object, which a full AML interpreter would
-/// evaluate; until that lands we use the QEMU/PIIX default of `0`, which is
-/// correct on the common development target and a benign no-op elsewhere.
+/// via [`super::shutdown::register_power_info`]. The bounded AML evaluator is
+/// not yet wired to publish `\_S5` package values into this record, so the
+/// QEMU/PIIX default of `0` remains an explicit fallback and a benign no-op on
+/// platforms that use another encoding.
 fn register_fadt_power(fadt: &'static Fadt) {
     let info = FadtPowerInfo {
         pm1a_evt: fadt.pm1a_evt_gas,

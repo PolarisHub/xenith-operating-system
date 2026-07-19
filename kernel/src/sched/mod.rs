@@ -9,11 +9,11 @@
 //!   sched/
 //!     context.rs   — `Context`: the saved-register image the asm switch reads
 //!     task.rs      — `Task`: the task control block (id, state, stack, prio)
-//!     thread.rs    — thread-vs-task distinctions (parallel phase)
+//!     thread.rs    — thread metadata layered over scheduler tasks
 //!     scheduler.rs — `Scheduler`: run queues, dispatch, spawn/exit/yield/sleep
-//!     fpu.rs       — FPU/SSE lazy-save wiring (parallel phase)
+//!     fpu.rs       — FPU/SSE/XSAVE lazy-save wiring
 //!     idle.rs      — per-CPU idle task and `sti;hlt` idle loop
-//!     kthread.rs   — kernel-thread spawn helpers (parallel phase)
+//!     kthread.rs   — kernel-thread spawn helpers
 //!     preempt.rs   — preemption counter, `need_resched`, the timer-tick path
 //! ```
 //!
