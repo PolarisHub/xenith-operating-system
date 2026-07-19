@@ -332,9 +332,10 @@ pub(in crate::devices::net) fn configure_intx(
     adapter_index: usize,
     irq_device: IrqDevice,
 ) -> bool {
-    let aml_gsi = crate::devices::pci::routing::resolve_intx(device).filter(|gsi| valid_nic_gsi(*gsi));
-    let Some(gsi) = aml_gsi
-        .or_else(|| fallback_intx_gsi(device.interrupt_line, device.interrupt_pin))
+    let aml_gsi =
+        crate::devices::pci::routing::resolve_intx(device).filter(|gsi| valid_nic_gsi(*gsi));
+    let Some(gsi) =
+        aml_gsi.or_else(|| fallback_intx_gsi(device.interrupt_line, device.interrupt_pin))
     else {
         return false;
     };
@@ -621,10 +622,7 @@ mod tests {
             fallback_intx_gsi(crate::devices::ps2::KEYBOARD_IRQ, 1),
             None
         );
-        assert_eq!(
-            fallback_intx_gsi(crate::devices::ps2::MOUSE_IRQ, 1),
-            None
-        );
+        assert_eq!(fallback_intx_gsi(crate::devices::ps2::MOUSE_IRQ, 1), None);
     }
 
     #[test]

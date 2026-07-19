@@ -437,11 +437,7 @@ impl<'a> Runner<'a> {
                 self.commit(b, 6);
             },
             0x83 if b[2] == 0xf9 => {
-                self.compare(
-                    u64::from(self.get32(ECX)),
-                    u64::from(b[3]),
-                    u32::MAX as u64,
-                );
+                self.compare(u64::from(self.get32(ECX)), u64::from(b[3]), u32::MAX as u64);
                 self.commit(b, 4);
             },
             0x83 if b[2] == 0xc8 => {
@@ -457,11 +453,7 @@ impl<'a> Runner<'a> {
             },
             0x3d => {
                 let rhs = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
-                self.compare(
-                    u64::from(self.get32(EAX)),
-                    u64::from(rhs),
-                    u32::MAX as u64,
-                );
+                self.compare(u64::from(self.get32(EAX)), u64::from(rhs), u32::MAX as u64);
                 self.commit(b, 6);
             },
             0xa1 => {
@@ -704,10 +696,10 @@ impl<'a> Runner<'a> {
                 let displacement = i64::from(i32::from_le_bytes([b[1], b[2], b[3], b[4]]));
                 let target = self.ip.wrapping_add(5).wrapping_add_signed(displacement);
                 self.commit(b, 5);
-                if self.get8(EDI) != BOOT_DRIVE
-                    || self.get32(ESI) != self.trace.e820_entries
-                {
-                    return Err(StageExecError::Bios("stage2_main arguments differ from BIOS state"));
+                if self.get8(EDI) != BOOT_DRIVE || self.get32(ESI) != self.trace.e820_entries {
+                    return Err(StageExecError::Bios(
+                        "stage2_main arguments differ from BIOS state",
+                    ));
                 }
                 self.trace.stage2_main_entry = target;
                 return Ok(true);
@@ -798,7 +790,14 @@ impl<'a> Runner<'a> {
         self.bus.write_physical(destination, &record.bytes())?;
         self.set32(EAX, 0x534d_4150);
         self.set32(ECX, 24);
-        self.set32(EBX, if index + 1 == records.len() { 0 } else { (index + 1) as u32 });
+        self.set32(
+            EBX,
+            if index + 1 == records.len() {
+                0
+            } else {
+                (index + 1) as u32
+            },
+        );
         self.trace.e820_entries = self.trace.e820_entries.max((index + 1) as u32);
         self.carry = false;
         Ok(())
@@ -844,8 +843,7 @@ impl<'a> Runner<'a> {
     }
 
     fn set_high8(&mut self, register: usize, value: u8) {
-        self.registers[register] =
-            (self.registers[register] & !0xff00) | (u64::from(value) << 8);
+        self.registers[register] = (self.registers[register] & !0xff00) | (u64::from(value) << 8);
     }
 
     fn get16(&self, register: usize) -> u16 {
@@ -955,13 +953,10 @@ mod tests {
         bus.write_physical(STAGE1_START, &[0x0f, 0x0b]).unwrap();
         let image = vec![0; 3 * SECTOR_SIZE];
         let error = execute_packaged_stages(&mut bus, &image).unwrap_err();
-        assert!(matches!(
-            error,
-            StageExecError::Unsupported {
-                stage: "stage1",
-                address: STAGE1_START,
-                ..
-            }
-        ));
+        assert!(matches!(error, StageExecError::Unsupported {
+            stage: "stage1",
+            address: STAGE1_START,
+            ..
+        }));
     }
 }

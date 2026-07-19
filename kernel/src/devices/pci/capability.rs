@@ -26,7 +26,7 @@ pub enum CapabilityError {
     InvalidBir(u8),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapabilityList {
     entries: [PciCapability; MAX_CAPABILITIES],
     len: usize,
@@ -70,7 +70,9 @@ pub fn walk(address: PciAddress) -> Result<CapabilityList, CapabilityError> {
         PciHeaderType::CardbusBridge => CARDBUS_CAP_POINTER,
         _ => TYPE0_CAP_POINTER,
     };
-    walk_from(address.read8(pointer_register), |offset| address.read8(offset))
+    walk_from(address.read8(pointer_register), |offset| {
+        address.read8(offset)
+    })
 }
 
 fn valid_pointer(pointer: u8) -> bool {
@@ -115,10 +117,7 @@ pub struct MsiCapability {
 }
 
 impl MsiCapability {
-    pub fn read(
-        address: PciAddress,
-        capability: PciCapability,
-    ) -> Result<Self, CapabilityError> {
+    pub fn read(address: PciAddress, capability: PciCapability) -> Result<Self, CapabilityError> {
         if capability.id != CAP_ID_MSI {
             return Err(CapabilityError::WrongCapability);
         }
@@ -207,10 +206,7 @@ pub struct MsixCapability {
 }
 
 impl MsixCapability {
-    pub fn read(
-        address: PciAddress,
-        capability: PciCapability,
-    ) -> Result<Self, CapabilityError> {
+    pub fn read(address: PciAddress, capability: PciCapability) -> Result<Self, CapabilityError> {
         if capability.id != CAP_ID_MSIX || capability.offset > 0xf4 {
             return Err(if capability.id == CAP_ID_MSIX {
                 CapabilityError::Truncated
@@ -298,8 +294,8 @@ mod tests {
 
     #[test]
     fn msix_metadata_validates_bars_and_masks_offsets() {
-        let decoded = MsixCapability::from_registers(0x70, (1 << 15) | 3, 0x1234_5002, 0x2001)
-            .unwrap();
+        let decoded =
+            MsixCapability::from_registers(0x70, (1 << 15) | 3, 0x1234_5002, 0x2001).unwrap();
         assert_eq!(decoded.table_size, 4);
         assert!(decoded.enabled);
         assert_eq!(decoded.table_bir, 2);

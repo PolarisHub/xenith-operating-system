@@ -200,13 +200,8 @@ pub(crate) fn boot_bios_image(
     // loaders before a Machine owns its ATA device. Keep the remaining
     // stage2_main payload/ELF work as an explicit semantic fallback; the exact
     // assembly entry and mode transition above are still executed bytewise.
-    let (entry, handoff) = semantic_stage2_loader_fallback(
-        bus,
-        image,
-        kernel,
-        kernel_entry,
-        initrd_entry,
-    )?;
+    let (entry, handoff) =
+        semantic_stage2_loader_fallback(bus, image, kernel, kernel_entry, initrd_entry)?;
 
     *cpu = Cpu::new();
     cpu.state.rip = entry;

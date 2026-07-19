@@ -621,8 +621,12 @@ pub fn enable_xsave(info: &FpuInfo) {
 /// [`super::init`] on the BSP. APs apply this published snapshot through
 /// [`init_ap`] without racing a second write to the global cache.
 pub fn init() {
-    let info = probe();
+    let mut info = probe();
     enable_xsave(&info);
+    // Boot starts without a userspace FPU owner. Clear a firmware-left TS bit
+    // before the one FXSAVE used to discover the processor's MXCSR mask.
+    clear_task_switched();
+    info.mxcsr_mask = detect_mxcsr_mask();
 
     // Publish the snapshot. The store to `FPU_INFO` happens before the
     // `Release` store to `FPU_INITIALIZED`, so any reader that observes the
@@ -651,6 +655,21 @@ pub fn init() {
         info.xcr0.bits(),
         info.instructions.bits(),
     );
+}
+
+#[repr(align(16))]
+struct LegacyProbeArea([u8; 512]);
+
+/// Capture the CPU's MXCSR capability mask from the architectural FXSAVE
+/// image. Older CPUs may report zero, for which Intel specifies the baseline
+/// `0x0000_ffbf` mask.
+fn detect_mxcsr_mask() -> u32 {
+    let mut area = LegacyProbeArea([0; 512]);
+    // SAFETY: early_init enabled OSFXSR, TS was cleared by init, and the
+    // destination is a writable, 16-byte-aligned 512-byte area.
+    unsafe { fxsave(area.0.as_mut_ptr()) };
+    let mask = u32::from_le_bytes(area.0[28..32].try_into().expect("four-byte MXCSR mask"));
+    if mask == 0 { 0x0000_ffbf } else { mask }
 }
 
 /// Apply the BSP-selected XSAVE policy to an application processor.
@@ -788,6 +807,87 @@ impl FpuSaveArea {
     #[must_use]
     pub fn size(&self) -> usize {
         self.layout.size()
+    }
+
+    /// XSAVE component mask represented by this image. The FXSAVE fallback
+    /// still exposes the architectural x87/SSE pair as bits zero and one.
+    #[inline]
+    #[must_use]
+    pub fn feature_mask(&self) -> u64 {
+        if self.xsave {
+            self.mask
+        } else {
+            (XsaveComponents::X87 | XsaveComponents::SSE).bits()
+        }
+    }
+
+    /// Immutable view used to copy an aligned kernel image to a user signal
+    /// frame. The allocation remains owned by `self`.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` names `layout.size()` live bytes for `self`'s lifetime.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+
+    /// Mutable view used to stage a user-edited signal image before validated
+    /// restore. Callers must validate with [`validate_user_image`] first.
+    #[inline]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `&mut self` proves exclusive access to the live allocation.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+
+    /// Save the currently live hardware register file for a signal frame.
+    /// Returns `false` if CR0.TS says no task owns a live register image.
+    pub fn capture_current(&mut self) -> bool {
+        // SAFETY: CPL0 architectural read. Saving with TS set would #NM.
+        if unsafe { read_cr0() } & CR0_TASK_SWITCHED != 0 {
+            return false;
+        }
+        // SAFETY: TS is clear, the buffer is correctly sized/aligned, and
+        // `&mut self` excludes aliases.
+        unsafe { self.save() };
+        true
+    }
+
+    /// Validate every privilege-sensitive field in a user-edited image.
+    /// This keeps XRSTOR/FXRSTOR from turning malformed signal data into #GP.
+    #[must_use]
+    pub fn validate_user_image(&self) -> bool {
+        let bytes = self.as_bytes();
+        if bytes.len() < 32 {
+            return false;
+        }
+        let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().expect("four-byte MXCSR"));
+        let Some(info) = info() else { return false };
+        if mxcsr & !info.mxcsr_mask != 0 {
+            return false;
+        }
+        if !self.xsave {
+            return bytes.len() == 512;
+        }
+        if bytes.len() < 576 {
+            return false;
+        }
+        let xstate_bv = u64::from_le_bytes(bytes[512..520].try_into().expect("XSAVE bitmap"));
+        let xcomp_bv = u64::from_le_bytes(bytes[520..528].try_into().expect("XSAVE format"));
+        xstate_bv & !self.mask == 0
+            && xcomp_bv == 0
+            && bytes[528..576].iter().all(|byte| *byte == 0)
+    }
+
+    /// Restore a validated signal image into the hardware register file.
+    /// The caller remains responsible for ensuring this is the current task.
+    pub fn restore_user_image(&self) -> bool {
+        if !self.validate_user_image() {
+            return false;
+        }
+        clear_task_switched();
+        // SAFETY: validation above constrains XSAVE header/MXCSR fields, the
+        // area has the boot-time size/alignment, and TS is clear.
+        unsafe { self.restore() };
+        true
     }
 
     /// Save the current FPU/SIMD state into this area.

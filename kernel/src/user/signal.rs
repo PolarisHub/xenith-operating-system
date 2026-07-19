@@ -44,6 +44,8 @@ use crate::arch::x86_64::gdt;
 use crate::arch::x86_64::interrupts::exceptions::ExceptionContext;
 use crate::sync::{SpinLock, SpinLockIRQ, SpinLockIRQGuard};
 
+pub use xenith_abi::SignalFrame;
+
 // ---------------------------------------------------------------------------
 // Numbering constants
 // ---------------------------------------------------------------------------
@@ -86,6 +88,19 @@ const RFLAGS_TF: u64 = 1 << 8;
 /// with IF set; the handler frame we build inherits this so `iretq` re-enters
 /// user mode with interrupts enabled.
 const RFLAGS_IF: u64 = 1 << 9;
+
+const EMPTY_SIGINFO: xenith_abi::SigInfo = xenith_abi::SigInfo {
+    signo: 0,
+    code: 0,
+    errno: 0,
+    trapno: 0,
+    address: 0,
+    sender_pid: 0,
+    sender_uid: 0,
+    status: 0,
+    value: 0,
+    reserved: 0,
+};
 
 // ---------------------------------------------------------------------------
 // Signal enum

@@ -2,12 +2,11 @@
 
 use alloc::string::String;
 
+use super::enumerate::{PciDevice, PciHeaderKind};
+use super::PciAddress;
 use crate::acpi::aml::{AmlError, AmlValue, PciRoute, Resource};
 use crate::mm::KVec;
 use crate::sync::SpinLock;
-
-use super::enumerate::{PciDevice, PciHeaderKind};
-use super::PciAddress;
 
 const MAX_SWIZZLE_HOPS: usize = 32;
 const PCI_BRIDGE_CLASS: u8 = 0x06;
@@ -200,9 +199,10 @@ fn table_bus(path: &str, devices: &[PciDevice]) -> Result<Option<u8>, TableError
     for (index, prefix) in prefixes.iter().enumerate() {
         if let Some(address) = optional_integer(prefix, "_ADR")? {
             first_addressed.get_or_insert(index);
-            addresses.push((index, u32::try_from(address).map_err(|_| {
-                TableError::InvalidInteger("_ADR")
-            })?));
+            addresses.push((
+                index,
+                u32::try_from(address).map_err(|_| TableError::InvalidInteger("_ADR"))?,
+            ));
         }
     }
     let anchor_end = first_addressed.unwrap_or(prefixes.len());
@@ -371,10 +371,11 @@ mod tests {
 
     #[test]
     fn path_prefixes_are_canonical_and_ordered() {
-        assert_eq!(
-            path_prefixes("\\_SB_.PCI0.RP01"),
-            ["\\_SB_", "\\_SB_.PCI0", "\\_SB_.PCI0.RP01"]
-        );
+        assert_eq!(path_prefixes("\\_SB_.PCI0.RP01"), [
+            "\\_SB_",
+            "\\_SB_.PCI0",
+            "\\_SB_.PCI0.RP01"
+        ]);
     }
 
     #[test]
