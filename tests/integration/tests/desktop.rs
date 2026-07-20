@@ -5,6 +5,12 @@ const FALLBACK_LIMIT: u64 = 30_000_000;
 const STABILITY_SLICE: u64 = 2_500_000;
 const STABILITY_SAMPLES: usize = 8;
 const INTERACTION_LIMIT: u64 = 80_000_000;
+// The emulator charges SMP execution against one aggregate round-robin
+// budget. Three virtual CPUs therefore need roughly three times the UP boot
+// allowance even when every guest CPU is making normal progress.
+const SMP_WINDOW_BOOT_LIMIT: u64 = 600_000_000;
+const SMP_WINDOW_FALLBACK_LIMIT: u64 = 100_000_000;
+const WINDOW_SMOKE_LIMIT: u64 = 500_000_000;
 
 fn framebuffer_payload(ppm: &[u8]) -> Option<&[u8]> {
     let mut newlines = 0usize;
@@ -115,4 +121,74 @@ fn desktop_renders_stays_stable_and_falls_back_to_shell() {
         framebuffer_payload(&terminal).expect("terminal framebuffer is a binary PPM image"),
         "desktop release did not restore the terminal framebuffer"
     );
+}
+
+#[test]
+#[ignore = "requires `xenith-build all`; explicit end-to-end compositor smoke"]
+fn opt_in_window_client_completes_shared_buffer_protocol() {
+    let mut machine = xenith_integration::load_built_kernel_with_framebuffer_and_cpus(
+        SMP_WINDOW_BOOT_LIMIT,
+        Some(FramebufferConfig {
+            width: 320,
+            height: 200,
+        }),
+        3,
+    )
+    .unwrap();
+    xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_DESKTOP_READY",
+        1,
+        SMP_WINDOW_BOOT_LIMIT,
+    )
+    .unwrap();
+    xenith_integration::request_desktop_exit(&mut machine).unwrap();
+    xenith_integration::run_until_serial(&mut machine, "xenith$ ", 1, SMP_WINDOW_FALLBACK_LIMIT)
+        .unwrap();
+
+    machine
+        .inject_keyboard_ascii("/bin/xenith-desktop --window-smoke --smoke-exit\n")
+        .unwrap();
+    let output = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_WINDOW_SMOKE_PASS",
+        1,
+        WINDOW_SMOKE_LIMIT,
+    )
+    .unwrap();
+    assert!(output.contains("XENITH_WINDOW_SMOKE_PRESENTED"));
+    assert!(!output.contains("XENITH_WINDOW_SMOKE_FAIL"));
+    assert!(!output.contains("XENITH_DESKTOP_FAIL"));
+
+    // The client emits PASS immediately before exiting; endpoint hangup is
+    // therefore observed asynchronously by the compositor on its next wait.
+    let closed = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_COMPOSITOR_CLIENT_CLOSED",
+        1,
+        WINDOW_SMOKE_LIMIT,
+    )
+    .unwrap();
+    assert!(!closed.contains("XENITH_WINDOW_SMOKE_FAIL"));
+    assert!(!closed.contains("XENITH_DESKTOP_FAIL"));
+
+    xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_DESKTOP_CLEAN_EXIT",
+        2,
+        SMP_WINDOW_FALLBACK_LIMIT,
+    )
+    .unwrap();
+    let shell = xenith_integration::run_until_serial(
+        &mut machine,
+        "xenith$ ",
+        2,
+        SMP_WINDOW_FALLBACK_LIMIT,
+    )
+    .unwrap();
+    assert!(shell.ends_with("xenith$ "));
+    assert_eq!(machine.cpu_count(), 3);
+    assert!((0..3).all(|processor| machine
+        .cpu_state(processor)
+        .is_some_and(|state| state.cycles != 0)));
 }

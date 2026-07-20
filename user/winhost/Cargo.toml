@@ -1,0 +1,23 @@
+[package]
+name = "xenith-winhost"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-winhost"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libuser = { path = "../libuser" }
+xenith-abi = { path = "../../crates/xenith-abi" }
+xenith-pe = { path = "../../crates/xenith-pe" }
+xenith-winhost-core = { path = "../winhost-core" }
+
+[lints]
+workspace = true

@@ -6,15 +6,24 @@ Xenith is a monolithic kernel with narrow shared contracts.
 2. `mm` owns the HHDM, page-table editing, user address spaces, physical allocation, and the 32 MiB kernel heap.
 3. `acpi` validates RSDP/RSDT/XSDT/MADT/FADT/DSDT/SSDT tables and hosts the bounded AML namespace/evaluator used for power state, resource, and PCI interrupt routing methods.
 4. `time` selects HPET or LAPIC time, calibrates with PIT, and seeds wall time from CMOS.
-5. `sched` owns tasks, per-CPU run queues and idle tasks, the sleep queue, kernel stacks, lazy FPU state, and CR3/TSS changes at dispatch.
+5. `sched` owns tasks, per-CPU run queues and idle tasks, the sleep queue, kernel stacks, lazy FPU state, shared address-space ownership, and CR3/TSS changes at dispatch.
 6. `devices` owns serial, framebuffer/VGA, PS/2, PCI topology/capabilities/routing, AHCI, interrupt-driven RTL8139/e1000, CMOS, and the terminal parser.
 7. `net` implements Ethernet, bounded ARP resolution/aging, IPv4, ICMP, UDP,
    reliable TCP state/retransmission/reassembly, routing, DHCPv4, DNS wire
    validation, loopback, live interface enumeration, and socket state. A
    kernel worker services physical adapters independently of socket syscalls.
-8. `fs` provides VFS, per-open offsets, ramfs/initramfs, FAT32, and XenithFS.
-9. `syscall` validates the register ABI and user ranges before delegating to process, VFS, time, and network services.
-10. `user` validates static ELF64 images, maps W^X segments/stacks, owns process resources, and enters ring 3.
+8. `fs` provides VFS, rights-bearing descriptor tables, transactional restricted
+   child-table cloning, per-open offsets, ramfs/initramfs, FAT32, and XenithFS.
+9. `ipc` owns bounded channel queues, fixed-size shared-memory objects, and
+   lost-wake-safe readiness registration. Descriptor installation and message
+   publication remain transactional across user faults and capacity failures.
+10. `syscall` validates the register ABI and user ranges before delegating to process, thread, VFS, IPC, UI, time, and network services. The current dense Xenith table ends at restricted spawn, syscall 68; it is not a Linux or Windows syscall table.
+11. `user` validates static ELF64 images, maps W^X segments/stacks, tracks
+    private and shared dynamic mappings, owns process resources, publishes
+    bounded joinable tasks in shared address spaces, and enters ring 3. The
+    desktop/libwindow compositor, bounded PE console host/NT policy core, and
+    future Windows driver-host policy core remain userspace policy rather than
+    kernel subsystems.
 
 Host crates are deliberately outside the kernel layering. `xenith-x86` is shared by the assembler, disassembler, debugger, and interpreter. The bootloader shares only `xenith-abi`-compatible records and its own `no_std` parser library.
 

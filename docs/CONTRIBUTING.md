@@ -13,9 +13,11 @@ Run formatting and stack-matched validation:
 
 ```text
 cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --target x86_64-pc-windows-msvc --exclude xenith-kernel --exclude xenith-init --exclude xenith-desktop --exclude xenith-sh --exclude xenith-coreutils --exclude xenith-editor --exclude xenith-net --exclude xenith-examples --exclude xenith-libc --all-targets -- -D warnings
 cargo clippy -p xenith-kernel --lib --bin xenith --target kernel/x86_64-xenith.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
-cargo clippy -p xenith-init -p xenith-sh -p xenith-coreutils -p xenith-editor -p xenith-net -p xenith-examples -p xenith-libc --target user/x86_64-xenith-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
-cargo test --target x86_64-pc-windows-msvc -p limine -p xenith-types -p xenith-bitflags -p xenith-boot -p xenith-abi -p xenith-fs-format -p xenith-x86 -p xenith-emu -p xenith-vmm -p xenith-asm -p xenith-disasm -p xenith-iso -p xenith-build -p xenith-mkfs -p xenith-fsck -p xenith-mount -p xenith-ld -p xenith-cc -p xenith-debug -p xenith-integration -p xenith-libc
+cargo clippy -p xenith-init -p xenith-desktop -p xenith-sh -p xenith-coreutils -p xenith-editor -p xenith-net -p xenith-examples -p xenith-libc -p xenith-winhost-core -p xenith-windrv-core -p xenith-winhost --target user/x86_64-xenith-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
+cargo test --target x86_64-pc-windows-msvc -p limine -p xenith-types -p xenith-bitflags -p xenith-boot -p xenith-abi -p xenith-fs-format -p xenith-pe -p xenith-x86 -p xenith-emu -p xenith-vmm -p xenith-asm -p xenith-disasm -p xenith-iso -p xenith-build -p xenith-mkfs -p xenith-fsck -p xenith-mount -p xenith-ld -p xenith-cc -p xenith-debug -p xenith-integration -p xenith-desktop -p xenith-libc -p libwindow -p xenith-winhost-core -p xenith-windrv-core -p xenith-winhost
 cargo test -p xenith-kernel --lib --target x86_64-pc-windows-msvc
 ```
 

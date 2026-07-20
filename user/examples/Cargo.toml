@@ -10,6 +10,12 @@ path = "src/hello.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "xenith-thread-smoke"
+path = "src/thread_smoke.rs"
+test = false
+bench = false
+
 [dependencies]
 libuser = { path = "../libuser" }
 xenith-abi = { path = "../../crates/xenith-abi" }

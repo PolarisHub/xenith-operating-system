@@ -59,11 +59,12 @@ execution with no semantic fallback.
 Both repository firmware runners are purpose-built validation environments for
 Xenith's packaged loaders. They do not execute arbitrary external BIOS/UEFI
 firmware, option ROMs, or a complete chipset reset model. Separately, VMware
-Workstation 17.6.3 legacy BIOS cold boots of the preceding externally tested El
-Torito ISO reached the framebuffer terminal and userspace shell with 1, 3, 4,
-8, 16, and 24 vCPUs on 2026-07-19. QEMU/SeaBIOS passed every integer CPU count
-from 1 through 64 for that ISO and passed its raw image at 64 CPUs. The current
-artifact hashes and exact external-proof boundary are recorded in
+Workstation 17.6.3 cold-booted the current El Torito ISO under both legacy BIOS
+and UEFI with three vCPUs on 2026-07-20; both paths brought every CPU online and
+reached the graphical desktop. Legacy-BIOS boots of the preceding ISO reached
+userspace with 1, 3, 4, 8, 16, and 24 vCPUs, and QEMU/SeaBIOS passed every
+integer CPU count from 1 through 64 for that preceding ISO plus its raw image at
+64 CPUs. The hashes and exact external-proof boundary are recorded in
 [STATUS](STATUS.md); these are not physical-hardware or all-firmware proof.
 
 ## CPU startup
@@ -129,6 +130,7 @@ metadata, corrupt initramfs, invalid ELF mappings, and exhausted critical
 memory fail closed rather than continuing with partial ownership.
 
 The deterministic framebuffer/text dumps and RTL8139 transmit sink are testing
-surfaces, not a live GUI or host network. The VMware BIOS/VBE result proves one
-virtual platform; physical display, input, storage, interrupt timing, inbound
-networking, and other firmware remain separate runtime boundaries.
+surfaces, not a live GUI or host network. The VMware BIOS/VBE and UEFI/GOP
+results prove one virtual platform; physical display, input, storage, interrupt
+timing, inbound networking, and other firmware remain separate runtime
+boundaries.

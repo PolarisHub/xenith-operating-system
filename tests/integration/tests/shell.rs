@@ -32,6 +32,10 @@ fn run_command(
         let output = machine.serial_output();
         let command_output = String::from_utf8_lossy(&output[start..]);
         let normalized = command_output.replace("\r\n", "\n");
+        assert!(
+            !normalized.contains("sh: tcsetpgrp:"),
+            "foreground process-group transfer failed while running {command:?}:\n{normalized}"
+        );
         if normalized.matches(marker).count() >= occurrences && normalized.ends_with("xenith$ ") {
             return Ok(normalized);
         }
@@ -149,6 +153,31 @@ fn shell_executes_builtins_and_coreutils_via_ps2() {
 
     let date = run_command(&mut machine, "date\n", " UTC (Unix)", 1).unwrap();
     assert!(date.contains(" UTC (Unix)"));
+}
+
+#[test]
+#[ignore = "requires `xenith-build all`; proves thread_create/join in a booted guest"]
+fn userspace_threads_create_join_and_teardown_in_guest() {
+    let mut machine =
+        xenith_integration::load_built_kernel_with_framebuffer_and_cpus(BOOT_LIMIT, None, 3)
+            .unwrap();
+    let boot = machine.run();
+    assert_eq!(boot.reason, ExitReason::InstructionLimit);
+    let boot_serial = String::from_utf8_lossy(&boot.serial);
+    assert!(
+        boot_serial.contains("Xenith shell 0.1 (type 'help')") && boot_serial.ends_with("xenith$ "),
+        "boot did not reach an idle userspace shell:\n{boot_serial}"
+    );
+
+    let output = run_command(&mut machine, "/bin/thread-smoke\n", "XENITH_THREAD_OK", 1).unwrap();
+    assert!(
+        output.contains("XENITH_THREAD_OK") && !output.contains("XENITH_THREAD_FAIL"),
+        "thread create/join smoke failed: {output:?}"
+    );
+    assert_eq!(machine.cpu_count(), 3);
+    assert!((0..3).all(|processor| machine
+        .cpu_state(processor)
+        .is_some_and(|state| state.cycles != 0)));
 }
 
 #[test]

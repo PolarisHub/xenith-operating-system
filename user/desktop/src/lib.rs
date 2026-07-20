@@ -6,7 +6,10 @@
 
 #![no_std]
 
+pub mod compositor;
 mod render;
+#[cfg(test)]
+mod window_smoke_render;
 
 pub use render::{PixelFormat, RenderError, Renderer, Surface};
 use xenith_abi::{
@@ -246,6 +249,7 @@ impl Layout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventAction {
     Continue,
+    Consumed,
     Exit,
 }
 
@@ -255,6 +259,8 @@ pub struct DesktopState {
     layout: Layout,
     cursor: Point,
     buttons: u16,
+    shell_pointer_buttons: u16,
+    suppressed_key: u32,
     launcher_open: bool,
 }
 
@@ -267,6 +273,8 @@ impl DesktopState {
             layout,
             cursor: Point::new((size.width / 2) as i32, (size.height / 2) as i32),
             buttons: 0,
+            shell_pointer_buttons: 0,
+            suppressed_key: 0,
             launcher_open: false,
         }
     }
@@ -304,6 +312,8 @@ impl DesktopState {
     pub fn handle_event(&mut self, event: UiInputEvent, damage: &mut DamageTracker) -> EventAction {
         if event.flags & UI_EVENT_FLAG_OVERFLOW != 0 {
             damage.mark_full();
+            self.shell_pointer_buttons = 0;
+            self.suppressed_key = 0;
         }
         match event.kind {
             UI_EVENT_POINTER => self.handle_pointer(event, damage),
@@ -328,14 +338,45 @@ impl DesktopState {
 
         let old_left = self.buttons & UI_POINTER_BUTTON_LEFT != 0;
         let new_left = event.buttons & UI_POINTER_BUTTON_LEFT != 0;
+        let old_buttons = self.buttons;
+        let newly_pressed = (old_buttons ^ event.buttons) & event.buttons;
+        let shell_had_capture = self.shell_pointer_buttons != 0;
+        let over_shell = self.layout.top_bar.contains(self.cursor)
+            || self.layout.dock.contains(self.cursor)
+            || self.launcher_open && self.layout.launcher.contains(self.cursor);
+        if shell_had_capture {
+            self.shell_pointer_buttons |= newly_pressed;
+        } else if old_buttons == 0 && newly_pressed != 0 && over_shell {
+            self.shell_pointer_buttons = newly_pressed;
+        }
         self.buttons = event.buttons;
         if new_left && !old_left && self.layout.launcher_button.contains(self.cursor) {
             self.toggle_launcher(damage);
         }
-        EventAction::Continue
+        let consumed = shell_had_capture
+            || self.shell_pointer_buttons != 0
+            || old_buttons == 0 && event.buttons == 0 && over_shell;
+        self.shell_pointer_buttons &= event.buttons;
+        if consumed {
+            EventAction::Consumed
+        } else {
+            EventAction::Continue
+        }
     }
 
     fn handle_key(&mut self, event: UiInputEvent, damage: &mut DamageTracker) -> EventAction {
+        if self.suppressed_key == event.code {
+            if event.flags & UI_EVENT_FLAG_PRESSED == 0 {
+                self.suppressed_key = 0;
+            }
+            return EventAction::Consumed;
+        }
+        if matches!(event.code, KEY_LEFT_SUPER | KEY_RIGHT_SUPER) {
+            if event.flags & UI_EVENT_FLAG_PRESSED != 0 && event.flags & UI_EVENT_FLAG_REPEAT == 0 {
+                self.toggle_launcher(damage);
+            }
+            return EventAction::Consumed;
+        }
         if event.flags & UI_EVENT_FLAG_PRESSED == 0 {
             return EventAction::Continue;
         }
@@ -348,11 +389,10 @@ impl DesktopState {
         {
             return EventAction::Exit;
         }
-        let super_toggle = event.flags & UI_EVENT_FLAG_REPEAT == 0
-            && matches!(event.code, KEY_LEFT_SUPER | KEY_RIGHT_SUPER)
-            || event.code == KEY_ESCAPE && self.launcher_open;
-        if super_toggle {
+        if event.code == KEY_ESCAPE && self.launcher_open {
+            self.suppressed_key = event.code;
             self.toggle_launcher(damage);
+            return EventAction::Consumed;
         }
         EventAction::Continue
     }
@@ -495,7 +535,10 @@ mod tests {
         let target = Point::new(button.x + 2, button.y + 2);
         state.cursor = target;
         let mut damage = DamageTracker::new(state.layout().screen);
-        state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage);
+        assert_eq!(
+            state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
+            EventAction::Consumed
+        );
         assert!(state.launcher_open());
         state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage);
         assert!(state.launcher_open());
@@ -529,7 +572,7 @@ mod tests {
             code: KEY_LEFT_SUPER,
             ..UiInputEvent::default()
         };
-        assert_eq!(state.handle_event(make, &mut damage), EventAction::Continue);
+        assert_eq!(state.handle_event(make, &mut damage), EventAction::Consumed);
         assert!(state.launcher_open());
         assert!(!damage.is_empty());
 
@@ -541,10 +584,47 @@ mod tests {
         };
         assert_eq!(
             state.handle_event(release, &mut damage),
-            EventAction::Continue
+            EventAction::Consumed
         );
         assert!(state.launcher_open());
         assert!(damage.is_empty());
+    }
+
+    #[test]
+    fn shell_pointer_capture_and_escape_release_do_not_leak_to_clients() {
+        let mut state = DesktopState::new(Size::new(1024, 768));
+        let button = state.layout().launcher_button;
+        state.cursor = Point::new(button.x + 1, button.y + 1);
+        let mut damage = DamageTracker::new(state.layout().screen);
+        assert_eq!(
+            state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
+            EventAction::Consumed
+        );
+        state.cursor = Point::new(500, 300);
+        assert_eq!(
+            state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
+            EventAction::Consumed
+        );
+        assert_eq!(
+            state.handle_event(pointer(0, 0, 0), &mut damage),
+            EventAction::Consumed
+        );
+
+        let escape = UiInputEvent {
+            kind: UI_EVENT_KEY,
+            flags: UI_EVENT_FLAG_PRESSED,
+            code: KEY_ESCAPE,
+            ..UiInputEvent::default()
+        };
+        assert_eq!(
+            state.handle_event(escape, &mut damage),
+            EventAction::Consumed
+        );
+        assert!(!state.launcher_open());
+        assert_eq!(
+            state.handle_event(UiInputEvent { flags: 0, ..escape }, &mut damage,),
+            EventAction::Consumed
+        );
     }
 
     #[test]

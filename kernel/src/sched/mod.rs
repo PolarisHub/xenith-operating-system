@@ -77,7 +77,8 @@ pub use preempt::{
     set_need_resched, should_preempt, LAPIC_TIMER_VECTOR,
 };
 pub use scheduler::{
-    sleep_until, spawn, spawn_on, stats, SchedulerStats, AGING_THRESHOLD_TICKS, SCHED_TICK_HZ,
+    sleep_until, spawn, spawn_on, stage_spawn, stats, SchedulerStats, StagedTask,
+    AGING_THRESHOLD_TICKS, SCHED_TICK_HZ,
 };
 pub use task::{ExitStatus, Task, TaskId, TaskState};
 

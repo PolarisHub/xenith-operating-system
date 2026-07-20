@@ -33,6 +33,7 @@ pub mod boot;
 pub mod console;
 pub mod devices;
 pub mod fs;
+pub mod ipc;
 pub mod log;
 pub mod mm;
 pub mod net;

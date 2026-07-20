@@ -943,6 +943,46 @@ impl AddressSpace {
         p1e.frame().map(|f| (f, p1e.flags()))
     }
 
+    /// Replace the access permissions of one present 4 KiB user mapping.
+    ///
+    /// The caller owns address-range and W^X policy. Hardware-maintained
+    /// accessed/dirty bits and Xenith's software COW marker are preserved.
+    /// A writable request over a COW leaf remains read-only in the PTE so the
+    /// normal write-fault path can split the shared frame before granting
+    /// write access.
+    pub fn protect_user(&self, page: Page, requested: PageTableFlags) -> Result<(), MapError> {
+        let start = page.start_address().as_u64();
+        if start > USER_MAX
+            || !requested.contains(PageTableFlags::USER)
+            || requested.intersects(PageTableFlags::GLOBAL | PageTableFlags::HUGE_PAGE)
+        {
+            return Err(MapError::OutOfRange);
+        }
+
+        // SAFETY: callers serialize address-space mutations through the
+        // owning process record. This walk changes only the requested leaf.
+        let leaf = unsafe { self.walk_mut(page) }.ok_or(MapError::CorruptPageTable)?;
+        let old = leaf.flags();
+        if !old.contains(PageTableFlags::PRESENT | PageTableFlags::USER) || leaf.is_huge() {
+            return Err(MapError::CorruptPageTable);
+        }
+        let frame = leaf.frame().ok_or(MapError::CorruptPageTable)?;
+        let mut next = requested | PageTableFlags::PRESENT;
+        if old.contains(PageTableFlags::ACCESSED) {
+            next |= PageTableFlags::ACCESSED;
+        }
+        if old.contains(PageTableFlags::DIRTY) {
+            next |= PageTableFlags::DIRTY;
+        }
+        if old.contains(PageTableFlags::COPY_ON_WRITE) {
+            next |= PageTableFlags::COPY_ON_WRITE;
+            next.remove(PageTableFlags::WRITABLE);
+        }
+        leaf.set(frame, next);
+        crate::arch::x86_64::smp::shootdown_page(self.cr3(), start);
+        Ok(())
+    }
+
     // -- fork / destroy ----------------------------------------------------
 
     /// Copy-on-write duplicate this address space for `fork(2)`.

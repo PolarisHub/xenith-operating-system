@@ -19,6 +19,7 @@ use xenith_abi::{
     UiDisplayInfo, UiInputEvent, UiRect, UI_ABI_VERSION, UI_DISPLAY_NATIVE_PIXEL_FORMAT,
     UI_EVENT_FLAG_OVERFLOW, UI_EVENT_FLAG_PRESSED, UI_EVENT_FLAG_REPEAT, UI_EVENT_KEY,
     UI_EVENT_POINTER, UI_MAX_DAMAGE_RECTS, UI_MAX_EVENTS_PER_READ, UI_TIMEOUT_INFINITE,
+    WAIT_READY_HANGUP, WAIT_READY_UI_INPUT,
 };
 
 use crate::devices::framebuffer::Scanout;
@@ -511,6 +512,39 @@ fn wake_waiter(waiter: Option<TaskId>) {
     if let Some(waiter) = waiter {
         crate::sched::scheduler::wake_blocked_task(waiter);
     }
+}
+
+#[must_use]
+pub(crate) fn wait_ready(pid: ProcessId) -> u32 {
+    let state = EVENTS.lock();
+    if OWNER.load(Ordering::Acquire) != pid.as_u64() || pid.is_kernel() {
+        WAIT_READY_HANGUP
+    } else if state.events.is_empty() {
+        0
+    } else {
+        WAIT_READY_UI_INPUT
+    }
+}
+
+pub(crate) fn arm_external_wait(pid: ProcessId, task: TaskId) -> Result<u32, UiError> {
+    let mut state = EVENTS.lock();
+    if OWNER.load(Ordering::Acquire) != pid.as_u64() || pid.is_kernel() {
+        return Ok(WAIT_READY_HANGUP);
+    }
+    if !state.events.is_empty() {
+        return Ok(WAIT_READY_UI_INPUT);
+    }
+    match state.waiter {
+        None => state.waiter = Some(task),
+        Some(existing) if existing == task => {},
+        Some(_) => return Err(UiError::Busy),
+    }
+    Ok(0)
+}
+
+pub(crate) fn disarm_external_wait(task: TaskId) {
+    let mut state = EVENTS.lock();
+    clear_waiter(&mut state, task);
 }
 
 /// Copy up to `capacity` ordered events to `destination`, sleeping when empty.

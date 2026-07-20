@@ -28,6 +28,16 @@ a boot result, and an internal firmware model is not a physical-machine result.
   Exiting tasks detach their address space before publishing exit, then a
   per-CPU post-switch retirement slot reclaims each dead task and kernel stack
   only after execution has left that stack.
+- Syscalls 64-67 provide joinable shared-address-space userspace tasks with
+  globally unique task IDs. One process may retain at most 32 live plus
+  completed-unjoined thread records, subject to a 256-user-task global bound.
+  Callers provide distinct page-aligned 16 KiB-8 MiB RW/NX stacks; the entry
+  page must be user-executable. Join ownership is single-consumer, thread
+  completion wakes its joiner, process termination interrupts peers, and the
+  last task detaches its address space before publishing process exit.
+  Task-local TLS and complete task-local signal state are not implemented, so
+  thread creation and multi-threaded signal/VM/image mutations fail closed
+  where their semantics would be ambiguous.
 - The VFS provides ramfs/initramfs, read-only FAT32, writable journaled
   XenithFS, pipes, console TTYs, and a mounted `/dev/pts`. PTY slaves share the
   console line discipline, including canonical editing, signals, termios,
@@ -79,12 +89,13 @@ a boot result, and an internal firmware model is not a physical-machine result.
   bounded software watchpoints, frame-pointer backtraces, ELF symbols,
   bidirectional DWARF line lookup, explicit PIE load bias, and a bounded
   single-client GDB Remote Serial Protocol bridge.
-- Freestanding init, graphical desktop, shell, coreutils, editor, network
-  tools, examples, `libuser`, and the C ABI runtime are packaged. The desktop
-  owns one native-format backbuffer, renders glass chrome procedurally, tracks
-  at most 12 merged damage rectangles, consumes fixed input batches, and parks
-  indefinitely when idle. Init supervises it and restores `/bin/sh` on missing
-  framebuffer, clean recovery, or failure. The shell supports pipelines,
+- Freestanding init, graphical desktop, opt-in window smoke, native thread
+  smoke, bounded Win64 console host and fixture, shell, coreutils, editor,
+  network tools, examples, `libuser`, and the C ABI runtime are packaged. The
+  desktop owns one native-format backbuffer, renders glass chrome procedurally,
+  tracks at most 12 merged damage rectangles, consumes fixed input batches, and
+  parks indefinitely when idle. Init supervises it and restores `/bin/sh` on
+  missing framebuffer, clean recovery, or failure. The shell supports pipelines,
   redirection, quoting, background jobs, sessions/process groups, and terminal
   job control. The shipped `/bin/c-demo` is compiled through
   `xenith-cc` -> `xenith-asm` -> `xenith-ld`.
@@ -100,12 +111,71 @@ a boot result, and an internal firmware model is not a physical-machine result.
   ordering.
 - Kernel logging and userspace TTY output share one COM1 serialization lock, so
   exact runtime markers cannot interleave across CPUs on the physical UART.
-- `xenith-abi::compositor` defines a separate version-1 transport-neutral wire
-  contract for generation-safe handles, shared-surface bounds, roles/state,
-  bounded damage commits, configure acknowledgement, focus/input/text/close,
-  and frame completion. No IPC transport or multi-process surface server is
-  connected yet; this is the boundary intended for native clients and a later
-  userspace Windows-compatibility server.
+- Syscalls 58-63 provide bounded local channels, transactional attenuated
+  descriptor transfer, fixed-size zero-filled shared memory, allocation-free
+  readiness waits across channel/UI sources, and dynamic-mapping `mprotect`.
+  Version-1 messages carry an 80-byte header, at most 4096 inline bytes, and at
+  most four transfers. Each direction has eight queue slots; the kernel admits
+  at most 64 channel pairs, 16 MiB per shared object, and 64 MiB of committed
+  shared memory while preserving an 8 MiB physical reserve. Shared mappings
+  are permanently non-executable and all mappings obey W^X.
+- Syscall 68, `spawn_restricted`, starts from an empty child descriptor table
+  and installs at most 16 exact source-to-target mappings after validating the
+  complete canonical 288-byte request. Rights may only attenuate; ordinary
+  sources require `TRANSFER`, while a channel endpoint may be passed only to
+  the immediate child with its existing nonempty `READ|WRITE` subset. Duplicate
+  targets and partial publication are rejected, and the same request performs
+  atomic process-group placement before the child becomes runnable.
+- Descriptor rights are checked at I/O, ioctl, mapping, and transfer
+  boundaries. Transfers may only attenuate existing `READ`, `WRITE`, `MAP`, and
+  `TRANSFER` rights. Send publication and receive descriptor installation are
+  transactional, including user-fault and descriptor-capacity rollback; drops
+  that can reclaim objects occur outside the process-table lock.
+- `xenith-abi::compositor` and allocation-free `libwindow` are connected to a
+  bounded eight-client desktop coordinator with eight surfaces and 64 MiB of
+  mapped buffers per client, plus a 256 MiB global mapping quota. It validates
+  generation-safe client/surface state, configure acknowledgements, damage,
+  and read-only buffers; maintains scene order/focus; routes pointer capture,
+  keys, and UTF-8 text; and isolates malformed or stalled clients. One wait
+  covers UI plus all live channels without polling. The opt-in
+  `--window-smoke` path currently provisions the only live connection and uses
+  restricted spawn so the child receives exactly stdout, stderr, and one
+  client endpoint. Normal boot creates no channel and remains app-free.
+- `xenith-pe`, `xenith-winhost-core`, and `xenith-winhost` implement a bounded
+  PE32+ AMD64 console path. The host accepts regular files up to 16 MiB and
+  images up to 64 MiB, paths up to 1024 bytes, at most 64 bootstrap imports,
+  1024 effective DIR64 writes, and 1 MiB per `WriteFile` call. Stack and heap
+  reserve/commit values must be nonzero page multiples; stack reserve is capped
+  at 8 MiB and heap reserve at 64 MiB. The host rejects contradictory
+  `RELOCS_STRIPPED` metadata or a relocation-stripped nonpreferred placement,
+  low-alignment sections whose raw file offset differs from their RVA, the COFF
+  `32BIT_MACHINE`/`SYSTEM`/`UP_SYSTEM_ONLY` flags, and the optional-header
+  `FORCE_INTEGRITY`/`APPCONTAINER`/`WDM_DRIVER`/`GUARD_CF` flags. It binds only
+  `KERNEL32.DLL!GetStdHandle`, `WriteFile`, and `ExitProcess`, optional
+  `NTDLL.DLL!RtlExitUserProcess`, and `NTDLL.DLL!NtClose`; it changes its
+  materialized image from RW to final R/RW/RX mappings, and invokes the Win64
+  entry point on a dedicated
+  validated stack whose full accepted reserve is committed above an unmapped
+  lower guard page. The source-built fixture deliberately collides its preferred
+  base with the host ELF, self-checks its relocated absolute pointer before
+  printing, and has passed through the booted host. This proves the bounded
+  forced-rebase path, not general Windows compatibility or sandbox isolation.
+- `xenith-winhost-core` catalogs 13 exact-symbol, pointer-free NT policy
+  services for handles, events, mutants, semaphores, caller-clocked timers, and
+  ready/zero-timeout single-object waits. Only `NtClose` is guest-wired; the
+  other 12 are internal typed policy calls, not decoded x64 entry points or a
+  numeric Windows-build syscall table. Blocking/alertable waits, APCs, named
+  objects, security descriptors, cross-process duplication, PEB/TEB
+  materialization, and Windows thread semantics remain unsupported.
+- `xenith-windrv-core` implements allocation-free validation/state policy for
+  WDM major-function and `CTL_CODE` values, generation-safe driver/device/
+  request IDs, image-confined callbacks, bounded linear device stacks, request
+  transitions, and rights-attenuated resource descriptors. Its inline bounds
+  are 64 drivers, 255 devices, 1024 requests, and 255 grants. It is not packaged
+  as a driver host and does not load `.sys` files, execute driver callbacks,
+  expose hardware, materialize WDM ABI objects, enforce IOCTL buffer/access
+  semantics, emulate cancel spin locks/routines, implement KMDF/UMDF, or make
+  arbitrary Windows drivers work.
 - The kernel accepts native `XenithBootInfo` from Xenith's BIOS/UEFI loaders and
   the optional local Limine-compatible input. Xenith records are validated and
   normalized into one internal boot aggregate before subsystem initialization;
@@ -123,6 +193,9 @@ the current build.
 | `shell_executes_builtins_and_coreutils_via_ps2` | PS/2 input drives the shell, coreutils, filesystem mutations, VM/RNG, and the ring-3 signal smoke | PASS (2026-07-20) |
 | `ring3_ui_smoke_restores_framebuffer_terminal` | Ring 3 acquires scanout, presents full and damaged frames, polls input, releases/unmaps, and the kernel terminal resumes drawing | PASS (2026-07-20) |
 | `desktop_renders_stays_stable_and_falls_back_to_shell` | Init starts the desktop; it presents the exact non-flat shell, handles Super through partial damage, reaches repeated halted idle states, survives a bounded idle window, releases cleanly on recovery input, then restores the shell and terminal framebuffer | PASS (2026-07-20) |
+| `opt_in_window_client_completes_shared_buffer_protocol` | With three CPUs online, the explicit desktop smoke mode restricted-spawns one native client with only stdout/stderr/endpoint 3, maps its attenuated shared buffer, composites client pixels, completes configure/release/frame events, disconnects, and reaps the child | PASS (2026-07-20) |
+| `userspace_threads_create_join_and_teardown_in_guest` | With three CPUs online, `/bin/thread-smoke` maps two private stacks, runs two simultaneous workers with distinct task IDs, joins exit codes 41/42, verifies shared atomic state, and unmaps both stacks | PASS (2026-07-20) |
+| `win64_console_fixture_executes_through_booted_host` | The packaged PE fixture is forced off its preferred base, validates the applied DIR64 relocation, enters through `/bin/xenith-winhost` on its guarded stack, calls the bootstrap console shim, exits, and returns to the shell | PASS (2026-07-20) |
 | `input_script_proves_shell_pipeline_and_redirection` | Multi-stage pipelines and `<`, `>`, `>>` work through real descriptors and syscalls | PASS (2026-07-20) |
 | `xenith_built_c_utility_executes_in_ring3` | C source compiled by Xenith's compiler/assembler/linker executes at CPL3 | PASS (2026-07-20) |
 | `manifest_image_reaches_userspace_shell` | The packaged manifest, checksums, kernel, initramfs, and attached ATA image reach the shell | PASS (2026-07-20) |
@@ -137,46 +210,41 @@ the current build.
 | `whp_boots_built_kernel_to_userspace_shell` | A real WHP virtual processor executes the direct kernel handoff to the shell | PASS (2026-07-20) |
 | `whp_brings_second_processor_online_and_reaches_userspace_shell` | Two real WHP VPs execute and the guest brings its AP online before reaching the shell | PASS (2026-07-20) |
 
-## Validation snapshot - 2026-07-20
+## Validation and artifact identity
 
-- Complete workspace check and the selected native workspace test suite: PASS.
-- Kernel host suite: 505 passed, 0 failed.
-- Shared ABI suite: 12 passed, 0 failed; desktop host suite: 10 passed, 0
-  failed; x86 decode/encode suite: 19 passed, 0 failed; emulator library suite:
-  64 passed, 0 failed.
-- Strict native, custom-target kernel/userspace, and standalone bootloader
-  Clippy with warnings denied: PASS.
-- Standalone bootloader checks/tests and root plus bootloader formatting: PASS.
-- `xenith-build all`: PASS; it regenerated the kernel, BIOS stage1/stage2,
-  `BOOTX64.EFI`, userspace ELFs, initramfs, raw image, hybrid ISO, and artifact
-  inventory through the repository-owned toolchain.
-- Every runtime gate in the table above: PASS against the refreshed artifacts.
-- Fresh footprint: 154,496-byte initramfs, 27,688-byte desktop ELF, and
-  95,368-byte kernel `.bss`.
-- Source inventory: 279 Rust files with 122,860 physical lines; 296 Rust, C,
-  assembly, and linker-script files with 124,786 physical lines total.
+The named runtime results above record the verified behavior boundary. Exact
+sizes below identify the fresh post-change build used by the runtime and
+external-firmware gates. `build/ARTIFACTS.txt` remains authoritative for the
+files currently in a local build directory. A parser/check-only result is never
+promoted to a guest runtime result.
 
-The repository-owned gates above ran against these refreshed artifacts:
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `build/xenith.iso` | 24,723,456 | `DD64844F15ECCB7285DDC51ED988316DE2210213524CB509F71984786C04DBD2` |
+| `build/xenith.img` | 3,792,896 | `9AAE4CA0413300140E519E57A19DA378C0745F45B384CAC8950DA9A20088CECB` |
+| `build/kernel.elf` | 3,417,584 | `E1534A637724114044271F78EA7079E4CF9D69F37AC8C1103E7CDC97D65903A2` |
+| `build/initramfs.cpio` | 351,924 | `A8B2A487DEFD6DC2C5A568B40EF13E70B192D18ACED882EB8CDE0A19BE65612B` |
+| `build/bootloader/BOOTX64.EFI` | 624,640 | `7E57B129424F47FF85BDA6164946BFA7D5A5E101768B0EFCD9E27A4C90649676` |
+| `build/user/xenith-desktop` | 99,832 | `961E8020DCB9074631FD892FA92BB9FA2DD0A6F5109D60F1216B2104A25709E8` |
 
-- `xenith.iso`: `3978C060A5E5CD21C5AC25E26EADC6694D8F8FC52A0E685E3243849B0315D968`
-- `xenith.img`: `C26375821935B5773AF33B73E2AF70E11DEB5F2A9A420E26B6BF092DD54F33AC`
-- `kernel.elf`: `F9D6F374E5D3575FEC24B92FB1C255C18FC6E278B66D10E6613E3389BA996D98`
-- `initramfs.cpio`: `038E15B18915E8E1CD1AD3392CD05B611F4368EADE9AF53A5976641B7F758002`
-- `stage1.bin`: `A46C1CDD3774064FEFAE8EB5379245900D773A4425FF16B8AA428A39328607C0`
-- `stage2.bin`: `A8AAEE751846A29C88D067D33EE9AB94DC2CC09DA3037C5491ED029B1A3CBDB7`
-- `BOOTX64.EFI`: `9356A507B45C31BD09ED75F2877EC2289DAF467A12815ACE931E324A7177FA74`
-- `xenith-desktop`: `10004A94669065B2AE2DD4F733F7CA28B81D5BB72374780DB6D83E114A146D80`
+The exact ISO above cold-booted in VMware Workstation 17.6.3 on 2026-07-20
+with 512 MiB RAM and 3 vCPUs under both legacy BIOS and UEFI with Secure Boot
+disabled. Both firmware paths brought all three CPUs online, initialized a
+framebuffer, spawned `/init` and `/bin/xenith-desktop`, and reached
+`XENITH_DESKTOP_READY` on COM1. The legacy path additionally recorded packaged
+stage2 entering long mode and selecting VBE; the UEFI path executed the ISO's
+EFI boot entry.
 
-External VMware Workstation 17.6.3 legacy-BIOS cold boots passed earlier on
-2026-07-19 with 512 MiB RAM and 1, 3, 4, 8, 16, and 24 vCPUs. QEMU 11.0.50
-with SeaBIOS 1.17 also passed every integer CPU count from 1 through 64, a
-64-CPU raw-image boot, and a 2-socket by 3-core topology with non-contiguous
-APIC IDs. Those external runs used the preceding ISO
+Earlier VMware legacy-BIOS cold boots passed with 1, 3, 4, 8, 16, and 24
+vCPUs. QEMU 11.0.50 with SeaBIOS 1.17 also passed every integer CPU count from
+1 through 64, a 64-CPU raw-image boot, and a 2-socket by 3-core topology with
+non-contiguous APIC IDs. Those broader-topology external runs used the
+preceding ISO
 `0949DB89FEF66AAA2A83A96858A5D97F12D5561C76ADD0580352954C9ACC110F`
 and raw image
 `074298C35B258A57D483D769C5F638D2620FBE505A968A0700BD3E629289FE20`;
-they were not rerun after the current desktop/scheduler rebuild and are historical
-evidence, not proof of the refreshed hashes above.
+they remain historical topology evidence rather than proof of those CPU counts
+on the current generated artifacts.
 
 Native unit/integration tests also exercise the debugger protocol and GDB RSP
 bridge, CPL-aware walks and interrupt entry, ATA/PCI/HPET/RTL8139 devices,
@@ -187,21 +255,37 @@ ordering.
 ## Remaining boundaries
 
 - Repository-owned emulator gates prove the refreshed raw disk plus BIOS and
-  UEFI ISO entries. VMware Workstation and QEMU/SeaBIOS externally proved the
-  immediately preceding SMP artifact, not the current desktop/scheduler
-  hashes. Neither result establishes physical-PC compatibility or coverage
-  across arbitrary firmware; physical AHCI/NVMe/USB boot, NICs, display/input,
-  ACPI quirks, and cache-flush behavior remain hardware-validation work.
-- The current desktop is deliberately a single-process software compositor.
-  There is no live multi-client window transport, shared client surface
-  service, acceleration, page flipping, or default application yet. The
-  versioned compositor records are specification only. PE loading, NT/Win32
-  APIs, COM, DirectX translation, .NET, and WoW64 are not implemented, so no
-  Windows application compatibility is claimed. SMP input timing stress and
-  broad real-device validation also remain.
-- The current process model has one scheduler task per userspace process.
-  Multi-threaded NT compatibility requires last-thread/refcounted address-space
-  teardown before adding Windows thread semantics.
+  UEFI ISO entries. VMware Workstation externally proves this exact ISO under
+  its BIOS and UEFI implementations at three vCPUs; the wider VMware and
+  QEMU/SeaBIOS CPU matrices belong to the preceding artifact. None establishes
+  physical-PC compatibility or coverage across arbitrary firmware; physical
+  AHCI/NVMe/USB boot, NICs, display/input, ACPI quirks, and cache-flush behavior
+  remain hardware-validation work.
+- The desktop coordinator implements bounded multi-client scene/focus/input
+  policy, but the packaged smoke is still its only live connection. There is no
+  service identity, rendezvous/admission protocol, booted two-client gate,
+  acceleration, page flipping, vsync, or default application. The input ABI
+  also lacks enter/leave, client-requested capture, IME/composition, distinct
+  logical key codes, horizontal wheel, and a dedicated key-overflow marker.
+- The PE host is deliberately limited to AMD64 console executables and five
+  guest-wired imports. DLL/GUI images, TLS, SEH, delay imports, Authenticode,
+  API sets, ordinal/arbitrary imports, Windows threads, registry, general
+  file/process/synchronization APIs, `user32`/`gdi32`, COM, DirectX, .NET,
+  installers, and WoW64 are unsupported. The 12 policy-only NT calls beyond
+  `NtClose` are not guest APIs. The host is not a sandbox: loaded code shares
+  its Xenith syscall authority and inherited descriptors, so only trusted
+  conformance images are supported. No broad Windows-application compatibility
+  is claimed.
+- Native Xenith threads share descriptors and an address space, but have no TLS,
+  detach/cancellation API, or task-local signal state. A clean signal state is
+  required before creating a second task; while multi-threaded, caught-handler,
+  signal-mask, alternate-stack, `fork`, `exec`, and VM mutation operations fail
+  closed. `fork` also rejects active shared mappings until true shared PTE
+  semantics are implemented.
+- The Windows driver policy crate is not a driver executor. An isolated host,
+  checked `.sys` loader/callback ABI, IRQL and PnP/power behavior, capability-
+  backed MMIO/port/interrupt/DMA bridges, framework support, and per-driver
+  conformance tests are all still required.
 - The supported configured CPU range is 1 through 64, including the BSP. CPU
   masks and several per-CPU stores are fixed around `MAX_CPUS=64`; supporting
   more than 64 requires dynamically sized CPU sets and per-CPU storage rather

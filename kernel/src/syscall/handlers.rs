@@ -600,9 +600,9 @@ pub fn sys_brk(ctx: &SyscallContext) -> i64 {
 /// `args[3]` = flags, `args[4]` = fd, `args[5]` = offset.
 ///
 /// Returns the mapped address on success, or `-errno` on failure. Xenith
-/// deliberately supports the bounded `MAP_PRIVATE | MAP_ANONYMOUS` subset;
-/// file, shared, and fixed mappings are rejected instead of silently
-/// approximated. Mappings must be readable and obey W^X.
+/// supports bounded anonymous-private mappings and descriptor-backed
+/// `MAP_SHARED` mappings over fixed-size shared-memory objects. Mappings must
+/// be readable and obey W^X; shared-memory mappings are always non-executable.
 pub fn sys_mmap(ctx: &SyscallContext) -> i64 {
     let addr = ctx.arg(0);
     let len = ctx.arg(1);
@@ -634,15 +634,49 @@ pub fn sys_mmap(ctx: &SyscallContext) -> i64 {
     if prot & xenith_abi::PROT_WRITE != 0 && prot & xenith_abi::PROT_EXEC != 0 {
         return Errno::Eacces.as_ret();
     }
-    let supported_flags = xenith_abi::MAP_PRIVATE | xenith_abi::MAP_ANONYMOUS;
-    if flags != supported_flags || fd != -1 || offset != 0 {
-        return Errno::Eopnotsupp.as_ret();
-    }
     let protection = crate::user::process::VmProtection {
         writable: prot & xenith_abi::PROT_WRITE != 0,
         executable: prot & xenith_abi::PROT_EXEC != 0,
     };
-    match crate::user::process::map_anonymous(addr, len, protection) {
+    let private_anonymous = xenith_abi::MAP_PRIVATE | xenith_abi::MAP_ANONYMOUS;
+    let result = if flags == private_anonymous {
+        if fd != -1 || offset != 0 {
+            return Errno::Einval.as_ret();
+        }
+        crate::user::process::map_anonymous(addr, len, protection)
+    } else if flags == xenith_abi::MAP_SHARED {
+        if fd < 0 || offset < 0 || (offset as u64) & (xenith_types::PAGE_SIZE - 1) != 0 {
+            return Errno::Einval.as_ret();
+        }
+        if protection.executable {
+            return Errno::Eacces.as_ret();
+        }
+        // MAP authorizes creation of a mapping; READ separately authorizes
+        // observing its bytes. Requiring both prevents a MAP-only attenuated
+        // descriptor from becoming an implicit read capability.
+        let mut required_rights =
+            xenith_abi::ipc::IPC_TRANSFER_RIGHT_MAP | xenith_abi::ipc::IPC_TRANSFER_RIGHT_READ;
+        if protection.writable {
+            required_rights |= xenith_abi::ipc::IPC_TRANSFER_RIGHT_WRITE;
+        }
+        let (object, descriptor_rights) =
+            match crate::fs::syscalls::get_shared_memory_with_rights(fd, required_rights) {
+                Ok(resolved) => resolved,
+                Err(error) => return Errno::from(error).as_ret(),
+            };
+        let writable_allowed = descriptor_rights & xenith_abi::ipc::IPC_TRANSFER_RIGHT_WRITE != 0;
+        crate::user::process::map_shared(
+            addr,
+            len,
+            offset as u64,
+            protection,
+            writable_allowed,
+            object,
+        )
+    } else {
+        return Errno::Eopnotsupp.as_ret();
+    };
+    match result {
         Ok(address) => address as i64,
         Err(error) => vm_errno(error).as_ret(),
     }
@@ -653,7 +687,7 @@ pub fn sys_mmap(ctx: &SyscallContext) -> i64 {
 /// Arguments: `args[0]` = addr, `args[1]` = len.
 ///
 /// Returns `0` on success or `-errno` on failure. Only pages wholly covered
-/// by anonymous regions created by [`sys_mmap`] are eligible; ELF, stack,
+/// by dynamic regions created by [`sys_mmap`] are eligible; ELF, stack,
 /// signal trampoline, and program-break pages are protected by construction.
 pub fn sys_munmap(ctx: &SyscallContext) -> i64 {
     let addr = ctx.arg(0);
@@ -665,7 +699,43 @@ pub fn sys_munmap(ctx: &SyscallContext) -> i64 {
     if addr > USER_MAX {
         return Errno::Efault.as_ret();
     }
-    match crate::user::process::unmap_anonymous(addr, len) {
+    match crate::user::process::unmap_dynamic(addr, len) {
+        Ok(()) => 0,
+        Err(error) => vm_errno(error).as_ret(),
+    }
+}
+
+/// `mprotect(addr, len, prot)` — change permissions on mmap-owned pages.
+///
+/// Xenith deliberately supports only readable mappings and enforces W^X.
+/// Shared-memory mappings remain permanently non-executable and cannot gain
+/// write authority beyond the descriptor used to create them; anonymous
+/// mappings can transition from RW to RX for loaders and JIT-style runtimes.
+pub fn sys_mprotect(ctx: &SyscallContext) -> i64 {
+    let addr = ctx.arg(0);
+    let len = ctx.arg(1);
+    let prot = match u32::try_from(ctx.arg(2)) {
+        Ok(value) => value,
+        Err(_) => return Errno::Einval.as_ret(),
+    };
+    if ctx.arg(3) != 0 || ctx.arg(4) != 0 || ctx.arg(5) != 0 || len == 0 {
+        return Errno::Einval.as_ret();
+    }
+    if addr > USER_MAX {
+        return Errno::Efault.as_ret();
+    }
+    const KNOWN_PROT: u32 = xenith_abi::PROT_READ | xenith_abi::PROT_WRITE | xenith_abi::PROT_EXEC;
+    if prot & !KNOWN_PROT != 0 || prot & xenith_abi::PROT_READ == 0 {
+        return Errno::Einval.as_ret();
+    }
+    if prot & xenith_abi::PROT_WRITE != 0 && prot & xenith_abi::PROT_EXEC != 0 {
+        return Errno::Eacces.as_ret();
+    }
+    let protection = crate::user::process::VmProtection {
+        writable: prot & xenith_abi::PROT_WRITE != 0,
+        executable: prot & xenith_abi::PROT_EXEC != 0,
+    };
+    match crate::user::process::protect_dynamic(addr, len, protection) {
         Ok(()) => 0,
         Err(error) => vm_errno(error).as_ret(),
     }
@@ -678,7 +748,9 @@ fn vm_errno(error: crate::user::process::VmError) -> Errno {
         },
         crate::user::process::VmError::OutOfMemory
         | crate::user::process::VmError::AddressInUse => Errno::Enomem,
+        crate::user::process::VmError::PermissionDenied => Errno::Eacces,
         crate::user::process::VmError::NoCurrentProcess => Errno::Esrch,
+        crate::user::process::VmError::Busy => Errno::Ebusy,
         crate::user::process::VmError::TableCorrupt => Errno::Eio,
     }
 }
@@ -701,6 +773,117 @@ pub fn sys_getpid(_ctx: &SyscallContext) -> i64 {
 /// kernel-spawned process and kernel context.
 pub fn sys_getppid(_ctx: &SyscallContext) -> i64 {
     current_ppid()
+}
+
+/// `gettid()` — return the scheduler task id of the calling thread.
+pub fn sys_gettid(ctx: &SyscallContext) -> i64 {
+    if ctx.args.iter().any(|argument| *argument != 0) {
+        return Errno::Einval.as_ret();
+    }
+    crate::user::process::current_thread_id()
+        .and_then(|id| i64::try_from(id).ok())
+        .unwrap_or_else(|| Errno::Esrch.as_ret())
+}
+
+/// Return whether every process-owned signal setting is safe to share with a
+/// second execution stream. Xenith deliberately fails closed until masks,
+/// alternate stacks, and caught-handler delivery state live on scheduler
+/// tasks rather than on `UserProcess`.
+fn signal_state_allows_thread_create(
+    signals: &crate::user::signal::SignalState,
+    current_rsp: u64,
+) -> bool {
+    if signals.blocked_mask().bits() != 0
+        || signals
+            .sigaltstack(current_rsp, None)
+            .map_or(true, |stack| stack.flags & xenith_abi::SS_DISABLE == 0)
+    {
+        return false;
+    }
+
+    !(1..=crate::user::signal::NSIG)
+        .filter_map(crate::user::signal::Signal::from_number)
+        .any(|signal| {
+            matches!(
+                signals.disposition(signal),
+                crate::user::signal::SignalAction::Catch { .. }
+            )
+        })
+}
+
+/// `thread_create(request)` — publish a joinable task in this address space.
+pub fn sys_thread_create(ctx: &SyscallContext) -> i64 {
+    if ctx.args[1..].iter().any(|argument| *argument != 0) {
+        return Errno::Einval.as_ret();
+    }
+    let mut request = xenith_abi::ThreadCreate::default();
+    let size = core::mem::size_of::<xenith_abi::ThreadCreate>();
+    // SAFETY: ThreadCreate is repr(C), initialized, and consists solely of
+    // integer fields for which every bit pattern is valid.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut request as *mut xenith_abi::ThreadCreate).cast::<u8>(),
+            size,
+        )
+    };
+    if let Err(error) = copy_from_user(ctx.arg(0), bytes, size) {
+        return error.as_ret();
+    }
+    let compatible_signal_state = crate::user::process::with_current_process(|process| {
+        signal_state_allows_thread_create(&process.signals, ctx.user_sp)
+    })
+    .unwrap_or(false);
+    if !compatible_signal_state {
+        // Masks, alternate stacks, and caught-handler delivery state are not
+        // yet task-local. Refuse an ambiguous shared instance instead of
+        // pretending POSIX per-thread semantics.
+        return Errno::Eopnotsupp.as_ret();
+    }
+    match crate::user::process::create_thread(request) {
+        Ok(thread) => i64::try_from(thread).unwrap_or_else(|_| Errno::Eagain.as_ret()),
+        Err(error) => process_errno(error).as_ret(),
+    }
+}
+
+/// `thread_exit(code)` — terminate only this execution stream.
+pub fn sys_thread_exit(ctx: &SyscallContext) -> i64 {
+    if ctx.args[1..].iter().any(|argument| *argument != 0) {
+        return Errno::Einval.as_ret();
+    }
+    crate::user::process::thread_exit(ctx.arg_i32(0));
+}
+
+/// `thread_join(tid, result, flags)` — wait for and consume one thread.
+pub fn sys_thread_join(ctx: &SyscallContext) -> i64 {
+    if ctx.arg(2) != 0 || ctx.args[3..].iter().any(|argument| *argument != 0) {
+        return Errno::Einval.as_ret();
+    }
+    let size = core::mem::size_of::<xenith_abi::ThreadJoinResult>();
+    let Some(destination) = crate::arch::x86_64::usercopy::prepare_user_write(ctx.arg(1), size)
+    else {
+        return Errno::Efault.as_ret();
+    };
+    let code = match crate::user::process::join_thread(ctx.arg(0)) {
+        Ok(code) => code,
+        Err(error) => return process_errno(error).as_ret(),
+    };
+    let result = xenith_abi::ThreadJoinResult {
+        exit_code: code,
+        reserved: 0,
+    };
+    // SAFETY: ThreadJoinResult is repr(C), fully initialized, and contains no
+    // padding outside its explicit integer fields.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&result as *const xenith_abi::ThreadJoinResult).cast::<u8>(),
+            size,
+        )
+    };
+    if destination.copy_from_kernel(bytes) {
+        0
+    } else {
+        Errno::Efault.as_ret()
+    }
 }
 
 /// `yield()` — voluntarily yield the CPU to the scheduler.
@@ -828,14 +1011,16 @@ fn process_errno(error: crate::user::ProcessError) -> Errno {
         },
         crate::user::ProcessError::TooManyArguments
         | crate::user::ProcessError::ArgumentListTooLong => Errno::E2big,
-        crate::user::ProcessError::Filesystem(crate::fs::FsError::PermissionDenied) => {
-            Errno::Eacces
-        },
+        crate::user::ProcessError::Filesystem(error) => error.into(),
         crate::user::ProcessError::NoCurrentProcess
-        | crate::user::ProcessError::NoSuchProcess(_) => Errno::Esrch,
+        | crate::user::ProcessError::NoSuchProcess(_)
+        | crate::user::ProcessError::NoSuchThread => Errno::Esrch,
         crate::user::ProcessError::PermissionDenied => Errno::Eperm,
+        crate::user::ProcessError::Busy => Errno::Ebusy,
+        crate::user::ProcessError::TlsUnsupported => Errno::Eopnotsupp,
         crate::user::ProcessError::Interrupted => Errno::Eintr,
         crate::user::ProcessError::SignalQueueFull => Errno::Eagain,
+        crate::user::ProcessError::SharedMappingsUnsupported => Errno::Eopnotsupp,
         crate::user::ProcessError::NoChildren | crate::user::ProcessError::NotChild(_) => {
             Errno::Echild
         },
@@ -885,6 +1070,30 @@ fn process_request_from_user(
     Ok((path, owned_arguments))
 }
 
+/// Preflight an optional wait-status destination before child state changes.
+fn prepare_wait_status_destination(
+    status_ptr: u64,
+) -> Result<Option<crate::arch::x86_64::usercopy::PreparedUserWrite>, Errno> {
+    if status_ptr == 0 {
+        return Ok(None);
+    }
+    let length = core::mem::size_of::<i32>();
+    check_user_buf(status_ptr, length as u64)?;
+    crate::arch::x86_64::usercopy::prepare_user_write(status_ptr, length)
+        .map(Some)
+        .ok_or(Errno::Efault)
+}
+
+fn encode_wait_status(status: crate::user::WaitStatus) -> i32 {
+    match status {
+        crate::user::WaitStatus::Exited(crate::sched::ExitStatus::Pending) => 0,
+        crate::user::WaitStatus::Exited(crate::sched::ExitStatus::Code(code)) => (code as i32) << 8,
+        crate::user::WaitStatus::Exited(crate::sched::ExitStatus::Signal(signal)) => signal & 0x7f,
+        crate::user::WaitStatus::Stopped(signal) => ((signal.as_number() as i32) << 8) | 0x7f,
+        crate::user::WaitStatus::Continued => 0xffff,
+    }
+}
+
 /// `waitpid(pid, status, options)` — wait for a child to change state.
 ///
 /// Arguments: `args[0]` = pid to wait on (or `-1` for any child),
@@ -901,8 +1110,8 @@ pub fn sys_waitpid(ctx: &SyscallContext) -> i64 {
     let options = ctx.arg(2) as u32;
 
     if status_ptr != 0 {
-        if let Err(e) = check_user_ptr(status_ptr) {
-            return e.as_ret();
+        if let Err(error) = check_user_ptr(status_ptr) {
+            return error.as_ret();
         }
     }
     let known_options = xenith_abi::WNOHANG | xenith_abi::WUNTRACED | xenith_abi::WCONTINUED;
@@ -926,6 +1135,13 @@ pub fn sys_waitpid(ctx: &SyscallContext) -> i64 {
     };
     let include_stopped = options & xenith_abi::WUNTRACED != 0;
     let include_continued = options & xenith_abi::WCONTINUED != 0;
+    // Resolve COW and prove the complete destination writable before waiting.
+    // Once a child state is returned it may already have been consumed, so a
+    // first-time EFAULT after that point would make waitpid non-transactional.
+    let prepared_status = match prepare_wait_status_destination(status_ptr) {
+        Ok(destination) => destination,
+        Err(error) => return error.as_ret(),
+    };
     let result = if options & xenith_abi::WNOHANG != 0 {
         crate::user::process::try_wait_selector(selected, include_stopped, include_continued)
     } else {
@@ -934,22 +1150,10 @@ pub fn sys_waitpid(ctx: &SyscallContext) -> i64 {
     match result {
         Ok(None) => 0,
         Ok(Some(waited)) => {
-            if status_ptr != 0 {
-                let status: i32 = match waited.status {
-                    crate::user::WaitStatus::Exited(crate::sched::ExitStatus::Pending) => 0,
-                    crate::user::WaitStatus::Exited(crate::sched::ExitStatus::Code(code)) => {
-                        (code as i32) << 8
-                    },
-                    crate::user::WaitStatus::Exited(crate::sched::ExitStatus::Signal(signal)) => {
-                        signal & 0x7f
-                    },
-                    crate::user::WaitStatus::Stopped(signal) => {
-                        ((signal.as_number() as i32) << 8) | 0x7f
-                    },
-                    crate::user::WaitStatus::Continued => 0xffff,
-                };
-                if let Err(error) = copy_to_user(status_ptr, &status.to_ne_bytes(), 4) {
-                    return error.as_ret();
+            if let Some(destination) = prepared_status.as_ref() {
+                let status = encode_wait_status(waited.status);
+                if !destination.copy_from_kernel(&status.to_ne_bytes()) {
+                    return Errno::Efault.as_ret();
                 }
             }
             waited.pid.as_u64() as i64
@@ -995,21 +1199,43 @@ pub fn sys_uname(ctx: &SyscallContext) -> i64 {
     }
 }
 
+// Recognized device-control operations require a descriptor with at least
+// one data-access capability. Unknown commands retain EBADF/ENOTTY behavior.
+fn ioctl_data_rights(command: u32) -> Option<u32> {
+    matches!(
+        command,
+        xenith_abi::TIOCGPTN
+            | xenith_abi::TCGETS
+            | xenith_abi::TCSETS
+            | xenith_abi::TCSETSW
+            | xenith_abi::TCSETSF
+            | xenith_abi::TIOCGWINSZ
+            | xenith_abi::TIOCSWINSZ
+            | xenith_abi::TIOCGPGRP
+            | xenith_abi::TIOCSPGRP
+            | xenith_abi::FIONREAD
+    )
+    .then_some(xenith_abi::ipc::IPC_TRANSFER_RIGHT_READ | xenith_abi::ipc::IPC_TRANSFER_RIGHT_WRITE)
+}
+
 /// `ioctl(fd, cmd, arg)` — device control.
 ///
-/// Arguments: `args[0]` = fd, `args[1]` = cmd, `args[2]` = arg.
-///
-/// Returns `0` on success or `-errno` on failure. No device exposes ioctl
-/// commands yet; the handler returns `-ENOTTY` for a valid fd (the
-/// conventional "inappropriate ioctl for device") and `-EBADF` for an
-/// unopen one. A future terminal / framebuffer ioctl set will dispatch on
-/// `cmd` here.
+/// Arguments: `args[0]` = fd, `args[1]` = cmd, `args[2]` = arg. Returns `0`
+/// on success or `-errno` on failure. Unknown commands return `-ENOTTY` for a
+/// valid descriptor.
 pub fn sys_ioctl(ctx: &SyscallContext) -> i64 {
     let fd = ctx.arg_i32(0);
     let cmd = ctx.arg(1) as u32;
     let arg = ctx.arg(2);
 
-    let file = match crate::fs::syscalls::get_file(fd) {
+    // Terminal-control operations are independent of the descriptor's data
+    // access mode: tcsetpgrp and termios setters are valid through a
+    // read-only controlling-terminal descriptor such as stdin. Requiring
+    // either data capability still rejects a transfer-only descriptor.
+    let file = match ioctl_data_rights(cmd).map_or_else(
+        || crate::fs::syscalls::get_file(fd),
+        |accepted| crate::fs::syscalls::get_file_with_any_right(fd, accepted),
+    ) {
         Ok(file) => file,
         Err(error) => return Errno::from(error).as_ret(),
     };
@@ -1356,6 +1582,16 @@ pub fn sys_sigaction(ctx: &SyscallContext) -> i64 {
             Err(error) => return error.as_ret(),
         }
     };
+    if matches!(
+        new_action,
+        Some(crate::user::signal::SignalAction::Catch { .. })
+    ) && crate::user::process::current_live_thread_count().is_some_and(|count| count > 1)
+    {
+        // Handler-entry masks are still process-owned. Default and ignored
+        // dispositions remain process-wide and safe, but caught handlers are
+        // unavailable until delivery state is task-local.
+        return Errno::Eopnotsupp.as_ret();
+    }
 
     let Some(previous) =
         crate::user::process::with_current_process(|process| process.signals.disposition(signal))
@@ -1382,6 +1618,9 @@ pub fn sys_sigaction(ctx: &SyscallContext) -> i64 {
 
 /// `sigprocmask(how, set, old_set)` — atomically update the blocked mask.
 pub fn sys_sigprocmask(ctx: &SyscallContext) -> i64 {
+    if crate::user::process::current_live_thread_count().is_some_and(|count| count > 1) {
+        return Errno::Eopnotsupp.as_ret();
+    }
     let how = ctx.arg(0) as u32;
     let set_pointer = ctx.arg(1);
     let old_pointer = ctx.arg(2);
@@ -1453,6 +1692,9 @@ fn encode_alt_stack(stack: xenith_abi::SigAltStack) -> [u8; 24] {
 /// `sigaltstack(new, old)` installs, disables, or queries the bounded
 /// alternate signal stack. Fork inherits the setting; exec disables it.
 pub fn sys_sigaltstack(ctx: &SyscallContext) -> i64 {
+    if crate::user::process::current_live_thread_count().is_some_and(|count| count > 1) {
+        return Errno::Eopnotsupp.as_ret();
+    }
     let new_pointer = ctx.arg(0);
     let old_pointer = ctx.arg(1);
     let new_stack = if new_pointer == 0 {
@@ -1761,6 +2003,17 @@ fn spawn_from_user(
     })
 }
 
+#[inline]
+fn decode_spawn_group(raw: u64) -> crate::user::process::SpawnGroup {
+    match raw {
+        xenith_abi::SPAWN_GROUP_INHERIT => crate::user::process::SpawnGroup::Inherit,
+        xenith_abi::SPAWN_GROUP_NEW => crate::user::process::SpawnGroup::New,
+        process_group => {
+            crate::user::process::SpawnGroup::Join(crate::user::ProcessId(process_group))
+        },
+    }
+}
+
 /// Spawn a child process without duplicating the caller's address space.
 ///
 /// Argument 5 atomically selects process-group placement before the child can
@@ -1768,16 +2021,56 @@ fn spawn_from_user(
 /// value joins that same-session group. This closes the short-lived pipeline
 /// race inherent in a separate parent-side `setpgid` call.
 pub fn sys_spawn(ctx: &SyscallContext) -> i64 {
-    let group = match ctx.arg(4) {
-        xenith_abi::SPAWN_GROUP_INHERIT => crate::user::process::SpawnGroup::Inherit,
-        xenith_abi::SPAWN_GROUP_NEW => crate::user::process::SpawnGroup::New,
-        process_group => {
-            crate::user::process::SpawnGroup::Join(crate::user::ProcessId(process_group))
-        },
-    };
+    let group = decode_spawn_group(ctx.arg(4));
     match spawn_from_user(ctx.arg(0), ctx.arg(1) as usize, ctx.arg(2), group) {
         Ok(pid) => pid.as_u64() as i64,
         Err(error) => error.as_ret(),
+    }
+}
+
+/// Spawn a child with an empty descriptor table plus a canonical, explicitly
+/// attenuated source-to-target mapping batch.
+///
+/// Arguments mirror `spawn`, except argument 4 points to a fixed-width
+/// [`xenith_abi::SpawnRestrictedRequest`] containing process-group placement
+/// and descriptor actions. Argument 5 is reserved and must be zero.
+pub fn sys_spawn_restricted(ctx: &SyscallContext) -> i64 {
+    if ctx.arg(5) != 0 {
+        return Errno::Einval.as_ret();
+    }
+
+    let mut request = xenith_abi::SpawnRestrictedRequest::default();
+    let size = core::mem::size_of::<xenith_abi::SpawnRestrictedRequest>();
+    // SAFETY: SpawnRestrictedRequest is repr(C), initialized, and consists
+    // solely of integer fields and integer-only SpawnFileAction records.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut request as *mut xenith_abi::SpawnRestrictedRequest).cast::<u8>(),
+            size,
+        )
+    };
+    if let Err(error) = copy_from_user(ctx.arg(4), bytes, size) {
+        return error.as_ret();
+    }
+    if !request.is_canonical() {
+        return Errno::Einval.as_ret();
+    }
+
+    // Copy and validate every variable-length userspace argument before the
+    // process layer can allocate or publish a child record.
+    let (path, owned_arguments) =
+        match process_request_from_user(ctx.arg(0), ctx.arg(1) as usize, ctx.arg(2)) {
+            Ok(request) => request,
+            Err(error) => return error.as_ret(),
+        };
+    let arguments: Vec<&str> = owned_arguments.iter().map(String::as_str).collect();
+    let group = decode_spawn_group(request.process_group);
+    match crate::user::process::spawn_restricted_in_group(&path, &arguments, group, &request) {
+        Ok(pid) => pid.as_u64() as i64,
+        Err(error) => {
+            ::log::warn!("restricted spawn {} failed: {}", path, error);
+            process_errno(error).as_ret()
+        },
     }
 }
 
@@ -2316,6 +2609,71 @@ mod user_range_tests {
     }
 
     #[test]
+    fn restricted_spawn_preserves_group_encoding_and_fd_errors() {
+        assert!(matches!(
+            decode_spawn_group(xenith_abi::SPAWN_GROUP_INHERIT),
+            crate::user::process::SpawnGroup::Inherit
+        ));
+        assert!(matches!(
+            decode_spawn_group(xenith_abi::SPAWN_GROUP_NEW),
+            crate::user::process::SpawnGroup::New
+        ));
+        assert!(matches!(
+            decode_spawn_group(41),
+            crate::user::process::SpawnGroup::Join(crate::user::ProcessId(41))
+        ));
+        assert_eq!(
+            process_errno(crate::user::ProcessError::Filesystem(
+                crate::fs::FsError::BadFileDescriptor,
+            )),
+            Errno::Ebadf
+        );
+        assert_eq!(
+            process_errno(crate::user::ProcessError::Filesystem(
+                crate::fs::FsError::PermissionDenied,
+            )),
+            Errno::Eacces
+        );
+    }
+
+    #[test]
+    fn thread_creation_rejects_shared_signal_handler_state() {
+        let signals = crate::user::signal::SignalState::try_new().unwrap();
+        assert!(signal_state_allows_thread_create(&signals, 0x8000));
+
+        signals.set_blocked(crate::user::signal::SignalMask::from_bits_sanitized(
+            1u64 << crate::user::signal::Signal::Usr1.as_number(),
+        ));
+        assert!(!signal_state_allows_thread_create(&signals, 0x8000));
+        signals.set_blocked(crate::user::signal::SignalMask::empty());
+
+        assert!(signals.set_handler(
+            crate::user::signal::Signal::Usr1,
+            crate::user::signal::SignalAction::Catch {
+                entry: 0x4000,
+                mask: crate::user::signal::SignalMask::empty(),
+                flags: 0,
+            },
+        ));
+        assert!(!signal_state_allows_thread_create(&signals, 0x8000));
+    }
+
+    #[test]
+    fn terminal_control_ioctls_accept_either_data_access_mode() {
+        let either_data_right =
+            xenith_abi::ipc::IPC_TRANSFER_RIGHT_READ | xenith_abi::ipc::IPC_TRANSFER_RIGHT_WRITE;
+        assert_eq!(
+            ioctl_data_rights(xenith_abi::TIOCSPGRP),
+            Some(either_data_right)
+        );
+        assert_eq!(
+            ioctl_data_rights(xenith_abi::TCSETS),
+            Some(either_data_right)
+        );
+        assert_eq!(ioctl_data_rights(u32::MAX), None);
+    }
+
+    #[test]
     fn inclusive_user_limit_accepts_its_final_byte() {
         assert_eq!(check_user_buf(USER_MAX, 1), Ok(()));
         assert_eq!(check_user_buf(USER_MAX - 15, 16), Ok(()));
@@ -2326,5 +2684,40 @@ mod user_range_tests {
         assert_eq!(check_user_buf(0, 1), Err(Errno::Efault));
         assert_eq!(check_user_buf(USER_MAX, 2), Err(Errno::Efault));
         assert_eq!(check_user_buf(u64::MAX - 1, 4), Err(Errno::Efault));
+    }
+
+    #[test]
+    fn wait_status_preflight_accepts_null_and_rejects_crossing_range() {
+        assert!(prepare_wait_status_destination(0).unwrap().is_none());
+        assert!(matches!(
+            prepare_wait_status_destination(USER_MAX - 2),
+            Err(Errno::Efault)
+        ));
+    }
+
+    #[test]
+    fn wait_status_encoding_preserves_posix_representations() {
+        assert_eq!(
+            encode_wait_status(crate::user::WaitStatus::Exited(
+                crate::sched::ExitStatus::Code(23)
+            )),
+            23 << 8
+        );
+        assert_eq!(
+            encode_wait_status(crate::user::WaitStatus::Exited(
+                crate::sched::ExitStatus::Signal(9)
+            )),
+            9
+        );
+        assert_eq!(
+            encode_wait_status(crate::user::WaitStatus::Stopped(
+                crate::user::signal::Signal::Tstp
+            )),
+            ((crate::user::signal::Signal::Tstp.as_number() as i32) << 8) | 0x7f
+        );
+        assert_eq!(
+            encode_wait_status(crate::user::WaitStatus::Continued),
+            0xffff
+        );
     }
 }

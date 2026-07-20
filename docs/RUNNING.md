@@ -113,6 +113,57 @@ launcher with Super, and has no bundled applications. `Ctrl+Alt+Backspace`,
 `Ctrl+Alt+F1`, or `Super+Shift+Q` releases the session and enters the terminal
 fallback. These options capture final state; the emulator does not open a live
 window.
+
+From that fallback shell, the explicit native-window proof is:
+
+```text
+/bin/xenith-desktop --window-smoke --smoke-exit
+```
+
+This mode alone creates a private channel and launches
+`/bin/xenith-window-smoke`; normal desktop startup remains app-free. The launch
+uses `spawn_restricted`: the child starts with only stdout, stderr, and its
+client endpoint at descriptor 3. The current packaged mode still opens one
+connection; the compositor's eight-client coordinator has no general service
+rendezvous yet.
+
+The packaged native-thread proof is:
+
+```text
+/bin/thread-smoke
+```
+
+It maps two independent 64 KiB RW/NX stacks, creates two joinable tasks, checks
+three distinct `gettid` values and both exit codes, joins them, then unmaps both
+stacks and prints `XENITH_THREAD_OK`. After building all artifacts, run its
+booted-guest gate with:
+
+```text
+cargo test -p xenith-integration --test shell userspace_threads_create_join_and_teardown_in_guest -- --ignored --exact
+```
+
+The packaged bounded Win64 console proof is:
+
+```text
+/bin/xenith-winhost /tests/win64-console.exe
+```
+
+The fixture calls `KERNEL32.DLL!GetStdHandle`, `WriteFile`, and `ExitProcess`
+through the host's bootstrap IAT and returns to the Xenith shell. Its preferred
+base deliberately overlaps the host ELF; the build rejects a layout that loses
+that collision, and the fixture emits its success line only after its absolute
+message pointer has been correctly rebased by a DIR64 relocation. The host
+executes it on a dedicated bounded stack with an unmapped lower guard page.
+
+This demonstrates only the documented PE32+ AMD64 console subset. It is not a
+sandbox: the trusted fixture executes inside `xenith-winhost` with that
+process's Xenith syscall authority and inherited descriptors. After building
+all artifacts, run the explicit booted-guest gate with:
+
+```text
+cargo test -p xenith-integration --test winhost win64_console_fixture_executes_through_booted_host -- --ignored --exact
+```
+
 The RTL8139 device similarly has deterministic transmit completion but no host
 network backend or inbound-frame source.
 
@@ -185,7 +236,7 @@ accepts the direct kernel/initramfs handoff, not the packaged BIOS or UEFI
 paths; only one and two vCPUs have artifact-backed runtime proof. VMM debugging,
 host networking, and a live GUI are not implemented.
 
-## VMware Workstation legacy BIOS
+## VMware Workstation BIOS and UEFI
 
 Create a custom VM with guest type **Other / Other 64-bit**, select **BIOS**
 firmware, assign any supported count from 1 through 64 vCPUs (subject to the
@@ -201,10 +252,16 @@ unavailable, the loader deliberately falls back to VGA text and init starts
 `Xenith shell 0.1` / `xenith$`. From the desktop, use
 `Ctrl+Alt+Backspace`, `Ctrl+Alt+F1`, or `Super+Shift+Q` to restore the terminal
 shell deliberately.
-VMware Workstation 17.6.3 cold boots of the preceding externally tested ISO
-passed with 1, 3, 4, 8, 16, and 24 vCPUs. The corresponding cores-per-socket
-values were 1, 1, 2, 4, 8, and 12; 24 was the tested host's logical-CPU limit.
-See [STATUS](STATUS.md) for its hash and the current artifact boundary.
+
+For UEFI, use the same ISO, select **UEFI**, and leave Secure Boot disabled.
+The current ISO identified in [STATUS](STATUS.md) cold-booted in VMware
+Workstation 17.6.3 with 512 MiB and 3 vCPUs under both BIOS and UEFI on
+2026-07-20. Both reached `XENITH_DESKTOP_READY`, and all three CPUs came online.
+The preceding ISO also passed legacy-BIOS boots with 1, 3, 4, 8, 16, and 24
+vCPUs. The corresponding cores-per-socket values were 1, 1, 2, 4, 8, and 12;
+24 was the tested host's logical-CPU limit. See [STATUS](STATUS.md) for exact
+hashes and the distinction between current-artifact and historical topology
+proof.
 
 The ISO is the normal VMware path. Booting `build/xenith.img` directly requires
 a VMDK wrapper that maps the raw image; VMware does not accept the raw `.img`
@@ -228,8 +285,9 @@ before using a platform imaging tool.
 
 The packaged execution gates prove Xenith's exact BIOS stage streams and its
 exact UEFI application under the repository's deterministic service models.
-Separately, VMware Workstation 17.6.3 legacy BIOS cold boots on 2026-07-19
-proved the preceding externally tested ISO at 1, 3, 4, 8, 16, and 24 vCPUs.
+Separately, VMware Workstation 17.6.3 BIOS and UEFI cold boots on 2026-07-20
+proved the current ISO at 3 vCPUs. Legacy BIOS cold boots on 2026-07-19 proved
+the preceding externally tested ISO at 1, 3, 4, 8, 16, and 24 vCPUs.
 QEMU 11.0.50 with SeaBIOS 1.17 proved every integer CPU count from 1 through
 64 for that ISO, its raw image at 64 CPUs, and a 2-socket by 3-core topology
 with non-contiguous APIC IDs. Every tested configuration brought the requested

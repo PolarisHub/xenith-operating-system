@@ -130,6 +130,17 @@ pub enum SyscallNumber {
     UiPresent = 55,
     UiReadEvents = 56,
     UiRelease = 57,
+    ChannelCreate = 58,
+    ChannelSend = 59,
+    ChannelRecv = 60,
+    ShmCreate = 61,
+    Wait = 62,
+    Mprotect = 63,
+    ThreadCreate = 64,
+    ThreadExit = 65,
+    ThreadJoin = 66,
+    Gettid = 67,
+    SpawnRestricted = 68,
 }
 
 /// `read` — read up to `count` bytes from `fd` into `buf`.
@@ -214,13 +225,24 @@ pub const SYS_UI_ACQUIRE: u64 = SyscallNumber::UiAcquire as u64;
 pub const SYS_UI_PRESENT: u64 = SyscallNumber::UiPresent as u64;
 pub const SYS_UI_READ_EVENTS: u64 = SyscallNumber::UiReadEvents as u64;
 pub const SYS_UI_RELEASE: u64 = SyscallNumber::UiRelease as u64;
+pub const SYS_CHANNEL_CREATE: u64 = SyscallNumber::ChannelCreate as u64;
+pub const SYS_CHANNEL_SEND: u64 = SyscallNumber::ChannelSend as u64;
+pub const SYS_CHANNEL_RECV: u64 = SyscallNumber::ChannelRecv as u64;
+pub const SYS_SHM_CREATE: u64 = SyscallNumber::ShmCreate as u64;
+pub const SYS_WAIT: u64 = SyscallNumber::Wait as u64;
+pub const SYS_MPROTECT: u64 = SyscallNumber::Mprotect as u64;
+pub const SYS_THREAD_CREATE: u64 = SyscallNumber::ThreadCreate as u64;
+pub const SYS_THREAD_EXIT: u64 = SyscallNumber::ThreadExit as u64;
+pub const SYS_THREAD_JOIN: u64 = SyscallNumber::ThreadJoin as u64;
+pub const SYS_GETTID: u64 = SyscallNumber::Gettid as u64;
+pub const SYS_SPAWN_RESTRICTED: u64 = SyscallNumber::SpawnRestricted as u64;
 
 /// The number of slots in the [`SYSCALLS`] table.
 ///
 /// This is one past the highest assigned syscall number so that every assigned
 /// number is a valid in-bounds index. Growing the table means bumping this and
 /// extending the array initialiser in lockstep.
-pub const NUM_SYSCALLS: usize = 58;
+pub const NUM_SYSCALLS: usize = 69;
 
 // ---------------------------------------------------------------------------
 // The table
@@ -237,64 +259,75 @@ pub const NUM_SYSCALLS: usize = 58;
 /// `'static` and needs no allocator. Handlers are defined in
 /// [`super::handlers`] and referenced here by name.
 pub static SYSCALLS: [Option<SyscallFn>; NUM_SYSCALLS] = [
-    Some(super::handlers::sys_read),           // 0  read
-    Some(super::handlers::sys_write),          // 1  write
-    Some(super::handlers::sys_open),           // 2  open
-    Some(super::handlers::sys_close),          // 3  close
-    Some(super::handlers::sys_exit),           // 4  exit
-    Some(super::handlers::sys_brk),            // 5  brk
-    Some(super::handlers::sys_mmap),           // 6  mmap
-    Some(super::handlers::sys_munmap),         // 7  munmap
-    Some(super::handlers::sys_getpid),         // 8  getpid
-    Some(super::handlers::sys_getppid),        // 9  getppid
-    Some(super::handlers::sys_yield),          // 10 yield
-    Some(super::handlers::sys_nanosleep),      // 11 nanosleep
-    Some(super::handlers::sys_fork),           // 12 fork
-    Some(super::handlers::sys_exec),           // 13 exec
-    Some(super::handlers::sys_waitpid),        // 14 waitpid
-    Some(super::handlers::sys_uname),          // 15 uname
-    Some(super::handlers::sys_ioctl),          // 16 ioctl
-    Some(super::handlers::sys_lseek),          // 17 lseek
-    Some(super::handlers::sys_stat),           // 18 stat
-    Some(super::handlers::sys_dup),            // 19 dup
-    Some(super::handlers::sys_dup2),           // 20 dup2
-    Some(super::handlers::sys_pipe),           // 21 pipe
-    Some(super::handlers::sys_chdir),          // 22 chdir
-    Some(super::handlers::sys_getcwd),         // 23 getcwd
-    Some(super::handlers::sys_mkdir),          // 24 mkdir
-    Some(super::handlers::sys_unlink),         // 25 unlink
-    Some(super::handlers::sys_read_dir),       // 26 read_dir
-    Some(super::handlers::sys_clock_gettime),  // 27 clock_gettime
-    Some(super::handlers::sys_spawn),          // 28 spawn
-    Some(super::handlers::sys_socket),         // 29 socket
-    Some(super::handlers::sys_bind),           // 30 bind
-    Some(super::handlers::sys_listen),         // 31 listen
-    Some(super::handlers::sys_accept),         // 32 accept
-    Some(super::handlers::sys_connect),        // 33 connect
-    Some(super::handlers::sys_send),           // 34 send
-    Some(super::handlers::sys_recv),           // 35 recv
-    Some(super::handlers::sys_net_info),       // 36 net_info
-    Some(super::handlers::sys_kill),           // 37 kill
-    Some(super::handlers::sys_mount_ramfs),    // 38 mount_ramfs
-    Some(super::handlers::sys_unmount),        // 39 unmount
-    Some(super::handlers::sys_symlink),        // 40 symlink
-    Some(super::handlers::sys_chmod),          // 41 chmod
-    Some(super::handlers::sys_chown),          // 42 chown
-    Some(super::handlers::sys_utimens),        // 43 utimens
-    Some(super::handlers::sys_rmdir),          // 44 rmdir
-    Some(super::handlers::sys_setpgid),        // 45 setpgid
-    Some(super::handlers::sys_getpgrp),        // 46 getpgrp
-    Some(super::handlers::sys_setsid),         // 47 setsid
-    Some(super::handlers::sys_open_pty),       // 48 openpty
-    Some(super::handlers::sys_sigreturn),      // 49 sigreturn (live-frame entry special-case)
-    Some(super::handlers::sys_sigaction),      // 50 sigaction
-    Some(super::handlers::sys_sigprocmask),    // 51 sigprocmask
-    Some(crate::devices::rng::sys_getrandom),  // 52 getrandom
-    Some(super::handlers::sys_sigaltstack),    // 53 sigaltstack
-    Some(super::handlers::sys_ui_acquire),     // 54 ui_acquire
-    Some(super::handlers::sys_ui_present),     // 55 ui_present
-    Some(super::handlers::sys_ui_read_events), // 56 ui_read_events
-    Some(super::handlers::sys_ui_release),     // 57 ui_release
+    Some(super::handlers::sys_read),               // 0  read
+    Some(super::handlers::sys_write),              // 1  write
+    Some(super::handlers::sys_open),               // 2  open
+    Some(super::handlers::sys_close),              // 3  close
+    Some(super::handlers::sys_exit),               // 4  exit
+    Some(super::handlers::sys_brk),                // 5  brk
+    Some(super::handlers::sys_mmap),               // 6  mmap
+    Some(super::handlers::sys_munmap),             // 7  munmap
+    Some(super::handlers::sys_getpid),             // 8  getpid
+    Some(super::handlers::sys_getppid),            // 9  getppid
+    Some(super::handlers::sys_yield),              // 10 yield
+    Some(super::handlers::sys_nanosleep),          // 11 nanosleep
+    Some(super::handlers::sys_fork),               // 12 fork
+    Some(super::handlers::sys_exec),               // 13 exec
+    Some(super::handlers::sys_waitpid),            // 14 waitpid
+    Some(super::handlers::sys_uname),              // 15 uname
+    Some(super::handlers::sys_ioctl),              // 16 ioctl
+    Some(super::handlers::sys_lseek),              // 17 lseek
+    Some(super::handlers::sys_stat),               // 18 stat
+    Some(super::handlers::sys_dup),                // 19 dup
+    Some(super::handlers::sys_dup2),               // 20 dup2
+    Some(super::handlers::sys_pipe),               // 21 pipe
+    Some(super::handlers::sys_chdir),              // 22 chdir
+    Some(super::handlers::sys_getcwd),             // 23 getcwd
+    Some(super::handlers::sys_mkdir),              // 24 mkdir
+    Some(super::handlers::sys_unlink),             // 25 unlink
+    Some(super::handlers::sys_read_dir),           // 26 read_dir
+    Some(super::handlers::sys_clock_gettime),      // 27 clock_gettime
+    Some(super::handlers::sys_spawn),              // 28 spawn
+    Some(super::handlers::sys_socket),             // 29 socket
+    Some(super::handlers::sys_bind),               // 30 bind
+    Some(super::handlers::sys_listen),             // 31 listen
+    Some(super::handlers::sys_accept),             // 32 accept
+    Some(super::handlers::sys_connect),            // 33 connect
+    Some(super::handlers::sys_send),               // 34 send
+    Some(super::handlers::sys_recv),               // 35 recv
+    Some(super::handlers::sys_net_info),           // 36 net_info
+    Some(super::handlers::sys_kill),               // 37 kill
+    Some(super::handlers::sys_mount_ramfs),        // 38 mount_ramfs
+    Some(super::handlers::sys_unmount),            // 39 unmount
+    Some(super::handlers::sys_symlink),            // 40 symlink
+    Some(super::handlers::sys_chmod),              // 41 chmod
+    Some(super::handlers::sys_chown),              // 42 chown
+    Some(super::handlers::sys_utimens),            // 43 utimens
+    Some(super::handlers::sys_rmdir),              // 44 rmdir
+    Some(super::handlers::sys_setpgid),            // 45 setpgid
+    Some(super::handlers::sys_getpgrp),            // 46 getpgrp
+    Some(super::handlers::sys_setsid),             // 47 setsid
+    Some(super::handlers::sys_open_pty),           // 48 openpty
+    Some(super::handlers::sys_sigreturn),          // 49 sigreturn (live-frame entry special-case)
+    Some(super::handlers::sys_sigaction),          // 50 sigaction
+    Some(super::handlers::sys_sigprocmask),        // 51 sigprocmask
+    Some(crate::devices::rng::sys_getrandom),      // 52 getrandom
+    Some(super::handlers::sys_sigaltstack),        // 53 sigaltstack
+    Some(super::handlers::sys_ui_acquire),         // 54 ui_acquire
+    Some(super::handlers::sys_ui_present),         // 55 ui_present
+    Some(super::handlers::sys_ui_read_events),     // 56 ui_read_events
+    Some(super::handlers::sys_ui_release),         // 57 ui_release
+    Some(crate::ipc::syscall::sys_channel_create), // 58 channel_create
+    Some(crate::ipc::syscall::sys_channel_send),   // 59 channel_send
+    Some(crate::ipc::syscall::sys_channel_recv),   // 60 channel_recv
+    Some(crate::ipc::syscall::sys_shm_create),     // 61 shm_create
+    Some(crate::ipc::wait::sys_wait),              // 62 wait
+    Some(super::handlers::sys_mprotect),           // 63 mprotect
+    Some(super::handlers::sys_thread_create),      // 64 thread_create
+    Some(super::handlers::sys_thread_exit),        // 65 thread_exit
+    Some(super::handlers::sys_thread_join),        // 66 thread_join
+    Some(super::handlers::sys_gettid),             // 67 gettid
+    Some(super::handlers::sys_spawn_restricted),   // 68 spawn_restricted
 ];
 
 /// Look up the handler for syscall number `num`.
@@ -380,6 +413,17 @@ pub fn name_for(num: u64) -> &'static str {
         SYS_UI_PRESENT => "ui_present",
         SYS_UI_READ_EVENTS => "ui_read_events",
         SYS_UI_RELEASE => "ui_release",
+        SYS_CHANNEL_CREATE => "channel_create",
+        SYS_CHANNEL_SEND => "channel_send",
+        SYS_CHANNEL_RECV => "channel_recv",
+        SYS_SHM_CREATE => "shm_create",
+        SYS_WAIT => "wait",
+        SYS_MPROTECT => "mprotect",
+        SYS_THREAD_CREATE => "thread_create",
+        SYS_THREAD_EXIT => "thread_exit",
+        SYS_THREAD_JOIN => "thread_join",
+        SYS_GETTID => "gettid",
+        SYS_SPAWN_RESTRICTED => "spawn_restricted",
         _ => "unknown",
     }
 }
@@ -391,7 +435,7 @@ pub fn name_for(num: u64) -> &'static str {
 // compiler.
 const _TABLE_SIZE_ASSERT: () = {
     const fn max_assigned() -> usize {
-        let n = SYS_UI_RELEASE as usize;
+        let n = SYS_SPAWN_RESTRICTED as usize;
         // The table must be at least `n + 1` long so index `n` is in bounds.
         n + 1
     }
@@ -411,7 +455,7 @@ mod tests {
 
     #[test]
     fn extended_coreutils_syscalls_are_dense_and_named() {
-        assert_eq!(NUM_SYSCALLS, SYS_UI_RELEASE as usize + 1);
+        assert_eq!(NUM_SYSCALLS, SYS_SPAWN_RESTRICTED as usize + 1);
         for (number, name) in [
             (SYS_KILL, "kill"),
             (SYS_MOUNT_RAMFS, "mount_ramfs"),
@@ -434,6 +478,17 @@ mod tests {
             (SYS_UI_PRESENT, "ui_present"),
             (SYS_UI_READ_EVENTS, "ui_read_events"),
             (SYS_UI_RELEASE, "ui_release"),
+            (SYS_CHANNEL_CREATE, "channel_create"),
+            (SYS_CHANNEL_SEND, "channel_send"),
+            (SYS_CHANNEL_RECV, "channel_recv"),
+            (SYS_SHM_CREATE, "shm_create"),
+            (SYS_WAIT, "wait"),
+            (SYS_MPROTECT, "mprotect"),
+            (SYS_THREAD_CREATE, "thread_create"),
+            (SYS_THREAD_EXIT, "thread_exit"),
+            (SYS_THREAD_JOIN, "thread_join"),
+            (SYS_GETTID, "gettid"),
+            (SYS_SPAWN_RESTRICTED, "spawn_restricted"),
         ] {
             assert!(lookup(number).is_some());
             assert_eq!(name_for(number), name);

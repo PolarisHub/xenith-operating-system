@@ -1,0 +1,19 @@
+[package]
+name = "xenith-pe"
+version = "0.1.0"
+edition = "2021"
+authors = ["Xenith OS Contributors"]
+description = "Checked no_std PE32+ image parser and loader planning primitives for Xenith"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+
+[lints]
+workspace = true

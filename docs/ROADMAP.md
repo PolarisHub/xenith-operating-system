@@ -1,61 +1,78 @@
 # Roadmap
 
-The first single-process visual desktop shell is complete. Independent
+The app-free visual desktop, restricted descriptor launch, native thread
+substrate, and bounded eight-client compositor/input coordinator are complete.
+The packaged runtime still opens only one opt-in smoke connection. Independent
 correctness and application-platform work remains ordered by runtime impact.
 Completed work such as COW fork, `/dev/pts`, SSDT loading, NIC interrupt mode,
 XenithFS flush barriers, SMP bring-up, native framebuffer-format handling, the
-exclusive UI-session ABI, and the allocation-free glass desktop is not repeated
-as future work.
+exclusive UI-session ABI, allocation-free glass desktop, transactional
+restricted spawn actions, and last-thread address-space teardown are not
+repeated as future work.
 
-1. Connect the versioned `xenith-abi::compositor` records to a bounded IPC and
-   shared-memory transport. Keep direct scanout ownership in the desktop,
-   validate generation-safe object lifetimes, and add multi-process client
-   surfaces, configure/acknowledge, focus, input routing, close, and frame-done
-   behavior without adding an idle polling loop.
-2. Build Windows compatibility as an isolated userspace subsystem. First make
-   process address-space teardown last-thread/refcount driven and add the
-   thread lifecycle needed by NT semantics. Then add PE32+/PE32 loading,
-   relocations/imports/TLS/SEH and NT object, file, registry, synchronization,
-   and virtual-memory behavior; layer `ntdll`, `kernel32`, `user32`/`gdi32`
-   through a WinServer mapped onto compositor surfaces. COM/OLE, DirectX
-   translation, .NET, installers, and WoW64 follow only behind conformance
-   tests. Do not claim broad Windows-app compatibility from symbol coverage
-   alone.
-3. Remove the BIOS emulator's semantic `stage2_main` boundary by executing the
+1. Add compositor service identity, rendezvous, and admission. Use the existing
+   restricted-spawn actions to grant each child exactly one least-rights client
+   endpoint, then define discovery, quotas, authentication policy, and peer
+   teardown for independently launched applications.
+2. Add a booted multi-client compositor gate and desktop window management.
+   Exercise two isolated clients, focus/z-order transitions, implicit pointer
+   capture, text routing, stalled-client teardown, and quota faults in one live
+   session; add explicit window-close/chrome policy without weakening the fixed
+   capacities or allocation-free idle wait.
+3. Complete task-local thread semantics. Add architectural TLS, task-local
+   signal masks/alternate stacks/handler frames, detach/cancellation policy,
+   multi-waiter process semantics, synchronization primitives, and loader state.
+   Back restricted-spawn rollback and last-thread teardown with booted-guest
+   fault injection before mapping these primitives onto Windows threads.
+4. Broaden Windows compatibility as an isolated userspace subsystem. Safely
+   decode and contain guest x64 arguments/results before wiring the 12
+   policy-only NT catalog entries beyond `NtClose`; add scheduler-backed waits,
+   PEB/TEB materialization, TLS/SEH, and dynamic-module loading. Then implement
+   deliberately tested NT file, registry, process, and virtual-memory behavior
+   and layer broader `ntdll`/`kernel32` plus `user32`/`gdi32` through a userspace
+   WinServer. PE32, COM/OLE, DirectX translation, .NET, installers, and WoW64
+   follow only behind conformance tests; symbol coverage alone is not an
+   application-compatibility claim.
+5. Build an isolated Windows driver host around `xenith-windrv-core`. Add a
+   checked `.sys` loader, contained callback ABI, capability-backed port/MMIO/
+   interrupt/DMA bridges, IRQL and cancellation rules, PnP/power management,
+   and per-driver conformance tests. KMDF/UMDF and device-class support must be
+   added explicitly; policy records alone are not driver compatibility.
+6. Remove the BIOS emulator's semantic `stage2_main` boundary by executing the
    complete packaged Rust body after the now-exact EDD preload and mode-
    transition stream.
-4. Extend the current VMware legacy-BIOS ISO/raw proof to at least one more
+7. Extend the current VMware legacy-BIOS ISO/raw proof to at least one more
    external firmware implementation, complete standalone/ISO UEFI cross-
    firmware coverage, then test physical hardware. Record exact serial output,
    platform configuration, and artifact hashes without treating internal
    firmware models as equivalent evidence.
-5. Expand the emulator from its Xenith-specific firmware/device contract toward
+8. Expand the emulator from its Xenith-specific firmware/device contract toward
    general 16/32/64-bit execution, including AP trampoline instructions, AHCI,
    e1000, PS/2 mouse, a live display backend, and bounded host networking.
-6. Add booted-guest fault injection for user-copy fixups, COW write faults,
+9. Add booted-guest fault injection for user-copy fixups, COW write faults,
    signal-frame/xstate restoration, realtime queue pressure, and fork/exec
    rollback so host structural tests are backed by adversarial runtime proof.
-7. Add a frame-pacing or vsync contract where hardware permits it, and measured
+10. Add a frame-pacing or vsync contract where hardware permits it, and measured
    physical-display/input validation before claiming broad hardware performance
    or compatibility. PAT write-combining for the current CPU-copy scanout path
    is complete.
-8. Add MSI-X table programming and IPv6/AF_INET6, then extend TCP with SACK and
+11. Add MSI-X table programming and IPv6/AF_INET6, then extend TCP with SACK and
    window scaling and DNS with TCP fallback. Validate both supported physical
    NIC drivers or equivalent exact device models under interrupt load.
-9. Grow XenithFS beyond its current extent/transaction bounds and add a
+12. Grow XenithFS beyond its current extent/transaction bounds and add a
    conservative `xenith-fsck` repair mode. Add writable FAT32 only with
    crash-consistent allocation and mirrored-FAT updates.
-10. Broaden AML opcode, operation-region, synchronization, and firmware-quirk
-   coverage while preserving the parser/evaluator's allocation, recursion, and
-   execution bounds across merged DSDT/SSDT namespaces.
-11. Make `xenith-asm` capable of assembling the BIOS and kernel sources directly
-   with 16/32-bit modes and relocatable objects; extend `xenith-ld` accordingly;
-   then grow `xenith-cc` to functions, pointers, aggregate types, headers, and a
-   general malloc/printf-capable libc. Add the planned vi-like userspace editor.
-12. Add DWARF variables/types, inline stacks, CFI unwinding, hardware
-   watchpoints, and asynchronous pause to `xenith-debug`, then wire the same
-   debugger contract to WHP and a bounded physical serial stop stub.
-13. Broaden WHP artifact coverage beyond one and two VPs, add debugger control,
+13. Broaden AML opcode, operation-region, synchronization, and firmware-quirk
+    coverage while preserving the parser/evaluator's allocation, recursion, and
+    execution bounds across merged DSDT/SSDT namespaces.
+14. Make `xenith-asm` capable of assembling the BIOS and kernel sources directly
+    with 16/32-bit modes and relocatable objects; extend `xenith-ld` accordingly;
+    then grow `xenith-cc` to functions, pointers, aggregate types, headers, and a
+    general malloc/printf-capable libc. Add the planned vi-like userspace editor.
+15. Add DWARF variables/types, inline stacks, CFI unwinding, hardware
+    watchpoints, and asynchronous pause to `xenith-debug`, then wire the same
+    debugger contract to WHP and a bounded physical serial stop stub.
+16. Broaden WHP artifact coverage beyond one and two VPs, add debugger control,
     and evaluate another host hypervisor backend without weakening the pure
     interpreter fallback or making acceleration a build/test dependency. Any
     future increase beyond 64 logical CPUs must replace fixed-width CPU masks

@@ -1,0 +1,6 @@
+C:\Users\Valentino\Documents\GitHub\xenith-os\user\winhost\target\debug\build\compiler_builtins-2a9f8a72341263f3\build_script_build-2a9f8a72341263f3.d: C:\Users\Valentino\.rustup\toolchains\nightly-2026-07-01-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs C:\Users\Valentino\.rustup\toolchains\nightly-2026-07-01-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\..\libm\configure.rs
+
+C:\Users\Valentino\Documents\GitHub\xenith-os\user\winhost\target\debug\build\compiler_builtins-2a9f8a72341263f3\build_script_build-2a9f8a72341263f3.exe: C:\Users\Valentino\.rustup\toolchains\nightly-2026-07-01-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs C:\Users\Valentino\.rustup\toolchains\nightly-2026-07-01-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\..\libm\configure.rs
+
+C:\Users\Valentino\.rustup\toolchains\nightly-2026-07-01-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\build.rs:
+C:\Users\Valentino\.rustup\toolchains\nightly-2026-07-01-x86_64-pc-windows-msvc\lib\rustlib\src\rust\library\compiler-builtins\compiler-builtins\..\libm\configure.rs:

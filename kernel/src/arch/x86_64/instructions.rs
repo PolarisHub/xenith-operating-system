@@ -578,6 +578,11 @@ pub unsafe fn write_cr3(value: u64) {
     unsafe {
         asm!("mov cr3, {val}", val = in(reg) value, options(nostack, preserves_flags));
     }
+    // Publish only after the hardware transition. A remote address-space
+    // shootdown may omit this CPU once it observes a different root, which is
+    // safe only when the corresponding CR3 load and local flush have already
+    // completed.
+    super::smp::publish_active_cr3(value);
 }
 
 /// Read CR4.

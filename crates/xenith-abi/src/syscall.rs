@@ -70,6 +70,40 @@ pub enum SyscallNumber {
     UiReadEvents = 56,
     /// Release userspace access to the framebuffer and desktop input queue.
     UiRelease = 57,
+    /// Create a connected local channel pair.
+    ///
+    /// `channel_create(out_pair, flags)` writes an `IpcChannelPair`; `flags`
+    /// is currently reserved and must be zero.
+    ChannelCreate = 58,
+    /// Atomically enqueue one bounded channel message and its transfers.
+    ///
+    /// `channel_send(fd, message, timeout_ns, flags)` takes an
+    /// `IpcSendMessage`; `flags` is currently reserved and must be zero.
+    ChannelSend = 59,
+    /// Atomically receive one bounded channel message and its transfers.
+    ///
+    /// `channel_recv(fd, message, timeout_ns, flags)` writes an
+    /// `IpcReceiveMessage`; `flags` is currently reserved and must be zero.
+    ChannelRecv = 60,
+    /// Create a zero-filled, fixed-length shared-memory descriptor.
+    ///
+    /// `shm_create(length, flags)` returns a descriptor; `flags` is currently
+    /// reserved and must be zero.
+    ShmCreate = 61,
+    /// Wait for readiness across bounded channel/UI sources.
+    Wait = 62,
+    /// Change permissions on a dynamic mapping while preserving W^X.
+    Mprotect = 63,
+    /// Create a joinable task in the caller's address space.
+    ThreadCreate = 64,
+    /// Exit only the calling thread, or the process when it is the last one.
+    ThreadExit = 65,
+    /// Wait for and consume one completed thread owned by the caller.
+    ThreadJoin = 66,
+    /// Return the calling scheduler task's globally unique id.
+    Gettid = 67,
+    /// Spawn a child with only an explicit attenuated descriptor set.
+    SpawnRestricted = 68,
 }
 
 /// `spawn` argument 5: inherit the caller's process group.
@@ -648,6 +682,17 @@ mod tests {
         assert_eq!(SyscallNumber::UiPresent as u64, 55);
         assert_eq!(SyscallNumber::UiReadEvents as u64, 56);
         assert_eq!(SyscallNumber::UiRelease as u64, 57);
+        assert_eq!(SyscallNumber::ChannelCreate as u64, 58);
+        assert_eq!(SyscallNumber::ChannelSend as u64, 59);
+        assert_eq!(SyscallNumber::ChannelRecv as u64, 60);
+        assert_eq!(SyscallNumber::ShmCreate as u64, 61);
+        assert_eq!(SyscallNumber::Wait as u64, 62);
+        assert_eq!(SyscallNumber::Mprotect as u64, 63);
+        assert_eq!(SyscallNumber::ThreadCreate as u64, 64);
+        assert_eq!(SyscallNumber::ThreadExit as u64, 65);
+        assert_eq!(SyscallNumber::ThreadJoin as u64, 66);
+        assert_eq!(SyscallNumber::Gettid as u64, 67);
+        assert_eq!(SyscallNumber::SpawnRestricted as u64, 68);
         assert_eq!(WNOHANG | WUNTRACED | WCONTINUED, 11);
     }
 

@@ -1,0 +1,21 @@
+[package]
+name = "xenith-winhost-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Xenith OS Contributors"]
+description = "Allocation-free Windows guest loader and runtime policy primitives for Xenith"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+xenith-pe = { path = "../../crates/xenith-pe" }
+
+[lints]
+workspace = true

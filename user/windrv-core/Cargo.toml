@@ -1,0 +1,21 @@
+[package]
+name = "xenith-windrv-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Xenith OS Contributors"]
+description = "Allocation-free Windows I/O-manager and driver-host policy primitives for Xenith"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+xenith-winhost-core = { path = "../winhost-core" }
+
+[lints]
+workspace = true

@@ -212,6 +212,14 @@ pub struct TaskNode {
     /// dispatched. Reset to zero on dispatch; bumped by [`tick`] for every
     /// queued task; drives the priority-bump aging in [`tick`].
     pub wait_ticks: u64,
+    /// One-shot generic interrupt wake credit.
+    ///
+    /// Signal delivery does not hold every producer lock a task may be
+    /// sleeping behind. If it races just before an explicit-event park, the
+    /// scheduler records this credit while holding its own lock; the park
+    /// path consumes it instead of blocking. This closes that cross-lock
+    /// lost-wake window without polling.
+    interrupt_pending: bool,
     /// Eager, feature-sized x87/SSE/AVX image. Keeping this on the live
     /// scheduler node makes FP state follow task migration and lets signal
     /// delivery materialize a CR0.TS-armed task before building its frame.
@@ -262,6 +270,7 @@ impl TaskNode {
             arg,
             wake_deadline: None,
             wait_ticks: 0,
+            interrupt_pending: false,
             fpu,
             started: false,
         })
@@ -295,6 +304,7 @@ impl fmt::Debug for TaskNode {
             .field("priority", &self.task.priority)
             .field("started", &self.started)
             .field("wait_ticks", &self.wait_ticks)
+            .field("interrupt_pending", &self.interrupt_pending)
             .field("wake_deadline", &self.wake_deadline)
             .finish()
     }
@@ -1237,6 +1247,52 @@ pub fn wake_blocked_task_from_task(id: TaskId) -> bool {
     target_cpu.is_some()
 }
 
+/// Interrupt one task blocked on an explicit event, or leave a one-shot wake
+/// credit if it has not parked yet.
+///
+/// Unlike readiness producers, signal delivery cannot acquire an arbitrary
+/// wait object's lock. The credit is checked under the scheduler lock by
+/// [`block_current_until_releasing`], making both race orders lossless:
+/// already-blocked tasks are dequeued immediately, while running/ready tasks
+/// consume the credit at their next attempted park.
+#[must_use]
+pub fn interrupt_task_from_task(id: TaskId) -> bool {
+    if id.as_u64() == 0 {
+        return false;
+    }
+
+    let flags = save_flags_and_cli();
+    let (found, target_cpu) = {
+        let mut inner = lock();
+        if let Some(node) = inner.blocked_queue.take_task(id) {
+            let target_cpu = unsafe { node.as_ref() }.task.cpu as usize;
+            // SAFETY: the node was removed from the blocked queue under the
+            // scheduler lock and remains owned by `all_tasks`.
+            unsafe { (*node.as_ptr()).task.state = TaskState::Ready };
+            inner.run_queues[target_cpu].enqueue(node);
+            (true, Some(target_cpu))
+        } else if let Some(node) = inner.all_tasks.iter_mut().find(|node| node.task.id == id) {
+            node.interrupt_pending = true;
+            (true, None)
+        } else {
+            (false, None)
+        }
+    };
+
+    if let Some(target_cpu) = target_cpu {
+        request_prompt_reschedule(target_cpu);
+    }
+    // SAFETY: `flags` was captured on this CPU at entry and the scheduler
+    // lock has been released.
+    unsafe { restore_flags(flags) };
+    found
+}
+
+#[inline]
+fn consume_interrupt_credit(pending: &mut bool) -> bool {
+    core::mem::replace(pending, false)
+}
+
 /// Drain the coalesced event-wake slot with one non-blocking scheduler-lock
 /// acquisition per observed request.
 ///
@@ -1254,21 +1310,27 @@ fn drain_pending_blocked_wakes() {
         let requested = PENDING_BLOCKED_WAKE.swap(0, Ordering::AcqRel);
         let target_cpu = if requested == 0 {
             None
+        } else if let Some(node) = inner.blocked_queue.take_task(TaskId(requested)) {
+            Some({
+                // Return the task to the CPU it last ran on. This
+                // preserves cache locality and enables a prompt IPI.
+                let target_cpu = unsafe { node.as_ref() }.task.cpu as usize;
+                // SAFETY: the node was just unlinked from the blocked
+                // queue, remains owned by `all_tasks`, and this raw guard
+                // gives exclusive scheduler metadata access.
+                unsafe { (*node.as_ptr()).task.state = TaskState::Ready };
+                inner.run_queues[target_cpu].enqueue(node);
+                target_cpu
+            })
         } else {
-            inner
-                .blocked_queue
-                .take_task(TaskId(requested))
-                .map(|node| {
-                    // Return the task to the CPU it last ran on. This
-                    // preserves cache locality and enables a prompt IPI.
-                    let target_cpu = unsafe { node.as_ref() }.task.cpu as usize;
-                    // SAFETY: the node was just unlinked from the blocked
-                    // queue, remains owned by `all_tasks`, and this raw guard
-                    // gives exclusive scheduler metadata access.
-                    unsafe { (*node.as_ptr()).task.state = TaskState::Ready };
-                    inner.run_queues[target_cpu].enqueue(node);
-                    target_cpu
-                })
+            if let Some(node) = inner
+                .all_tasks
+                .iter_mut()
+                .find(|node| node.task.id == TaskId(requested))
+            {
+                node.interrupt_pending = true;
+            }
+            None
         };
         // Release before requesting reschedule: the target CPU's IPI handler
         // may enter the scheduler immediately.
@@ -1477,6 +1539,158 @@ pub fn init_ap() {
 // spawn
 // ---------------------------------------------------------------------------
 
+/// A fully allocated scheduler task that is owned but not yet runnable.
+///
+/// The node is retained in the scheduler's master ownership list, but remains
+/// off every run/wait queue until [`commit`](Self::commit). This gives callers
+/// a transaction boundary for publishing metadata keyed by [`TaskId`] before
+/// another CPU can dispatch the task. Dropping an uncommitted value removes
+/// and frees the unstarted node.
+#[must_use = "a staged task must be committed or deliberately dropped"]
+pub struct StagedTask {
+    id: TaskId,
+    target_cpu: usize,
+    committed: bool,
+}
+
+impl StagedTask {
+    /// Identity reserved for this task before runnable publication.
+    #[inline]
+    pub const fn id(&self) -> TaskId {
+        self.id
+    }
+
+    /// Attach a shared userspace page-table root before runnable publication.
+    ///
+    /// This is intentionally available only on an uncommitted token. The
+    /// scheduler lock keeps the task off every CPU while the address-space
+    /// identity is installed, so its very first dispatch uses the right CR3.
+    #[must_use]
+    pub fn attach_address_space(&mut self, space: crate::mm::r#virtual::AddressSpace) -> bool {
+        if self.committed {
+            return false;
+        }
+        let flags = save_flags_and_cli();
+        let attached = {
+            let mut inner = lock();
+            inner
+                .all_tasks
+                .iter_mut()
+                .find(|node| node.task.id == self.id)
+                .filter(|node| {
+                    staged_node_cancellable(node.links.is_unlinked(), node.started, node.task.state)
+                })
+                .is_some_and(|node| {
+                    node.task.address_space = Some(space);
+                    true
+                })
+        };
+        // SAFETY: `flags` was captured on this CPU immediately before locking.
+        unsafe { restore_flags(flags) };
+        attached
+    }
+
+    #[inline]
+    fn mark_committed(&mut self) -> bool {
+        !core::mem::replace(&mut self.committed, true)
+    }
+
+    /// Publish the staged task to its selected run queue.
+    ///
+    /// The scheduler lock publishes the queue link before any remote
+    /// reschedule IPI is sent. `None` indicates scheduler ownership corruption;
+    /// the uncommitted token then attempts its normal cancellation rollback.
+    #[must_use]
+    pub fn commit(mut self) -> Option<TaskId> {
+        let flags = save_flags_and_cli();
+        let target_cpu = {
+            let mut inner = lock();
+            let node = inner
+                .all_tasks
+                .iter_mut()
+                .find(|node| node.task.id == self.id)
+                .map(|node| NonNull::from(&mut **node));
+            node.map(|node| {
+                let target_cpu = if crate::arch::x86_64::smp::is_online(self.target_cpu) {
+                    self.target_cpu
+                } else {
+                    select_least_loaded_cpu(&inner)
+                };
+                // Mark the token committed before linking the node. If an
+                // invariant panic occurs inside the intrusive queue, Drop must
+                // never mistake a linked node for cancellable staged state.
+                let first_commit = self.mark_committed();
+                debug_assert!(first_commit);
+                // SAFETY: the token proves this newly-created node is still
+                // owned by `all_tasks`, unstarted, and off every queue. The
+                // scheduler lock gives exclusive metadata access.
+                unsafe { (*node.as_ptr()).task.cpu = target_cpu as u32 };
+                inner.run_queues[target_cpu].enqueue(node);
+                target_cpu
+            })
+        };
+        // SAFETY: `flags` was captured on this CPU immediately before locking.
+        unsafe { restore_flags(flags) };
+
+        let target_cpu = target_cpu?;
+        if target_cpu != current_cpu() {
+            crate::arch::x86_64::smp::request_reschedule(target_cpu);
+        }
+        Some(self.id)
+    }
+}
+
+#[inline]
+const fn staged_node_cancellable(unlinked: bool, started: bool, state: TaskState) -> bool {
+    unlinked && !started && matches!(state, TaskState::Ready)
+}
+
+impl Drop for StagedTask {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let flags = save_flags_and_cli();
+        let removed = {
+            let mut inner = lock();
+            inner
+                .all_tasks
+                .iter()
+                .position(|node| node.task.id == self.id)
+                .and_then(|index| {
+                    let node = &inner.all_tasks[index];
+                    if !staged_node_cancellable(
+                        node.links.is_unlinked(),
+                        node.started,
+                        node.task.state,
+                    ) {
+                        // A linked, started, or non-ready node may still be
+                        // observed by a CPU. Refuse reclamation rather than
+                        // turning scheduler corruption into a use-after-free.
+                        ::log::error!(
+                            "xenith.sched: refusing to cancel non-staged {} (tid={}, state={}, started={}, linked={})",
+                            node.task.name,
+                            node.task.id,
+                            node.task.state,
+                            node.started,
+                            node.links.is_linked(),
+                        );
+                        return None;
+                    }
+                    let mut removed = inner.all_tasks.swap_remove(index);
+                    removed.task.state = TaskState::Dead;
+                    Some(removed)
+                })
+        };
+        // SAFETY: `flags` was captured on this CPU immediately before locking.
+        unsafe { restore_flags(flags) };
+        // Kernel-stack reclamation may touch the allocator, so keep it outside
+        // the scheduler lock just like ordinary post-switch task reaping.
+        drop(removed);
+    }
+}
+
 /// Spawn a kernel thread that runs `entry(arg)` on a fresh kernel stack.
 ///
 /// Allocates a [`Task`] (with stack) and a [`TaskNode`] (with the
@@ -1497,7 +1711,7 @@ pub fn init_ap() {
 /// the idle task would not yet exist.
 #[must_use]
 pub fn spawn(name: KString, entry: unsafe extern "C" fn(u64) -> !, arg: u64) -> Option<TaskId> {
-    spawn_inner(name, entry, arg, None)
+    stage_spawn_inner(name, entry, arg, None)?.commit()
 }
 
 /// Spawn a kernel task directly onto one online CPU's run queue.
@@ -1515,24 +1729,38 @@ pub fn spawn_on(
     if !crate::arch::x86_64::smp::is_online(cpu) {
         return None;
     }
-    spawn_inner(name, entry, arg, Some(cpu))
+    stage_spawn_inner(name, entry, arg, Some(cpu))?.commit()
 }
 
-fn spawn_inner(
+/// Allocate and retain a task without making it runnable.
+///
+/// Callers may publish external metadata using [`StagedTask::id`] and then
+/// invoke [`StagedTask::commit`]. Until commit, no run queue contains the node
+/// and no reschedule IPI is sent.
+#[must_use]
+pub fn stage_spawn(
+    name: KString,
+    entry: unsafe extern "C" fn(u64) -> !,
+    arg: u64,
+) -> Option<StagedTask> {
+    stage_spawn_inner(name, entry, arg, None)
+}
+
+fn stage_spawn_inner(
     name: KString,
     entry: unsafe extern "C" fn(u64) -> !,
     arg: u64,
     requested_cpu: Option<usize>,
-) -> Option<TaskId> {
-    // `spawn` touches the run queue, so it must run with interrupts off and
-    // the scheduler lock held. No context switch happens here, so the lock is
-    // simply taken and released around the enqueue.
+) -> Option<StagedTask> {
+    // Task ownership and target selection are scheduler metadata, so stage
+    // them with local interrupts off under the scheduler lock. The node stays
+    // deliberately absent from all run queues.
     let flags = save_flags_and_cli();
-    let (id, target_cpu) = {
+    let staged = {
         let mut inner = lock();
         debug_assert!(
             inner.initialised,
-            "sched::spawn before init is not permitted"
+            "sched::stage_spawn before init is not permitted"
         );
         let node = match create_task_inner(&mut inner, name, entry, arg) {
             Some(node) => node,
@@ -1545,24 +1773,21 @@ fn spawn_inner(
             },
         };
         let target_cpu = requested_cpu.unwrap_or_else(|| select_least_loaded_cpu(&inner));
-        // Ordinary tasks become runnable immediately. Idle-task creation uses
-        // `create_task_inner` directly and records the node only in
-        // `idle_tasks`, keeping it as a fallback rather than queued work.
-        // SAFETY: `node` is newly created, live in `all_tasks`, and still off
-        // every queue. The scheduler lock gives exclusive task metadata
-        // access while its initial CPU assignment is published.
+        // Record the intended placement for diagnostics and signal wake
+        // locality, but do not enqueue or notify that CPU until commit.
+        // SAFETY: `node` is newly created, owned by `all_tasks`, unstarted,
+        // and still off every queue under the scheduler lock.
         unsafe { (*node.as_ptr()).task.cpu = target_cpu as u32 };
-        inner.run_queues[target_cpu].enqueue(node);
-        // SAFETY: `node` is in `all_tasks` and stays alive; reading its id is
-        // a shared access under the lock.
-        (unsafe { node.as_ref() }.task.id, target_cpu)
+        StagedTask {
+            // SAFETY: the node remains live in `all_tasks`.
+            id: unsafe { node.as_ref() }.task.id,
+            target_cpu,
+            committed: false,
+        }
     }; // lock released
        // SAFETY: `flags` was captured on this CPU just above.
     unsafe { restore_flags(flags) };
-    if target_cpu != current_cpu() {
-        crate::arch::x86_64::smp::request_reschedule(target_cpu);
-    }
-    Some(id)
+    Some(staged)
 }
 
 fn select_least_loaded_cpu(inner: &SchedulerInner) -> usize {
@@ -1594,9 +1819,10 @@ fn select_least_loaded_cpu(inner: &SchedulerInner) -> usize {
 /// Create and retain a task node without making it runnable.
 ///
 /// Builds the [`Task`] and [`TaskNode`] and takes ownership in `all_tasks`.
-/// The caller decides how the node becomes selectable: [`spawn`] enqueues an
-/// ordinary task, while [`init`] records the idle task only in `idle_tasks` so
-/// [`pick_next`] can use it as the empty-queue fallback.
+/// The caller decides how the node becomes selectable: [`stage_spawn`] returns
+/// an RAII token whose commit enqueues an ordinary task, while [`init`] records
+/// the idle task only in `idle_tasks` so [`pick_next`] can use it as the
+/// empty-queue fallback.
 fn create_task_inner(
     inner: &mut SchedulerInner,
     name: KString,
@@ -1938,41 +2164,52 @@ pub fn block_current_until_releasing<T: ?Sized>(
     // Keep the producer lock and IF=0 while publishing the blocked state.
     let next = {
         let mut inner = lock();
-        // SAFETY: `cur` is current and unlinked; the scheduler lock excludes
-        // every other metadata mutation while it moves to `blocked_queue`.
-        unsafe { (*cur.as_ptr()).task.state = TaskState::Blocked };
-        inner.blocked_queue.add(cur, deadline);
-        // SAFETY: this CPU exclusively owns its current slot with IF clear.
-        unsafe { set_current_node(None) };
+        // SAFETY: `cur` is the live current node and the scheduler lock
+        // serializes the wake credit with cross-lock signal delivery.
+        let interrupted =
+            unsafe { consume_interrupt_credit(&mut (*cur.as_ptr()).interrupt_pending) };
+        if interrupted {
+            None
+        } else {
+            // SAFETY: `cur` is current and unlinked; the scheduler lock
+            // excludes every other metadata mutation while it moves to the
+            // blocked queue.
+            unsafe { (*cur.as_ptr()).task.state = TaskState::Blocked };
+            inner.blocked_queue.add(cur, deadline);
+            // SAFETY: this CPU exclusively owns its current slot with IF
+            // clear.
+            unsafe { set_current_node(None) };
 
-        let next = pick_next(&mut inner);
-        if next.is_none() {
-            // Pre-init/misconfigured fallback: undo the park while the
-            // producer lock still prevents a concurrent wake.
-            let restored = inner
-                .blocked_queue
-                .take_task(task_id)
-                .expect("newly blocked task disappeared");
-            debug_assert_eq!(restored, cur);
-            // SAFETY: `cur` is unlinked again and exclusively owned here.
-            unsafe {
-                (*cur.as_ptr()).task.state = TaskState::Running;
-                set_current_node(Some(cur));
+            let next = pick_next(&mut inner);
+            if next.is_none() {
+                // Pre-init/misconfigured fallback: undo the park while the
+                // producer lock still prevents a concurrent wake.
+                let restored = inner
+                    .blocked_queue
+                    .take_task(task_id)
+                    .expect("newly blocked task disappeared");
+                debug_assert_eq!(restored, cur);
+                // SAFETY: `cur` is unlinked again and exclusively owned here.
+                unsafe {
+                    (*cur.as_ptr()).task.state = TaskState::Running;
+                    set_current_node(Some(cur));
+                }
+            } else if let Some(next) = next {
+                // Publish the selected task before the switch, matching
+                // `sleep_until` and the normal dispatch path.
+                // SAFETY: `next` was removed from a run queue under the lock
+                // and remains live in `all_tasks`.
+                unsafe {
+                    let task = core::ptr::addr_of_mut!((*next.as_ptr()).task);
+                    (*task).state = TaskState::Running;
+                    (*task).cpu = current_cpu() as u32;
+                    (*task).stats.context_switches =
+                        (*task).stats.context_switches.saturating_add(1);
+                    set_current_node(Some(next));
+                }
             }
-        } else if let Some(next) = next {
-            // Publish the selected task before the switch, matching
-            // `sleep_until` and the normal dispatch path.
-            // SAFETY: `next` was removed from a run queue under the lock and
-            // remains live in `all_tasks`.
-            unsafe {
-                let task = core::ptr::addr_of_mut!((*next.as_ptr()).task);
-                (*task).state = TaskState::Running;
-                (*task).cpu = current_cpu() as u32;
-                (*task).stats.context_switches = (*task).stats.context_switches.saturating_add(1);
-                set_current_node(Some(next));
-            }
+            next
         }
-        next
     };
 
     // SAFETY: the scheduler immediately consumes the guard's same-CPU RFLAGS
@@ -1986,6 +2223,69 @@ pub fn block_current_until_releasing<T: ?Sized>(
         return;
     };
 
+    preempt::on_context_switch_in();
+    do_switch(Some(cur), next, flags);
+}
+
+/// Park on the scheduler's generic interrupt token without a producer lock.
+///
+/// Multi-source waits register with several independent objects, so no one
+/// producer guard can cover the final park. Every registered producer uses
+/// [`interrupt_task_from_task`] (or the IRQ-safe [`wake_blocked_task`]), which
+/// either dequeues an already-blocked task or records `interrupt_pending`
+/// under this same scheduler lock. The token therefore closes the last race
+/// without polling.
+pub fn block_current_interruptible(deadline: Option<Instant>) {
+    let cur = current_node().expect("sched::block_current with no current task");
+    let flags = save_flags_and_cli();
+    let task_id = unsafe { cur.as_ref() }.task.id;
+    let next = {
+        let mut inner = lock();
+        // SAFETY: `cur` is current and the scheduler lock serializes the
+        // generic wake token with every producer.
+        if unsafe { consume_interrupt_credit(&mut (*cur.as_ptr()).interrupt_pending) } {
+            None
+        } else {
+            // SAFETY: current tasks are unlinked and exclusively owned by
+            // this CPU until publication into the blocked queue.
+            unsafe { (*cur.as_ptr()).task.state = TaskState::Blocked };
+            inner.blocked_queue.add(cur, deadline);
+            // SAFETY: interrupts are disabled on this CPU.
+            unsafe { set_current_node(None) };
+            let next = pick_next(&mut inner);
+            if next.is_none() {
+                let restored = inner
+                    .blocked_queue
+                    .take_task(task_id)
+                    .expect("newly blocked task disappeared");
+                debug_assert_eq!(restored, cur);
+                // SAFETY: `cur` is unlinked again and remains the current
+                // task on this CPU.
+                unsafe {
+                    (*cur.as_ptr()).task.state = TaskState::Running;
+                    set_current_node(Some(cur));
+                }
+            } else if let Some(next) = next {
+                // SAFETY: `next` was removed from a run queue under the lock.
+                unsafe {
+                    let task = core::ptr::addr_of_mut!((*next.as_ptr()).task);
+                    (*task).state = TaskState::Running;
+                    (*task).cpu = current_cpu() as u32;
+                    (*task).stats.context_switches =
+                        (*task).stats.context_switches.saturating_add(1);
+                    set_current_node(Some(next));
+                }
+            }
+            next
+        }
+    };
+
+    let Some(next) = next else {
+        preempt::clear_need_resched();
+        // SAFETY: `flags` was captured on this CPU above.
+        unsafe { restore_flags(flags) };
+        return;
+    };
     preempt::on_context_switch_in();
     do_switch(Some(cur), next, flags);
 }
@@ -2579,6 +2879,14 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_wake_credit_is_consumed_exactly_once() {
+        let mut pending = true;
+        assert!(consume_interrupt_credit(&mut pending));
+        assert!(!pending);
+        assert!(!consume_interrupt_credit(&mut pending));
+    }
+
+    #[test]
     fn process_exit_may_publish_only_after_kernel_cr3_detach() {
         let kernel_cr3 = 0x1234_5000;
         assert!(!exit_detach_complete(true, kernel_cr3, kernel_cr3));
@@ -2624,6 +2932,33 @@ mod tests {
         assert!(!should_requeue_for_dispatch(false, TaskState::Sleeping));
         assert!(!should_requeue_for_dispatch(false, TaskState::Blocked));
         assert!(!should_requeue_for_dispatch(false, TaskState::Zombie));
+    }
+
+    #[test]
+    fn staged_task_publication_token_commits_exactly_once() {
+        let mut staged = StagedTask {
+            id: TaskId(73),
+            target_cpu: 3,
+            committed: false,
+        };
+
+        assert_eq!(staged.id(), TaskId(73));
+        assert_eq!(staged.target_cpu, 3);
+        assert!(staged.mark_committed());
+        assert!(!staged.mark_committed());
+        // A committed token's Drop is intentionally inert and therefore does
+        // not touch privileged scheduler state in this host-side test.
+        drop(staged);
+    }
+
+    #[test]
+    fn staged_rollback_reclaims_only_unlinked_unstarted_ready_nodes() {
+        assert!(staged_node_cancellable(true, false, TaskState::Ready));
+        assert!(!staged_node_cancellable(false, false, TaskState::Ready));
+        assert!(!staged_node_cancellable(true, true, TaskState::Ready));
+        assert!(!staged_node_cancellable(true, false, TaskState::Running));
+        assert!(!staged_node_cancellable(true, false, TaskState::Blocked));
+        assert!(!staged_node_cancellable(true, false, TaskState::Zombie));
     }
 
     #[test]

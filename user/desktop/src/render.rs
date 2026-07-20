@@ -166,10 +166,14 @@ impl<'a> Surface<'a> {
         self.bytes[offset..offset + 4].copy_from_slice(&bytes);
     }
 
-    #[cfg(test)]
     fn get(&self, x: u32, y: u32) -> Rgb {
         let offset = y as usize * self.stride + x as usize * 4;
-        let pixel = u32::from_ne_bytes(self.bytes[offset..offset + 4].try_into().unwrap());
+        let pixel = u32::from_ne_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+        ]);
         self.format.unpack(pixel)
     }
 }
@@ -206,30 +210,54 @@ impl Renderer {
     }
 
     pub fn render(&self, surface: &mut Surface<'_>, state: &DesktopState, damage: &[Rect]) {
+        self.render_background(surface, state, damage);
+        self.render_overlay(surface, state, damage);
+    }
+
+    /// Rebuild the opaque wallpaper below every client surface.
+    pub fn render_background(
+        &self,
+        surface: &mut Surface<'_>,
+        state: &DesktopState,
+        damage: &[Rect],
+    ) {
         for &rect in damage {
             let Some(clip) = rect.intersect(state.layout().screen) else {
                 continue;
             };
-            self.render_backdrop(surface, state, clip);
+            self.render_wallpaper(surface, state, clip);
+        }
+    }
+
+    /// Rebuild shell-owned glass, chrome, and cursor above client surfaces.
+    pub fn render_overlay(&self, surface: &mut Surface<'_>, state: &DesktopState, damage: &[Rect]) {
+        for &rect in damage {
+            let Some(clip) = rect.intersect(state.layout().screen) else {
+                continue;
+            };
+            self.render_glass(surface, state, clip);
             self.render_chrome(surface, state, clip);
             self.render_cursor(surface, state.cursor(), clip);
         }
     }
 
-    fn render_backdrop(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
-        let layout = state.layout();
+    fn render_wallpaper(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
         let right = clip.right() as i32;
         let bottom = clip.bottom() as i32;
         for y in clip.y..bottom {
             for x in clip.x..right {
-                let mut color = wallpaper(x as u32, y as u32, state.size());
-                color = glass_panel(color, Point::new(x, y), layout.top_bar, 18, 145);
-                color = glass_panel(color, Point::new(x, y), layout.dock, 22, 165);
-                if state.launcher_open() {
-                    color = glass_panel(color, Point::new(x, y), layout.launcher, 24, 205);
-                }
+                let color = wallpaper(x as u32, y as u32, state.size());
                 surface.put(x, y, color);
             }
+        }
+    }
+
+    fn render_glass(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
+        let layout = state.layout();
+        apply_glass_panel(surface, layout.top_bar, 18, 145, clip);
+        apply_glass_panel(surface, layout.dock, 22, 165, clip);
+        if state.launcher_open() {
+            apply_glass_panel(surface, layout.launcher, 24, 205, clip);
         }
     }
 
@@ -465,6 +493,19 @@ fn glass_panel(mut base: Rgb, point: Point, panel: Rect, radius: u32, alpha: u8)
         }
     }
     base
+}
+
+fn apply_glass_panel(surface: &mut Surface<'_>, panel: Rect, radius: u32, alpha: u8, clip: Rect) {
+    let Some(bounds) = panel.expand(8).intersect(clip) else {
+        return;
+    };
+    for y in bounds.y..bounds.bottom() as i32 {
+        for x in bounds.x..bounds.right() as i32 {
+            let point = Point::new(x, y);
+            let base = surface.get(x as u32, y as u32);
+            surface.put(x, y, glass_panel(base, point, panel, radius, alpha));
+        }
+    }
 }
 
 fn rounded_contains(rect: Rect, radius: u32, point: Point) -> bool {
@@ -756,6 +797,25 @@ mod tests {
         assert!(first.iter().any(|byte| *byte != 0));
         let surface = Surface::new(&mut first, size, stride, rgb_format()).unwrap();
         assert_eq!(surface.get(0, 0), Rgb::new(12, 20, 42));
+    }
+
+    #[test]
+    fn explicit_scene_layers_match_the_combined_renderer() {
+        let size = Size::new(320, 200);
+        let stride = size.width as usize * 4;
+        let mut combined = vec![0u8; stride * size.height as usize];
+        let mut layered = combined.clone();
+        let state = DesktopState::new(size);
+        let renderer = Renderer::new();
+        renderer.render(
+            &mut Surface::new(&mut combined, size, stride, rgb_format()).unwrap(),
+            &state,
+            &[size.bounds()],
+        );
+        let mut surface = Surface::new(&mut layered, size, stride, rgb_format()).unwrap();
+        renderer.render_background(&mut surface, &state, &[size.bounds()]);
+        renderer.render_overlay(&mut surface, &state, &[size.bounds()]);
+        assert_eq!(combined, layered);
     }
 
     #[test]

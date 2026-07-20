@@ -4,10 +4,15 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use super::fd::{FdTable, FileObject, FileRef, OpenFlags, SeekWhence};
+use xenith_abi::ipc::IpcSendTransfer;
+
+pub use super::fd::InstalledTransferBatch;
+use super::fd::{FdTable, FileObject, FileRef, OpenFlags, RetiredFiles, SeekWhence};
 use super::inode::{FileType, InodeMetadata};
 use super::path::{self, Path, PathBuf};
 use super::vfs::{self, FsError};
+use crate::ipc::channel::{ChannelEndpoint, ChannelTransfers, CHANNEL_TRANSFER_CAPACITY};
+use crate::ipc::shared_memory::SharedMemoryRef;
 use crate::sync::SpinLock;
 
 static FD_TABLE: SpinLock<Option<FdTable>> = SpinLock::new(None);
@@ -74,26 +79,35 @@ impl From<InodeMetadata> for Stat {
 pub fn sys_open(path: &str, raw_flags: u32, mode: u32) -> Result<i32, FsError> {
     let flags = OpenFlags::from_raw(raw_flags)?;
     let file = vfs::open(&Path::new(path), flags, mode)?;
-    with_fd_table(|table| table.alloc_fd(file))
+    let result = with_fd_table(|table| table.alloc_fd(Arc::clone(&file)));
+    drop(file);
+    result
 }
 
 pub fn sys_close(fd: i32) -> Result<(), FsError> {
-    with_fd_table(|table| table.close(fd))
+    let removed = with_fd_table(|table| table.close(fd))?;
+    drop(removed);
+    Ok(())
 }
 
 pub fn sys_read(fd: i32, buffer: &mut [u8]) -> Result<usize, FsError> {
-    let file = with_fd_table(|table| table.get(fd))?;
+    let file = get_file_with_rights(fd, xenith_abi::ipc::IPC_TRANSFER_RIGHT_READ)?;
     file.read(buffer)
 }
 
 pub fn sys_write(fd: i32, buffer: &[u8]) -> Result<usize, FsError> {
-    let file = with_fd_table(|table| table.get(fd))?;
+    let file = get_file_with_rights(fd, xenith_abi::ipc::IPC_TRANSFER_RIGHT_WRITE)?;
     file.write(buffer)
 }
 
 pub fn sys_lseek(fd: i32, offset: i64, raw_whence: i32) -> Result<u64, FsError> {
     let whence = SeekWhence::from_raw(raw_whence)?;
-    let file = with_fd_table(|table| table.get(fd))?;
+    let file = with_fd_table(|table| {
+        table.get_with_any_right(
+            fd,
+            xenith_abi::ipc::IPC_TRANSFER_RIGHT_READ | xenith_abi::ipc::IPC_TRANSFER_RIGHT_WRITE,
+        )
+    })?;
     file.seek(offset, whence)
 }
 
@@ -169,29 +183,127 @@ pub fn sys_dup(fd: i32) -> Result<i32, FsError> {
 }
 
 pub fn sys_dup2(old_fd: i32, new_fd: i32) -> Result<i32, FsError> {
-    with_fd_table(|table| table.dup2(old_fd, new_fd))
+    let (duplicated, displaced) = with_fd_table(|table| table.dup2(old_fd, new_fd))?;
+    drop(displaced);
+    Ok(duplicated)
 }
 
 pub fn get_file(fd: i32) -> Result<FileRef, FsError> {
     with_fd_table(|table| table.get(fd))
 }
 
+pub fn get_file_with_rights(fd: i32, required_rights: u32) -> Result<FileRef, FsError> {
+    with_fd_table(|table| table.get_with_rights(fd, required_rights))
+}
+
+pub fn get_file_with_any_right(fd: i32, accepted_rights: u32) -> Result<FileRef, FsError> {
+    with_fd_table(|table| table.get_with_any_right(fd, accepted_rights))
+}
+
+pub fn descriptor_rights(fd: i32) -> Result<u32, FsError> {
+    with_fd_table(|table| table.rights(fd))
+}
+
+pub fn get_channel(fd: i32, required_rights: u32) -> Result<FileRef, FsError> {
+    let file = get_file_with_rights(fd, required_rights)?;
+    if file.channel_endpoint().is_none() {
+        return Err(FsError::BadFileDescriptor);
+    }
+    Ok(file)
+}
+
+pub fn get_shared_memory(fd: i32, required_rights: u32) -> Result<SharedMemoryRef, FsError> {
+    let file = get_file_with_rights(fd, required_rights)?;
+    file.shared_memory()
+        .map(Arc::clone)
+        .ok_or(FsError::BadFileDescriptor)
+}
+
+/// Resolve one shared-memory descriptor and return the exact rights attached
+/// to that descriptor in the same descriptor-table transaction.
+///
+/// Mapping code retains the returned rights as the maximum permissions of
+/// the mapping, so a later `mprotect` cannot recover authority that was
+/// removed while the descriptor was transferred.
+pub fn get_shared_memory_with_rights(
+    fd: i32,
+    required_rights: u32,
+) -> Result<(SharedMemoryRef, u32), FsError> {
+    let resolved: Result<(FileRef, u32), FsError> = with_fd_table(|table| {
+        let file = table.get_with_rights(fd, required_rights)?;
+        let rights = table.rights(fd)?;
+        Ok((file, rights))
+    });
+    let (file, rights) = resolved?;
+    let object = file
+        .shared_memory()
+        .map(Arc::clone)
+        .ok_or(FsError::BadFileDescriptor)?;
+    drop(file);
+    Ok((object, rights))
+}
+
+pub fn install_channel_pair(
+    first: ChannelEndpoint,
+    second: ChannelEndpoint,
+) -> Result<(i32, i32), FsError> {
+    let first = Arc::new(FileObject::new_channel(first));
+    let second = Arc::new(FileObject::new_channel(second));
+    let result = with_fd_table(|table| table.alloc_pair(Arc::clone(&first), Arc::clone(&second)));
+    drop(first);
+    drop(second);
+    result
+}
+
+pub fn install_shared_memory(object: SharedMemoryRef) -> Result<i32, FsError> {
+    let file = Arc::new(FileObject::new_shared_memory(object));
+    let result = with_fd_table(|table| table.alloc_fd(Arc::clone(&file)));
+    drop(file);
+    result
+}
+
+pub fn snapshot_channel_transfers(
+    requests: &[IpcSendTransfer; CHANNEL_TRANSFER_CAPACITY],
+    count: usize,
+) -> Result<ChannelTransfers, FsError> {
+    with_fd_table(|table| table.snapshot_channel_transfers(requests, count))
+}
+
+pub fn install_channel_transfers(
+    transfers: &ChannelTransfers,
+) -> Result<InstalledTransferBatch, FsError> {
+    with_fd_table(|table| table.install_channel_transfers(transfers))
+}
+
+#[must_use = "drop rolled-back files after this function releases PROCESS_TABLE"]
+pub fn rollback_channel_transfers(installed: InstalledTransferBatch) -> RetiredFiles {
+    with_fd_table(|table| table.rollback_channel_transfers(installed))
+}
+
 pub fn sys_pipe() -> Result<(i32, i32), FsError> {
     let (reader, writer) = super::pipe::create();
     let reader = Arc::new(FileObject::new_pipe(reader, OpenFlags::READ_ONLY));
     let writer = Arc::new(FileObject::new_pipe(writer, OpenFlags::WRITE_ONLY));
-    with_fd_table(|table| table.alloc_pair(reader, writer))
+    let result = with_fd_table(|table| table.alloc_pair(Arc::clone(&reader), Arc::clone(&writer)));
+    drop(reader);
+    drop(writer);
+    result
 }
 
 pub fn sys_open_pty() -> Result<(i32, i32), FsError> {
     let (master, slave) = super::pty::create()?;
     let master = Arc::new(FileObject::new_pty(master, OpenFlags::READ_WRITE));
     let slave = Arc::new(FileObject::new_pty(slave, OpenFlags::READ_WRITE));
-    with_fd_table(|table| table.alloc_pair(master, slave))
+    let result = with_fd_table(|table| table.alloc_pair(Arc::clone(&master), Arc::clone(&slave)));
+    drop(master);
+    drop(slave);
+    result
 }
 
 pub fn reset_process_state() {
-    with_fd_table(|table| *table = FdTable::new_process());
+    let replacement = FdTable::new_process();
+    let previous = with_fd_table(|table| core::mem::replace(table, replacement));
+    drop(previous);
     path::set_current_dir(PathBuf::root());
 }
 

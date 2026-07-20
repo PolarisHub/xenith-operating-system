@@ -27,6 +27,15 @@ pub fn load_built_kernel_with_framebuffer(
     instruction_limit: u64,
     framebuffer: Option<FramebufferConfig>,
 ) -> Result<Machine, String> {
+    load_built_kernel_with_framebuffer_and_cpus(instruction_limit, framebuffer, 1)
+}
+
+/// Load the built kernel with an explicit logical-processor count.
+pub fn load_built_kernel_with_framebuffer_and_cpus(
+    instruction_limit: u64,
+    framebuffer: Option<FramebufferConfig>,
+    cpu_count: usize,
+) -> Result<Machine, String> {
     let root = workspace_root();
     let kernel_path = root.join("build/kernel.elf");
     let initrd_path = root.join("build/initramfs.cpio");
@@ -39,7 +48,7 @@ pub fn load_built_kernel_with_framebuffer(
         instruction_limit,
         mirror_serial: false,
         framebuffer,
-        ..MachineConfig::default()
+        cpu_count,
     });
     machine
         .load_kernel(&kernel, Some(&initrd))
@@ -72,11 +81,19 @@ pub fn run_until_serial(
         }
     }
 
+    let cpu_states = (0..machine.cpu_count())
+        .filter_map(|processor| {
+            machine.cpu_state(processor).map(|state| {
+                format!(
+                    "cpu{processor}: rip={:#x}, cs={:#x}, rflags={:#x}, cr3={:#x}, cycles={}, halted={}",
+                    state.rip, state.cs, state.rflags, state.cr3, state.cycles, state.halted
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
     Err(format!(
-        "guest did not emit {marker:?} {occurrences} time(s) in {instruction_limit} emulator-loop iterations; rip={:#x}, cs={:#x}, halted={}; output:\n{}",
-        machine.cpu.state.rip,
-        machine.cpu.state.cs,
-        machine.cpu.state.halted,
+        "guest did not emit {marker:?} {occurrences} time(s) in {instruction_limit} emulator-loop iterations; {cpu_states}; output:\n{}",
         String::from_utf8_lossy(&machine.serial_output())
     ))
 }

@@ -129,6 +129,28 @@ impl TlbRequest {
 static TLB_REQUESTS: [TlbRequest; MAX_CPUS] = [const { TlbRequest::new() }; MAX_CPUS];
 static TLB_ACK: [AtomicU64; MAX_CPUS * MAX_CPUS] =
     [const { AtomicU64::new(0) }; MAX_CPUS * MAX_CPUS];
+/// Page-table root active on each CPU after its most recent CR3 write.
+///
+/// A zero slot means the CPU has not changed CR3 since bootstrap. That is a
+/// safe conservative value for address-space-specific invalidations because
+/// user roots are always nonzero; shared-kernel invalidations ignore this
+/// table and continue to target every online CPU.
+static ACTIVE_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Publish a completed local CR3 transition for targeted TLB shootdowns.
+///
+/// This must run *after* the architectural write. Seeing a nonmatching root
+/// with `Acquire` then proves that CPU has already left the old address space
+/// and flushed its non-global translations. Conversely, a CPU entering the
+/// requested root may be omitted until this publication because its preceding
+/// CR3 load necessarily obtains translations newer than the page-table
+/// mutation that triggered the shootdown.
+pub(crate) fn publish_active_cr3(cr3: u64) {
+    let cpu = crate::sync::current_cpu();
+    if cpu < MAX_CPUS {
+        ACTIVE_CR3[cpu].store(normalise_cr3(cr3), Ordering::Release);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrampolinePageSource {
@@ -599,6 +621,33 @@ const fn normalise_cr3(cr3: u64) -> u64 {
     cr3 & CR3_ADDRESS_MASK
 }
 
+#[inline]
+const fn shootdown_targets_active_root(
+    kind: ShootdownKind,
+    requested_cr3: u64,
+    active_cr3: u64,
+) -> bool {
+    !kind.is_address_space_specific() || normalise_cr3(active_cr3) == normalise_cr3(requested_cr3)
+}
+
+fn shootdown_targets(kind: ShootdownKind, requested_cr3: u64, current: usize) -> u64 {
+    let mut targets = online_mask() & !(1u64 << current);
+    if kind.is_address_space_specific() {
+        for (cpu, active_cr3) in ACTIVE_CR3.iter().enumerate() {
+            if targets & (1u64 << cpu) != 0
+                && !shootdown_targets_active_root(
+                    kind,
+                    requested_cr3,
+                    active_cr3.load(Ordering::Acquire),
+                )
+            {
+                targets &= !(1u64 << cpu);
+            }
+        }
+    }
+    targets
+}
+
 fn apply_shootdown(kind: ShootdownKind, request_cr3: u64, address: u64) {
     if kind.is_address_space_specific() {
         let active = normalise_cr3(unsafe { read_cr3() });
@@ -631,7 +680,11 @@ fn shootdown(kind: ShootdownKind, cr3: u64, address: u64) {
     let _interrupt_guard = unsafe { InterruptGuard::disable() };
     let current = crate::sync::current_cpu();
     debug_assert!(current < MAX_CPUS);
-    let targets = online_mask() & !(1u64 << current);
+    // Address-space invalidations involve only CPUs which still publish the
+    // affected root. This is more than an optimisation: a CPU spinning on an
+    // unrelated IRQ-safe lock has interrupts disabled and cannot acknowledge
+    // an IPI. Waiting on such a CPU while holding that lock would deadlock.
+    let targets = shootdown_targets(kind, cr3, current);
     if targets == 0 || !is_ready() {
         apply_shootdown(kind, cr3, address);
         return;
@@ -678,6 +731,19 @@ fn shootdown(kind: ShootdownKind, cr3: u64, address: u64) {
         let ack = &TLB_ACK[tlb_ack_index(current, cpu)];
         while ack.load(Ordering::Acquire) != generation {
             service_tlb_requests(current);
+            // A target may leave this address space after the initial
+            // snapshot. Its Release publication follows the CR3 write, so a
+            // nonmatching Acquire observation proves the stale TLB is gone;
+            // waiting for an IPI acknowledgement is no longer necessary.
+            if kind.is_address_space_specific()
+                && !shootdown_targets_active_root(
+                    kind,
+                    cr3,
+                    ACTIVE_CR3[cpu].load(Ordering::Acquire),
+                )
+            {
+                break;
+            }
             pause();
         }
     }
@@ -750,6 +816,26 @@ mod tests {
         assert!(ShootdownKind::AddressSpacePage.is_address_space_specific());
         assert!(ShootdownKind::KernelAll.is_full_flush());
         assert!(!ShootdownKind::AddressSpacePage.is_full_flush());
+    }
+
+    #[test]
+    fn address_space_shootdown_targets_only_matching_roots() {
+        let requested = 0x1234_5000;
+        assert!(shootdown_targets_active_root(
+            ShootdownKind::AddressSpacePage,
+            requested | 0xabc,
+            requested | 0x055,
+        ));
+        assert!(!shootdown_targets_active_root(
+            ShootdownKind::AddressSpaceAll,
+            requested,
+            0x9876_5000,
+        ));
+        assert!(shootdown_targets_active_root(
+            ShootdownKind::KernelPage,
+            requested,
+            0x9876_5000,
+        ));
     }
 
     #[test]

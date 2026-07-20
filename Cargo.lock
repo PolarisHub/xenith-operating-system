@@ -82,6 +82,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libwindow"
+version = "0.1.0"
+dependencies = [
+ "libuser",
+ "xenith-abi",
+]
+
+[[package]]
 name = "limine"
 version = "0.3.2"
 
@@ -208,6 +216,7 @@ version = "0.1.0"
 dependencies = [
  "xenith-cc",
  "xenith-iso",
+ "xenith-winhost",
 ]
 
 [[package]]
@@ -239,6 +248,7 @@ name = "xenith-desktop"
 version = "0.1.0"
 dependencies = [
  "libuser",
+ "libwindow",
  "xenith-abi",
 ]
 
@@ -357,6 +367,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xenith-pe"
+version = "0.1.0"
+
+[[package]]
 name = "xenith-sh"
 version = "0.1.0"
 dependencies = [
@@ -373,6 +387,30 @@ name = "xenith-vmm"
 version = "0.1.0"
 dependencies = [
  "xenith-emu",
+]
+
+[[package]]
+name = "xenith-windrv-core"
+version = "0.1.0"
+dependencies = [
+ "xenith-winhost-core",
+]
+
+[[package]]
+name = "xenith-winhost"
+version = "0.1.0"
+dependencies = [
+ "libuser",
+ "xenith-abi",
+ "xenith-pe",
+ "xenith-winhost-core",
+]
+
+[[package]]
+name = "xenith-winhost-core"
+version = "0.1.0"
+dependencies = [
+ "xenith-pe",
 ]
 
 [[package]]

@@ -58,9 +58,11 @@ The firmware-read path retains the BIOS-provided drive number and supports the
 hard-disk-emulated El Torito image as well as a raw BIOS disk. Legacy
 primary-master ATA PIO is retained only as a drive-`0x80` fallback if firmware
 preloading fails. Repository firmware gates cover the current raw and ISO
-paths; external VMware legacy-BIOS and QEMU/SeaBIOS proof currently belongs to
-the preceding artifact hashes recorded in `docs/STATUS.md`. Physical hardware
-and arbitrary firmware remain separate validation boundaries.
+paths; VMware Workstation 17.6.3 externally cold-booted the current ISO under
+both legacy BIOS and UEFI with three vCPUs. The wider VMware legacy-BIOS and
+QEMU/SeaBIOS topology matrices belong to the preceding hashes recorded in
+`docs/STATUS.md`. Physical hardware and arbitrary firmware remain separate
+validation boundaries.
 
 The BIOS handoff sets the exact `xenith.boot=bios` command-line token and marks
 the first MiB reserved. Once all synchronous INT 13h payload reads are done,

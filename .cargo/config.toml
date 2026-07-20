@@ -71,4 +71,4 @@ kimage = "build --target kernel/x86_64-xenith.json -p xenith-kernel --release -Z
 kclippy = "clippy --target kernel/x86_64-xenith.json -p xenith-kernel -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings"
 kfmt = "fmt --all"
 kdoc = "doc --target kernel/x86_64-xenith.json --no-deps -p xenith-kernel"
-ubuild = "build --target user/x86_64-xenith-user.json -p xenith-init -p xenith-sh -p xenith-coreutils -p xenith-editor -p xenith-net -p xenith-examples -p xenith-libc -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem"
+ubuild = "build --target user/x86_64-xenith-user.json -p xenith-init -p xenith-desktop -p xenith-winhost -p xenith-sh -p xenith-coreutils -p xenith-editor -p xenith-net -p xenith-examples -p xenith-libc -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem"

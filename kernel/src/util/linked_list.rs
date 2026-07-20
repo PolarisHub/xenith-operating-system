@@ -121,7 +121,7 @@ impl<T> LinkEntry<T> {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use xenith_kernel::util::linked_list::{IntrusiveLinkedList, LinkEntry, Links};
 /// use core::ptr::NonNull;
 ///

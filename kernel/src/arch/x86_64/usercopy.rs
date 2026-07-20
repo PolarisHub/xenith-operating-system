@@ -279,22 +279,35 @@ impl PreparedUserWrite {
     /// changing page tables, or issuing a TLB shootdown.
     #[must_use]
     pub fn copy_from_kernel(&self, source: &[u8]) -> bool {
-        if source.len() > self.length {
+        self.copy_from_kernel_at(0, source)
+    }
+
+    /// Copy into a subrange of the prepared destination without allocating
+    /// or changing page tables.
+    #[must_use]
+    pub fn copy_from_kernel_at(&self, offset: usize, source: &[u8]) -> bool {
+        let Some(end) = offset.checked_add(source.len()) else {
+            return false;
+        };
+        if end > self.length {
             return false;
         }
         if source.is_empty() {
             return true;
         }
+        let Some(destination) = self.pointer.checked_add(offset as u64) else {
+            return false;
+        };
         // SAFETY: the guard pins the current CR3 through the read-only PTE
         // recheck and fault-recoverable copy.
         let _interrupt_guard = unsafe { InterruptGuard::disable() };
-        if !validate_user_pages(self.pointer, source.len(), true, false) {
+        if !validate_user_pages(destination, source.len(), true, false) {
             return false;
         }
         // SAFETY: the no-COW validation above proved the destination is
         // currently user-writable, and the assembly loop converts a late
         // user fault into `false`.
-        unsafe { copy_to_user(self.pointer as *mut u8, source.as_ptr(), source.len()) }
+        unsafe { copy_to_user(destination as *mut u8, source.as_ptr(), source.len()) }
     }
 }
 
@@ -455,5 +468,19 @@ mod tests {
         let mut byte = [0u8; 1];
 
         assert!(!prepared.copy_to_kernel(1, &mut byte));
+    }
+
+    #[test]
+    fn prepared_write_subranges_reject_overflow_and_out_of_bounds() {
+        let prepared = PreparedUserWrite {
+            pointer: 0x1000,
+            length: 16,
+            _not_send: PhantomData,
+        };
+        let empty = [];
+
+        assert!(prepared.copy_from_kernel_at(16, &empty));
+        assert!(!prepared.copy_from_kernel_at(17, &empty));
+        assert!(!prepared.copy_from_kernel_at(usize::MAX, &[1]));
     }
 }

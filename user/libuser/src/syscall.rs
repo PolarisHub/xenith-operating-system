@@ -3,8 +3,10 @@
 use core::arch::asm;
 
 use xenith_abi::{
-    DirectoryEntry, NetInterfaceInfo, OpenFlags, SigAction, SigAltStack, SigSet, SockAddrV4, Stat,
-    SyscallNumber, Timespec, UiDisplayInfo, UiInputEvent, UiRect, UtsName, UI_MAX_EVENTS_PER_READ,
+    DirectoryEntry, IpcChannelPair, IpcReceiveMessage, IpcSendMessage, NetInterfaceInfo, OpenFlags,
+    SigAction, SigAltStack, SigSet, SockAddrV4, SpawnRestrictedRequest, Stat, SyscallNumber,
+    ThreadCreate, ThreadJoinResult, Timespec, UiDisplayInfo, UiInputEvent, UiRect, UtsName,
+    WaitItem, UI_MAX_EVENTS_PER_READ, WAIT_MAX_ITEMS,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +68,27 @@ pub fn write(fd: i32, buffer: &[u8]) -> Result<usize> {
     ])
 }
 
+/// Submit a raw userspace address to Xenith's checked `write` syscall path.
+///
+/// Unlike [`write`], this wrapper never creates or dereferences a Rust slice.
+/// The kernel validates and copies the address range before the descriptor
+/// backend observes it, returning `EFAULT` for an inaccessible range.
+///
+/// # Safety
+/// The address and length must remain stable for the synchronous syscall. The
+/// pointer is intentionally allowed to originate outside Rust's reference
+/// model; no Rust validity or alignment assumption is made by this wrapper.
+pub unsafe fn write_raw(fd: i32, buffer: *const u8, length: usize) -> Result<usize> {
+    call(SyscallNumber::Write, [
+        fd as usize,
+        buffer as usize,
+        length,
+        0,
+        0,
+        0,
+    ])
+}
+
 pub fn open(path: &[u8], flags: OpenFlags, mode: u32) -> Result<i32> {
     call(SyscallNumber::Open, [
         path.as_ptr() as usize,
@@ -87,8 +110,7 @@ pub fn brk(address: usize) -> Result<usize> {
     call(SyscallNumber::Brk, [address, 0, 0, 0, 0, 0])
 }
 
-/// Create a mapping. The kernel currently accepts the bounded anonymous,
-/// private subset (`MAP_PRIVATE | MAP_ANONYMOUS`, `fd == -1`, offset zero).
+/// Create a private anonymous or shared descriptor-backed mapping.
 pub fn mmap(
     address: *mut u8,
     length: usize,
@@ -114,6 +136,19 @@ pub fn munmap(address: *mut u8, length: usize) -> Result<()> {
         address as usize,
         length,
         0,
+        0,
+        0,
+        0,
+    ])
+    .map(|_| ())
+}
+
+/// Change permissions on a page-aligned range returned by [`mmap`].
+pub fn mprotect(address: *mut u8, length: usize, protection: u32) -> Result<()> {
+    call(SyscallNumber::Mprotect, [
+        address as usize,
+        length,
+        protection as usize,
         0,
         0,
         0,
@@ -165,6 +200,95 @@ pub fn exit(code: i32) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Return the globally unique scheduler task id of the calling thread.
+pub fn gettid() -> Result<u64> {
+    call(SyscallNumber::Gettid, [0; 6]).map(|value| value as u64)
+}
+
+/// Create a raw joinable thread from an ABI request.
+pub fn thread_create(request: &ThreadCreate) -> Result<u64> {
+    call(SyscallNumber::ThreadCreate, [
+        request as *const ThreadCreate as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])
+    .map(|value| value as u64)
+}
+
+/// Terminate only the calling thread.
+pub fn thread_exit(code: i32) -> ! {
+    let _ = call(SyscallNumber::ThreadExit, [code as usize, 0, 0, 0, 0, 0]);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Wait for and consume one completed thread.
+pub fn thread_join(thread: u64, result: &mut ThreadJoinResult) -> Result<()> {
+    call(SyscallNumber::ThreadJoin, [
+        thread as usize,
+        result as *mut ThreadJoinResult as usize,
+        0,
+        0,
+        0,
+        0,
+    ])
+    .map(|_| ())
+}
+
+/// Entry signature accepted by [`spawn_thread`].
+pub type ThreadEntry = extern "C" fn(usize) -> i32;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ThreadStart {
+    entry: ThreadEntry,
+    argument: usize,
+}
+
+unsafe extern "C" fn thread_bootstrap(raw_start: usize) -> ! {
+    // SAFETY: spawn_thread stores an aligned ThreadStart at the base of the
+    // exclusively-owned mapping before publishing this task.
+    let start = unsafe { (raw_start as *const ThreadStart).read() };
+    thread_exit((start.entry)(start.argument))
+}
+
+/// Start a joinable function on a caller-owned private stack mapping.
+///
+/// # Safety
+///
+/// `stack` must be a page-aligned, page-sized, writable and non-executable
+/// mapping which no other execution context reads or writes until the returned
+/// thread has been joined. The mapping must remain live for that entire time.
+pub unsafe fn spawn_thread(entry: ThreadEntry, argument: usize, stack: &mut [u8]) -> Result<u64> {
+    const PAGE_SIZE: usize = 4096;
+    let base = stack.as_mut_ptr() as usize;
+    if base == 0
+        || base & (PAGE_SIZE - 1) != 0
+        || stack.len() & (PAGE_SIZE - 1) != 0
+        || stack.len() < core::mem::size_of::<ThreadStart>()
+    {
+        return Err(Error(xenith_abi::Errno::Einval as i32));
+    }
+    let start = ThreadStart { entry, argument };
+    // SAFETY: the caller grants exclusive writable ownership of the complete
+    // mapping, and the alignment check is stronger than ThreadStart requires.
+    unsafe { (base as *mut ThreadStart).write(start) };
+    thread_create(&ThreadCreate {
+        version: xenith_abi::THREAD_ABI_VERSION,
+        flags: 0,
+        entry: thread_bootstrap as *const () as usize as u64,
+        stack_base: base as u64,
+        stack_size: stack.len() as u64,
+        argument: base as u64,
+        tls_base: 0,
+        reserved: [0; 2],
+    })
 }
 
 pub fn getpid() -> Result<u64> {
@@ -365,6 +489,41 @@ fn spawn_with_group_argument(
         0,
     ])
     .map(|pid| pid as i64)
+}
+
+/// Spawn a child with only the descriptor mappings named by `request`.
+///
+/// The request also carries the ordinary spawn process-group token. The
+/// kernel validates and snapshots the complete action batch before publishing
+/// the child, leaving the caller's descriptor table unchanged on failure.
+pub fn spawn_restricted(
+    path: &[u8],
+    argv: *const *const u8,
+    envp: *const *const u8,
+    request: &SpawnRestrictedRequest,
+) -> Result<i64> {
+    call(
+        SyscallNumber::SpawnRestricted,
+        spawn_restricted_arguments(path, argv, envp, request),
+    )
+    .map(|pid| pid as i64)
+}
+
+#[inline]
+fn spawn_restricted_arguments(
+    path: &[u8],
+    argv: *const *const u8,
+    envp: *const *const u8,
+    request: &SpawnRestrictedRequest,
+) -> [usize; 6] {
+    [
+        path.as_ptr() as usize,
+        path.len(),
+        argv as usize,
+        envp as usize,
+        request as *const SpawnRestrictedRequest as usize,
+        0,
+    ]
 }
 
 pub fn socket(domain: u32, socket_type: u32, protocol: u32) -> Result<i32> {
@@ -708,4 +867,88 @@ pub fn ui_read_events(events: &mut [UiInputEvent], timeout_ns: u64) -> Result<us
 
 pub fn ui_release() -> Result<()> {
     call(SyscallNumber::UiRelease, [0, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Create a connected pair of bidirectional, message-preserving channels.
+pub fn channel_create() -> Result<IpcChannelPair> {
+    let mut pair = IpcChannelPair::default();
+    call(SyscallNumber::ChannelCreate, [
+        core::ptr::from_mut(&mut pair) as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])?;
+    Ok(pair)
+}
+
+/// Atomically enqueue one bounded payload and its attenuated descriptor set.
+pub fn channel_send(fd: i32, message: &IpcSendMessage, timeout_ns: u64) -> Result<usize> {
+    call(SyscallNumber::ChannelSend, [
+        fd as usize,
+        core::ptr::from_ref(message) as usize,
+        timeout_ns as usize,
+        0,
+        0,
+        0,
+    ])
+}
+
+/// Receive one complete channel message and atomically install its transfers.
+pub fn channel_recv(fd: i32, message: &mut IpcReceiveMessage, timeout_ns: u64) -> Result<usize> {
+    call(SyscallNumber::ChannelRecv, [
+        fd as usize,
+        core::ptr::from_mut(message) as usize,
+        timeout_ns as usize,
+        0,
+        0,
+        0,
+    ])
+}
+
+/// Create a zero-filled page-rounded shared-memory object and return its FD.
+pub fn shm_create(length: usize) -> Result<i32> {
+    call(SyscallNumber::ShmCreate, [length, 0, 0, 0, 0, 0]).map(|fd| fd as i32)
+}
+
+/// Wait until at least one channel or the exclusive UI seat is ready.
+///
+/// The kernel updates every item transactionally and returns the number of
+/// entries whose `ready` field is nonzero. An empty or oversized set is
+/// rejected without entering the kernel.
+pub fn wait(items: &mut [WaitItem], timeout_ns: u64) -> Result<usize> {
+    if items.is_empty() || items.len() > WAIT_MAX_ITEMS {
+        return Err(Error(xenith_abi::Errno::Einval as i32));
+    }
+    call(SyscallNumber::Wait, [
+        items.as_mut_ptr() as usize,
+        items.len(),
+        timeout_ns as usize,
+        0,
+        0,
+        0,
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restricted_spawn_wrapper_uses_the_fixed_request_pointer_slot() {
+        let path = b"/bin/client";
+        let request = SpawnRestrictedRequest::default();
+        let argv = 0x1000usize as *const *const u8;
+        let envp = 0x2000usize as *const *const u8;
+        let arguments = spawn_restricted_arguments(path, argv, envp, &request);
+
+        assert_eq!(arguments[0], path.as_ptr() as usize);
+        assert_eq!(arguments[1], path.len());
+        assert_eq!(arguments[2], argv as usize);
+        assert_eq!(arguments[3], envp as usize);
+        assert_eq!(arguments[4], core::ptr::from_ref(&request) as usize);
+        assert_eq!(arguments[5], 0);
+        assert_eq!(SyscallNumber::SpawnRestricted as u64, 68);
+    }
 }

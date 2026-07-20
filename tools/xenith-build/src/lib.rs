@@ -291,6 +291,8 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
         "-p",
         "xenith-desktop",
         "-p",
+        "xenith-winhost",
+        "-p",
         "xenith-sh",
         "-p",
         "xenith-coreutils",
@@ -315,15 +317,19 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
     let rust_programs = [
         ("init", "init"),
         ("bin/xenith-desktop", "xenith-desktop"),
+        ("bin/xenith-window-smoke", "xenith-window-smoke"),
+        ("bin/xenith-winhost", "xenith-winhost"),
         ("bin/sh", "xenith-sh"),
         ("bin/coreutils", "xenith-coreutils"),
         ("bin/editor", "xenith-editor"),
         ("bin/xenith-net", "xenith-net"),
         ("bin/hello", "xenith-hello"),
+        ("bin/thread-smoke", "xenith-thread-smoke"),
     ];
     for (_, binary) in &rust_programs {
         validate_userspace_elf(&layout.user_release(binary))?;
     }
+    validate_fixture_rebase_collision(&layout.user_release("xenith-winhost"))?;
     let mut programs = rust_programs
         .into_iter()
         .map(|(archive, binary)| {
@@ -340,6 +346,16 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
     fs::write(&c_destination, c_image)?;
     validate_userspace_elf(&c_destination)?;
     programs.push(("bin/c-demo".to_owned(), c_destination));
+
+    let win64_fixture_destination = user_dir.join("win64-console.exe");
+    fs::write(
+        &win64_fixture_destination,
+        xenith_winhost::fixture::console_fixture(),
+    )?;
+    programs.push((
+        "tests/win64-console.exe".to_owned(),
+        win64_fixture_destination,
+    ));
     Ok(programs)
 }
 
@@ -367,6 +383,47 @@ fn validate_userspace_elf(path: &Path) -> Result<(), BuildError> {
         path: path.to_path_buf(),
         reason,
     })
+}
+
+fn validate_fixture_rebase_collision(path: &Path) -> Result<(), BuildError> {
+    let image = fs::read(path)?;
+    let preferred = xenith_winhost::fixture::CONSOLE_FIXTURE_IMAGE_BASE;
+    match userspace_elf_maps_address(&image, preferred) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BuildError::InvalidUserspaceElf {
+            path: path.to_path_buf(),
+            reason: format!(
+                "host does not occupy fixture preferred base {preferred:#x}; the runtime gate would no longer prove rebasing"
+            ),
+        }),
+        Err(reason) => Err(BuildError::InvalidUserspaceElf {
+            path: path.to_path_buf(),
+            reason,
+        }),
+    }
+}
+
+fn userspace_elf_maps_address(image: &[u8], address: u64) -> Result<bool, String> {
+    validate_userspace_elf_bytes(image)?;
+    let program_offset = usize::try_from(elf_u64(image, 32).ok_or("truncated program offset")?)
+        .map_err(|_| "program header offset does not fit usize")?;
+    let program_size = usize::from(elf_u16(image, 54).ok_or("truncated program header size")?);
+    let program_count = usize::from(elf_u16(image, 56).ok_or("truncated program header count")?);
+    for index in 0..program_count {
+        let header = program_offset + index * program_size;
+        if elf_u32(image, header) != Some(ELF_PT_LOAD) {
+            continue;
+        }
+        let start = elf_u64(image, header + 16).ok_or("truncated PT_LOAD virtual address")?;
+        let size = elf_u64(image, header + 40).ok_or("truncated PT_LOAD memory size")?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| format!("PT_LOAD {index} memory range overflows"))?;
+        if (start..end).contains(&address) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_userspace_elf_bytes(image: &[u8]) -> Result<(), String> {
@@ -791,6 +848,60 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_window_smoke_is_packaged_as_a_separate_executable() {
+        let programs = vec![
+            ("bin/xenith-desktop".to_owned(), vec![0x44; 64]),
+            ("bin/xenith-window-smoke".to_owned(), vec![0x55; 48]),
+            ("bin/coreutils".to_owned(), vec![0x11; 32]),
+            ("bin/editor".to_owned(), vec![0x22; 32]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 32]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+        let (_, mode, data) = entries
+            .iter()
+            .find(|(name, _, _)| *name == "bin/xenith-window-smoke")
+            .copied()
+            .unwrap();
+
+        assert_eq!(mode & 0o170000, 0o100000);
+        assert_eq!(data, &[0x55; 48]);
+    }
+
+    #[test]
+    fn winhost_and_source_built_pe_fixture_are_packaged_separately() {
+        let fixture = xenith_winhost::fixture::console_fixture();
+        let programs = vec![
+            ("bin/xenith-winhost".to_owned(), vec![
+                0x7f, b'E', b'L', b'F',
+            ]),
+            ("tests/win64-console.exe".to_owned(), fixture.to_vec()),
+            ("bin/coreutils".to_owned(), vec![0x11; 32]),
+            ("bin/editor".to_owned(), vec![0x22; 32]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 32]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+
+        let (_, host_mode, host) = entries
+            .iter()
+            .find(|(name, _, _)| *name == "bin/xenith-winhost")
+            .copied()
+            .unwrap();
+        let (_, fixture_mode, packaged_fixture) = entries
+            .iter()
+            .find(|(name, _, _)| *name == "tests/win64-console.exe")
+            .copied()
+            .unwrap();
+
+        assert_eq!(host_mode & 0o170000, 0o100000);
+        assert_eq!(host, &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(fixture_mode & 0o170000, 0o100000);
+        assert_eq!(packaged_fixture, fixture);
+        assert_eq!(&packaged_fixture[..2], b"MZ");
+    }
+
+    #[test]
     fn discovers_workspace() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         let layout = Layout::discover(here).unwrap();
@@ -843,6 +954,9 @@ mod tests {
     fn accepts_low_half_userspace_elf() {
         let image = minimal_userspace_elf(0x20_0080, 0x20_0000);
         assert_eq!(validate_userspace_elf_bytes(&image), Ok(()));
+        assert_eq!(userspace_elf_maps_address(&image, 0x20_0000), Ok(true));
+        assert_eq!(userspace_elf_maps_address(&image, 0x20_0fff), Ok(true));
+        assert_eq!(userspace_elf_maps_address(&image, 0x20_1000), Ok(false));
     }
 
     #[test]

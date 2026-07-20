@@ -38,6 +38,19 @@ pub const COMPOSITOR_EVENT_POINTER: u16 = 4;
 pub const COMPOSITOR_EVENT_KEY: u16 = 5;
 pub const COMPOSITOR_EVENT_TEXT: u16 = 6;
 pub const COMPOSITOR_EVENT_FRAME_DONE: u16 = 7;
+/// The compositor has stopped reading the named attached buffer.
+pub const COMPOSITOR_EVENT_BUFFER_RELEASE: u16 = 8;
+
+/// Request completed successfully.
+pub const COMPOSITOR_STATUS_OK: i32 = 0;
+pub const COMPOSITOR_STATUS_INVALID_ARGUMENT: i32 = -1;
+pub const COMPOSITOR_STATUS_NOT_FOUND: i32 = -2;
+pub const COMPOSITOR_STATUS_ALREADY_EXISTS: i32 = -3;
+pub const COMPOSITOR_STATUS_ACCESS_DENIED: i32 = -4;
+pub const COMPOSITOR_STATUS_NO_MEMORY: i32 = -5;
+pub const COMPOSITOR_STATUS_RESOURCE_EXHAUSTED: i32 = -6;
+pub const COMPOSITOR_STATUS_UNSUPPORTED: i32 = -7;
+pub const COMPOSITOR_STATUS_INVALID_STATE: i32 = -8;
 
 pub const COMPOSITOR_FORMAT_BGRX8888: u32 = 1;
 pub const COMPOSITOR_FORMAT_BGRA8888: u32 = 2;
@@ -68,6 +81,55 @@ pub const COMPOSITOR_KEY_REPEATED: u16 = 2;
 
 pub const COMPOSITOR_FOCUS_OUT: u32 = 0;
 pub const COMPOSITOR_FOCUS_IN: u32 = 1;
+
+/// Local validation context; this enum is not part of any wire record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositorMessageDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// Whether an opcode targets a surface in [`CompositorHeader::object`].
+/// This enum is descriptive metadata and is not carried on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositorObjectRule {
+    Invalid,
+    Valid,
+}
+
+/// Exact schema associated with one `(kind, opcode)` pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositorOpcodeSchema {
+    pub kind: u16,
+    pub opcode: u16,
+    pub payload_size: u32,
+    pub direction: CompositorMessageDirection,
+    pub object_rule: CompositorObjectRule,
+}
+
+impl CompositorOpcodeSchema {
+    #[must_use]
+    pub const fn accepts_direction(&self, direction: CompositorMessageDirection) -> bool {
+        matches!(
+            (self.direction, direction),
+            (
+                CompositorMessageDirection::ClientToServer,
+                CompositorMessageDirection::ClientToServer
+            ) | (
+                CompositorMessageDirection::ServerToClient,
+                CompositorMessageDirection::ServerToClient
+            )
+        )
+    }
+
+    #[must_use]
+    pub const fn accepts_object(&self, object: CompositorHandle) -> bool {
+        match self.object_rule {
+            CompositorObjectRule::Invalid => object.0 == CompositorHandle::INVALID.0,
+            CompositorObjectRule::Valid => object.is_valid(),
+        }
+    }
+}
 
 /// Opaque object identifier. Both the slot and generation must be nonzero.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -113,6 +175,7 @@ pub struct CompositorHeader {
     pub flags: u32,
     /// Must be zero.
     pub reserved: u32,
+    /// Nonzero request/reply correlation or server event serial.
     pub serial: u64,
     /// Target surface for surface requests/events, otherwise invalid.
     pub object: CompositorHandle,
@@ -149,14 +212,24 @@ impl CompositorHeader {
 
     #[must_use]
     pub const fn is_valid(&self) -> bool {
-        self.magic == COMPOSITOR_MAGIC
-            && self.version == COMPOSITOR_VERSION
-            && self.header_size == COMPOSITOR_HEADER_SIZE
-            && self.message_size >= COMPOSITOR_HEADER_SIZE as u32
-            && self.message_size <= COMPOSITOR_MAX_MESSAGE_SIZE
-            && self.flags == 0
-            && self.reserved == 0
-            && is_known_opcode(self.kind, self.opcode)
+        if self.magic != COMPOSITOR_MAGIC
+            || self.version != COMPOSITOR_VERSION
+            || self.header_size != COMPOSITOR_HEADER_SIZE
+            || self.message_size < COMPOSITOR_HEADER_SIZE as u32
+            || self.message_size > COMPOSITOR_MAX_MESSAGE_SIZE
+            || self.flags != 0
+            || self.reserved != 0
+            || self.serial == 0
+        {
+            return false;
+        }
+        match compositor_opcode_schema(self.kind, self.opcode) {
+            Some(schema) => {
+                self.message_size == COMPOSITOR_HEADER_SIZE as u32 + schema.payload_size
+                    && schema.accepts_object(self.object)
+            },
+            None => false,
+        }
     }
 
     #[must_use]
@@ -167,38 +240,36 @@ impl CompositorHeader {
     }
 
     #[must_use]
+    pub const fn is_valid_for_direction(&self, direction: CompositorMessageDirection) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
+        match compositor_opcode_schema(self.kind, self.opcode) {
+            Some(schema) => schema.accepts_direction(direction),
+            None => false,
+        }
+    }
+
+    /// Validate one complete datagram. Trailing bytes are noncanonical.
+    #[must_use]
     pub const fn is_complete_in(&self, available_bytes: u32) -> bool {
-        self.is_valid() && available_bytes >= self.message_size
+        self.is_valid() && available_bytes == self.message_size
+    }
+
+    /// Validate schema, direction, object rule, payload size, and exact datagram length.
+    #[must_use]
+    pub const fn is_valid_message(
+        &self,
+        direction: CompositorMessageDirection,
+        available_bytes: u32,
+    ) -> bool {
+        self.is_valid_for_direction(direction) && available_bytes == self.message_size
     }
 }
 
 #[must_use]
 pub const fn is_known_opcode(kind: u16, opcode: u16) -> bool {
-    match kind {
-        COMPOSITOR_KIND_REQUEST => matches!(
-            opcode,
-            COMPOSITOR_REQUEST_CREATE_SURFACE
-                | COMPOSITOR_REQUEST_DESTROY_SURFACE
-                | COMPOSITOR_REQUEST_ATTACH_BUFFER
-                | COMPOSITOR_REQUEST_COMMIT
-                | COMPOSITOR_REQUEST_SET_ROLE
-                | COMPOSITOR_REQUEST_SET_TITLE
-                | COMPOSITOR_REQUEST_SET_STATE
-                | COMPOSITOR_REQUEST_ACK_CONFIGURE
-        ),
-        COMPOSITOR_KIND_REPLY => opcode == COMPOSITOR_REPLY_STATUS,
-        COMPOSITOR_KIND_EVENT => matches!(
-            opcode,
-            COMPOSITOR_EVENT_CONFIGURE
-                | COMPOSITOR_EVENT_CLOSE
-                | COMPOSITOR_EVENT_FOCUS
-                | COMPOSITOR_EVENT_POINTER
-                | COMPOSITOR_EVENT_KEY
-                | COMPOSITOR_EVENT_TEXT
-                | COMPOSITOR_EVENT_FRAME_DONE
-        ),
-        _ => false,
-    }
+    compositor_opcode_schema(kind, opcode).is_some()
 }
 
 /// Shared-memory surface description. `buffer_token` is transport-defined.
@@ -327,6 +398,13 @@ pub struct CompositorCreateSurfaceRequest {
     pub reserved: [u64; 2],
 }
 
+impl CompositorCreateSurfaceRequest {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.reserved[0] == 0 && self.reserved[1] == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompositorDestroySurfaceRequest {
@@ -334,10 +412,24 @@ pub struct CompositorDestroySurfaceRequest {
     pub reserved: [u64; 2],
 }
 
+impl CompositorDestroySurfaceRequest {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.reserved[0] == 0 && self.reserved[1] == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompositorAttachBufferRequest {
     pub surface: CompositorSurfaceMetadata,
+}
+
+impl CompositorAttachBufferRequest {
+    #[must_use]
+    pub const fn is_valid(&self, backing_length: u64) -> bool {
+        self.surface.is_valid(backing_length)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,13 +589,42 @@ impl CompositorSetStateRequest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompositorStatusReply {
-    /// Zero on success; otherwise a negative transport-independent error code.
+    /// [`COMPOSITOR_STATUS_OK`] or a known negative compositor status.
     pub status: i32,
     /// Must be zero.
     pub reserved: u32,
     pub value: CompositorHandle,
     /// Must be zero.
     pub reserved2: [u64; 2],
+}
+
+#[must_use]
+pub const fn is_known_status(status: i32) -> bool {
+    matches!(
+        status,
+        COMPOSITOR_STATUS_OK
+            | COMPOSITOR_STATUS_INVALID_ARGUMENT
+            | COMPOSITOR_STATUS_NOT_FOUND
+            | COMPOSITOR_STATUS_ALREADY_EXISTS
+            | COMPOSITOR_STATUS_ACCESS_DENIED
+            | COMPOSITOR_STATUS_NO_MEMORY
+            | COMPOSITOR_STATUS_RESOURCE_EXHAUSTED
+            | COMPOSITOR_STATUS_UNSUPPORTED
+            | COMPOSITOR_STATUS_INVALID_STATE
+    )
+}
+
+impl CompositorStatusReply {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        let value_is_invalid = self.value.0 == CompositorHandle::INVALID.0;
+        is_known_status(self.status)
+            && self.reserved == 0
+            && self.reserved2[0] == 0
+            && self.reserved2[1] == 0
+            && (value_is_invalid || self.value.is_valid())
+            && (self.status == COMPOSITOR_STATUS_OK || value_is_invalid)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -518,6 +639,20 @@ pub struct CompositorConfigureEvent {
     pub reserved: [u64; 2],
 }
 
+impl CompositorConfigureEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.width != 0
+            && self.height != 0
+            && self.width <= COMPOSITOR_MAX_SURFACE_DIMENSION
+            && self.height <= COMPOSITOR_MAX_SURFACE_DIMENSION
+            && self.state & !COMPOSITOR_STATE_ALL == 0
+            && self.scale_milli != 0
+            && self.reserved[0] == 0
+            && self.reserved[1] == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompositorCloseEvent {
@@ -528,6 +663,13 @@ pub struct CompositorCloseEvent {
     pub reserved2: [u64; 2],
 }
 
+impl CompositorCloseEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.reserved == 0 && self.reserved2[0] == 0 && self.reserved2[1] == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompositorFocusEvent {
@@ -536,6 +678,15 @@ pub struct CompositorFocusEvent {
     pub seat: u32,
     /// Must be zero.
     pub reserved: [u64; 2],
+}
+
+impl CompositorFocusEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        matches!(self.focused, COMPOSITOR_FOCUS_OUT | COMPOSITOR_FOCUS_IN)
+            && self.reserved[0] == 0
+            && self.reserved[1] == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -558,6 +709,30 @@ pub struct CompositorPointerEvent {
     pub reserved2: [u64; 2],
 }
 
+impl CompositorPointerEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        if self.reserved != 0 || self.reserved2[0] != 0 || self.reserved2[1] != 0 {
+            return false;
+        }
+        match self.action {
+            COMPOSITOR_POINTER_ACTION_MOTION => {
+                self.changed_button == 0 && self.axis_x == 0 && self.axis_y == 0
+            },
+            COMPOSITOR_POINTER_ACTION_BUTTON => {
+                self.changed_button != 0
+                    && self.changed_button & (self.changed_button - 1) == 0
+                    && self.axis_x == 0
+                    && self.axis_y == 0
+            },
+            COMPOSITOR_POINTER_ACTION_AXIS => {
+                self.changed_button == 0 && (self.axis_x != 0 || self.axis_y != 0)
+            },
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct CompositorKeyEvent {
@@ -572,6 +747,22 @@ pub struct CompositorKeyEvent {
     pub reserved: [u32; 2],
     /// Must be zero.
     pub reserved2: [u64; 2],
+}
+
+impl CompositorKeyEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        let repeat_is_valid = match self.state {
+            COMPOSITOR_KEY_RELEASED | COMPOSITOR_KEY_PRESSED => self.repeat_count == 0,
+            COMPOSITOR_KEY_REPEATED => self.repeat_count != 0,
+            _ => false,
+        };
+        repeat_is_valid
+            && self.reserved[0] == 0
+            && self.reserved[1] == 0
+            && self.reserved2[0] == 0
+            && self.reserved2[1] == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,6 +815,141 @@ pub struct CompositorFrameDoneEvent {
     pub reserved2: [u64; 2],
 }
 
+impl CompositorFrameDoneEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.frame_token != 0
+            && self.flags == 0
+            && self.reserved == 0
+            && self.reserved2[0] == 0
+            && self.reserved2[1] == 0
+    }
+}
+
+/// Signals that the compositor will no longer read the attached buffer token.
+/// The client may reuse, replace, unmap, or close that buffer after this event.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct CompositorBufferReleaseEvent {
+    pub buffer_token: u64,
+    pub flags: u32,
+    /// Must be zero.
+    pub reserved: u32,
+    /// Must be zero.
+    pub reserved2: [u64; 2],
+}
+
+impl CompositorBufferReleaseEvent {
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.buffer_token != 0
+            && self.flags == 0
+            && self.reserved == 0
+            && self.reserved2[0] == 0
+            && self.reserved2[1] == 0
+    }
+}
+
+/// Return the exact schema for a known compositor `(kind, opcode)` pair.
+#[must_use]
+pub const fn compositor_opcode_schema(kind: u16, opcode: u16) -> Option<CompositorOpcodeSchema> {
+    let (payload_size, direction, object_rule) = match (kind, opcode) {
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_CREATE_SURFACE) => (
+            size_of::<CompositorCreateSurfaceRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Invalid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_DESTROY_SURFACE) => (
+            size_of::<CompositorDestroySurfaceRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_ATTACH_BUFFER) => (
+            size_of::<CompositorAttachBufferRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_COMMIT) => (
+            size_of::<CompositorCommitRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_SET_ROLE) => (
+            size_of::<CompositorSetRoleRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_SET_TITLE) => (
+            size_of::<CompositorSetTitleRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_SET_STATE) => (
+            size_of::<CompositorSetStateRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REQUEST, COMPOSITOR_REQUEST_ACK_CONFIGURE) => (
+            size_of::<CompositorAckConfigureRequest>() as u32,
+            CompositorMessageDirection::ClientToServer,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_REPLY, COMPOSITOR_REPLY_STATUS) => (
+            size_of::<CompositorStatusReply>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Invalid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_CONFIGURE) => (
+            size_of::<CompositorConfigureEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_CLOSE) => (
+            size_of::<CompositorCloseEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_FOCUS) => (
+            size_of::<CompositorFocusEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_POINTER) => (
+            size_of::<CompositorPointerEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_KEY) => (
+            size_of::<CompositorKeyEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_TEXT) => (
+            size_of::<CompositorTextEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_FRAME_DONE) => (
+            size_of::<CompositorFrameDoneEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        (COMPOSITOR_KIND_EVENT, COMPOSITOR_EVENT_BUFFER_RELEASE) => (
+            size_of::<CompositorBufferReleaseEvent>() as u32,
+            CompositorMessageDirection::ServerToClient,
+            CompositorObjectRule::Valid,
+        ),
+        _ => return None,
+    };
+    Some(CompositorOpcodeSchema {
+        kind,
+        opcode,
+        payload_size,
+        direction,
+        object_rule,
+    })
+}
+
 macro_rules! assert_layout {
     ($ty:ty, $size:expr, $align:expr) => {
         const _: [(); $size] = [(); size_of::<$ty>()];
@@ -651,6 +977,7 @@ assert_layout!(CompositorPointerEvent, 64, 8);
 assert_layout!(CompositorKeyEvent, 48, 8);
 assert_layout!(CompositorTextEvent, 88, 8);
 assert_layout!(CompositorFrameDoneEvent, 48, 8);
+assert_layout!(CompositorBufferReleaseEvent, 32, 8);
 
 #[cfg(test)]
 mod tests {
@@ -668,6 +995,161 @@ mod tests {
     }
 
     #[test]
+    fn opcode_schema_is_exact_and_complete() {
+        let cases = [
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_CREATE_SURFACE,
+                size_of::<CompositorCreateSurfaceRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Invalid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_DESTROY_SURFACE,
+                size_of::<CompositorDestroySurfaceRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_ATTACH_BUFFER,
+                size_of::<CompositorAttachBufferRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_COMMIT,
+                size_of::<CompositorCommitRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_SET_ROLE,
+                size_of::<CompositorSetRoleRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_SET_TITLE,
+                size_of::<CompositorSetTitleRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_SET_STATE,
+                size_of::<CompositorSetStateRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REQUEST,
+                COMPOSITOR_REQUEST_ACK_CONFIGURE,
+                size_of::<CompositorAckConfigureRequest>() as u32,
+                CompositorMessageDirection::ClientToServer,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_REPLY,
+                COMPOSITOR_REPLY_STATUS,
+                size_of::<CompositorStatusReply>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Invalid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_CONFIGURE,
+                size_of::<CompositorConfigureEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_CLOSE,
+                size_of::<CompositorCloseEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_FOCUS,
+                size_of::<CompositorFocusEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_POINTER,
+                size_of::<CompositorPointerEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_KEY,
+                size_of::<CompositorKeyEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_TEXT,
+                size_of::<CompositorTextEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_FRAME_DONE,
+                size_of::<CompositorFrameDoneEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+            (
+                COMPOSITOR_KIND_EVENT,
+                COMPOSITOR_EVENT_BUFFER_RELEASE,
+                size_of::<CompositorBufferReleaseEvent>() as u32,
+                CompositorMessageDirection::ServerToClient,
+                CompositorObjectRule::Valid,
+            ),
+        ];
+        assert_eq!(cases.len(), 17);
+
+        for (kind, opcode, payload_size, direction, object_rule) in cases {
+            let schema = compositor_opcode_schema(kind, opcode).expect("known schema");
+            assert_eq!(schema.kind, kind);
+            assert_eq!(schema.opcode, opcode);
+            assert_eq!(schema.payload_size, payload_size);
+            assert_eq!(schema.direction, direction);
+            assert_eq!(schema.object_rule, object_rule);
+            assert!(is_known_opcode(kind, opcode));
+
+            let object = match object_rule {
+                CompositorObjectRule::Invalid => CompositorHandle::INVALID,
+                CompositorObjectRule::Valid => CompositorHandle::from_parts(2, 4),
+            };
+            let header = CompositorHeader::new(kind, opcode, payload_size, 1, object);
+            assert!(header.is_valid_message(direction, header.message_size));
+            let opposite = match direction {
+                CompositorMessageDirection::ClientToServer => {
+                    CompositorMessageDirection::ServerToClient
+                },
+                CompositorMessageDirection::ServerToClient => {
+                    CompositorMessageDirection::ClientToServer
+                },
+            };
+            assert!(!header.is_valid_for_direction(opposite));
+        }
+
+        assert!(compositor_opcode_schema(0, 0).is_none());
+        assert!(compositor_opcode_schema(COMPOSITOR_KIND_EVENT, u16::MAX).is_none());
+    }
+
+    #[test]
     fn header_rejects_unknown_or_noncanonical_messages() {
         let header = CompositorHeader::new(
             COMPOSITOR_KIND_REQUEST,
@@ -678,18 +1160,58 @@ mod tests {
         );
         assert!(header.is_valid());
         assert!(header.is_valid_for_payload(size_of::<CompositorCommitRequest>() as u32));
+        assert!(!header.is_valid_for_payload(size_of::<CompositorCommitRequest>() as u32 - 1));
         assert!(header.is_complete_in(header.message_size));
         assert!(!header.is_complete_in(header.message_size - 1));
+        assert!(!header.is_complete_in(header.message_size + 1));
+        assert!(header.is_valid_message(
+            CompositorMessageDirection::ClientToServer,
+            header.message_size
+        ));
+        assert!(!header.is_valid_for_direction(CompositorMessageDirection::ServerToClient));
 
         let mut corrupt = header;
+        corrupt.magic ^= 1;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
+        corrupt.version += 1;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
+        corrupt.header_size -= 1;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
+        corrupt.flags = 1;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
         corrupt.reserved = 1;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
+        corrupt.serial = 0;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
+        corrupt.object = CompositorHandle::INVALID;
         assert!(!corrupt.is_valid());
         corrupt = header;
         corrupt.opcode = u16::MAX;
         assert!(!corrupt.is_valid());
         corrupt = header;
+        corrupt.message_size -= 1;
+        assert!(!corrupt.is_valid());
+        corrupt = header;
         corrupt.message_size = COMPOSITOR_MAX_MESSAGE_SIZE + 1;
         assert!(!corrupt.is_valid());
+
+        let create = CompositorHeader::new(
+            COMPOSITOR_KIND_REQUEST,
+            COMPOSITOR_REQUEST_CREATE_SURFACE,
+            size_of::<CompositorCreateSurfaceRequest>() as u32,
+            10,
+            CompositorHandle::INVALID,
+        );
+        assert!(create.is_valid());
+        let mut corrupt_create = create;
+        corrupt_create.object = CompositorHandle::from_parts(1, 1);
+        assert!(!corrupt_create.is_valid());
     }
 
     #[test]
@@ -775,5 +1297,180 @@ mod tests {
         ack.configure_serial = 41;
         ack.reserved[1] = 1;
         assert!(!ack.is_valid());
+    }
+
+    #[test]
+    fn request_payloads_require_canonical_reserved_fields() {
+        let mut create = CompositorCreateSurfaceRequest::default();
+        assert!(create.is_valid());
+        create.reserved[0] = 1;
+        assert!(!create.is_valid());
+
+        let mut destroy = CompositorDestroySurfaceRequest::default();
+        assert!(destroy.is_valid());
+        destroy.reserved[1] = 1;
+        assert!(!destroy.is_valid());
+
+        let surface = CompositorSurfaceMetadata {
+            width: 64,
+            height: 64,
+            stride: 256,
+            format: COMPOSITOR_FORMAT_BGRX8888,
+            buffer_token: 7,
+            offset: 0,
+            length: 64 * 64 * 4,
+            reserved: [0; 2],
+        };
+        let attach = CompositorAttachBufferRequest { surface };
+        assert!(attach.is_valid(surface.length));
+        assert!(!attach.is_valid(surface.length - 1));
+
+        let mut role = CompositorSetRoleRequest {
+            role: COMPOSITOR_ROLE_POPUP,
+            parent: CompositorHandle::from_parts(1, 1),
+            ..CompositorSetRoleRequest::default()
+        };
+        assert!(role.is_valid());
+        role.flags = 1;
+        assert!(!role.is_valid());
+
+        let mut state = CompositorSetStateRequest {
+            state: COMPOSITOR_STATE_MAXIMIZED,
+            mask: COMPOSITOR_STATE_MAXIMIZED,
+            reserved: [0; 2],
+        };
+        assert!(state.is_valid());
+        state.state |= COMPOSITOR_STATE_FULLSCREEN;
+        assert!(!state.is_valid());
+    }
+
+    #[test]
+    fn status_codes_and_status_payload_are_canonical() {
+        let statuses = [
+            COMPOSITOR_STATUS_OK,
+            COMPOSITOR_STATUS_INVALID_ARGUMENT,
+            COMPOSITOR_STATUS_NOT_FOUND,
+            COMPOSITOR_STATUS_ALREADY_EXISTS,
+            COMPOSITOR_STATUS_ACCESS_DENIED,
+            COMPOSITOR_STATUS_NO_MEMORY,
+            COMPOSITOR_STATUS_RESOURCE_EXHAUSTED,
+            COMPOSITOR_STATUS_UNSUPPORTED,
+            COMPOSITOR_STATUS_INVALID_STATE,
+        ];
+        for (index, status) in statuses.iter().copied().enumerate() {
+            assert!(is_known_status(status));
+            if index != 0 {
+                assert!(status < 0);
+            }
+            assert!(!statuses[..index].contains(&status));
+        }
+        assert!(!is_known_status(1));
+        assert!(!is_known_status(-9));
+
+        let mut reply = CompositorStatusReply::default();
+        assert!(reply.is_valid());
+        reply.value = CompositorHandle::from_parts(4, 2);
+        assert!(reply.is_valid());
+        reply.status = COMPOSITOR_STATUS_INVALID_ARGUMENT;
+        assert!(!reply.is_valid());
+        reply.value = CompositorHandle::INVALID;
+        assert!(reply.is_valid());
+        reply.status = -9;
+        assert!(!reply.is_valid());
+        reply.status = COMPOSITOR_STATUS_OK;
+        reply.value = CompositorHandle::from_parts(4, 0);
+        assert!(!reply.is_valid());
+        reply.value = CompositorHandle::INVALID;
+        reply.reserved2[0] = 1;
+        assert!(!reply.is_valid());
+    }
+
+    #[test]
+    fn server_event_payloads_reject_noncanonical_values() {
+        let mut configure = CompositorConfigureEvent {
+            width: 800,
+            height: 600,
+            state: COMPOSITOR_STATE_ACTIVATED,
+            scale_milli: 1000,
+            reserved: [0; 2],
+        };
+        assert!(configure.is_valid());
+        configure.scale_milli = 0;
+        assert!(!configure.is_valid());
+        configure.scale_milli = 1000;
+        configure.state = 1 << 31;
+        assert!(!configure.is_valid());
+
+        let mut close = CompositorCloseEvent::default();
+        assert!(close.is_valid());
+        close.reserved = 1;
+        assert!(!close.is_valid());
+
+        let mut focus = CompositorFocusEvent::default();
+        assert!(focus.is_valid());
+        focus.focused = 2;
+        assert!(!focus.is_valid());
+
+        let mut pointer = CompositorPointerEvent {
+            action: COMPOSITOR_POINTER_ACTION_MOTION,
+            ..CompositorPointerEvent::default()
+        };
+        assert!(pointer.is_valid());
+        pointer.changed_button = 1;
+        assert!(!pointer.is_valid());
+        pointer.action = COMPOSITOR_POINTER_ACTION_BUTTON;
+        assert!(pointer.is_valid());
+        pointer.changed_button = 3;
+        assert!(!pointer.is_valid());
+        pointer.action = COMPOSITOR_POINTER_ACTION_AXIS;
+        pointer.changed_button = 0;
+        pointer.axis_y = -1;
+        assert!(pointer.is_valid());
+        pointer.reserved2[1] = 1;
+        assert!(!pointer.is_valid());
+
+        let mut key = CompositorKeyEvent {
+            state: COMPOSITOR_KEY_PRESSED,
+            ..CompositorKeyEvent::default()
+        };
+        assert!(key.is_valid());
+        key.state = COMPOSITOR_KEY_REPEATED;
+        assert!(!key.is_valid());
+        key.repeat_count = 1;
+        assert!(key.is_valid());
+        key.state = u16::MAX;
+        assert!(!key.is_valid());
+
+        let mut frame = CompositorFrameDoneEvent {
+            frame_token: 1,
+            ..CompositorFrameDoneEvent::default()
+        };
+        assert!(frame.is_valid());
+        frame.frame_token = 0;
+        assert!(!frame.is_valid());
+        frame.frame_token = 1;
+        frame.flags = 1;
+        assert!(!frame.is_valid());
+
+        assert_eq!(size_of::<CompositorBufferReleaseEvent>(), 32);
+        assert_eq!(align_of::<CompositorBufferReleaseEvent>(), 8);
+        assert_eq!(
+            core::mem::offset_of!(CompositorBufferReleaseEvent, buffer_token),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(CompositorBufferReleaseEvent, reserved2),
+            16
+        );
+        let mut release = CompositorBufferReleaseEvent {
+            buffer_token: 9,
+            ..CompositorBufferReleaseEvent::default()
+        };
+        assert!(release.is_valid());
+        release.buffer_token = 0;
+        assert!(!release.is_valid());
+        release.buffer_token = 9;
+        release.reserved2[0] = 1;
+        assert!(!release.is_valid());
     }
 }

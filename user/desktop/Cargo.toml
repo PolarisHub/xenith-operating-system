@@ -14,7 +14,14 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "xenith-window-smoke"
+path = "src/window_smoke.rs"
+test = false
+bench = false
+
 [dependencies]
+libwindow = { path = "../libwindow" }
 libuser = { path = "../libuser" }
 xenith-abi = { path = "../../crates/xenith-abi" }
 
