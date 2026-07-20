@@ -834,6 +834,7 @@ fn process_errno(error: crate::user::ProcessError) -> Errno {
         crate::user::ProcessError::NoCurrentProcess
         | crate::user::ProcessError::NoSuchProcess(_) => Errno::Esrch,
         crate::user::ProcessError::PermissionDenied => Errno::Eperm,
+        crate::user::ProcessError::Interrupted => Errno::Eintr,
         crate::user::ProcessError::SignalQueueFull => Errno::Eagain,
         crate::user::ProcessError::NoChildren | crate::user::ProcessError::NotChild(_) => {
             Errno::Echild
@@ -2303,6 +2304,14 @@ mod user_range_tests {
         assert_eq!(
             process_errno(crate::user::ProcessError::SignalQueueFull),
             Errno::Eagain
+        );
+    }
+
+    #[test]
+    fn interrupted_process_wait_maps_to_eintr() {
+        assert_eq!(
+            process_errno(crate::user::ProcessError::Interrupted),
+            Errno::Eintr
         );
     }
 

@@ -1,11 +1,15 @@
 [package]
-name = "xenith-init"
+name = "xenith-desktop"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+name = "xenith_desktop"
+path = "src/lib.rs"
+
 [[bin]]
-name = "init"
+name = "xenith-desktop"
 path = "src/main.rs"
 test = false
 bench = false

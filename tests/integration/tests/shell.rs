@@ -2,7 +2,7 @@ use xenith_emu::{ExitReason, FramebufferConfig, Machine};
 
 const BOOT_LIMIT: u64 = 100_000_000;
 const COMMAND_SLICE: u64 = 2_000_000;
-const COMMAND_LIMIT: u64 = 30_000_000;
+const COMMAND_LIMIT: u64 = 50_000_000;
 
 fn serial(machine: &Machine) -> String {
     String::from_utf8_lossy(&machine.serial_output()).into_owned()
@@ -162,12 +162,19 @@ fn ring3_ui_smoke_restores_framebuffer_terminal() {
         }),
     )
     .unwrap();
-    let boot = machine.run();
-    assert_eq!(boot.reason, ExitReason::InstructionLimit);
-    let boot_serial = String::from_utf8_lossy(&boot.serial);
+    let desktop =
+        xenith_integration::run_until_serial(&mut machine, "XENITH_DESKTOP_READY", 1, BOOT_LIMIT)
+            .unwrap();
+    assert!(
+        !desktop.contains("XENITH_DESKTOP_FAIL"),
+        "desktop failed before the ring-3 UI smoke: {desktop}"
+    );
+    xenith_integration::request_desktop_exit(&mut machine).unwrap();
+    let boot_serial =
+        xenith_integration::run_until_serial(&mut machine, "xenith$ ", 1, COMMAND_LIMIT).unwrap();
     assert!(
         boot_serial.contains("Xenith shell 0.1 (type 'help')") && boot_serial.ends_with("xenith$ "),
-        "framebuffer gate did not reach an idle userspace shell:\n{boot_serial}"
+        "desktop recovery gesture did not reach an idle userspace shell:\n{boot_serial}"
     );
 
     let hello = run_command(&mut machine, "/bin/hello\n", "XENITH_RING3_UI_OK", 1).unwrap();

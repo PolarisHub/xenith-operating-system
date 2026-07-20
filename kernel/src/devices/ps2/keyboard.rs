@@ -867,6 +867,25 @@ mod tests {
     }
 
     #[test]
+    fn extended_left_super_preserves_raw_code_and_modifier_edges() {
+        let mut state = KeyboardState::new();
+        assert!(state.feed(0xE0).is_none());
+        let make = state.feed(0x5B).unwrap();
+        assert_eq!(make.code, KeyCode::LeftSuper);
+        assert_eq!(make.raw_scancode, 0xE05B);
+        assert!(make.pressed);
+        assert!(!make.repeat);
+        assert!(make.modifiers.contains(KeyModifiers::LEFT_SUPER));
+
+        assert!(state.feed(0xE0).is_none());
+        let release = state.feed(0xDB).unwrap();
+        assert_eq!(release.code, KeyCode::LeftSuper);
+        assert_eq!(release.raw_scancode, 0xE05B);
+        assert!(!release.pressed);
+        assert!(!release.modifiers.contains(KeyModifiers::LEFT_SUPER));
+    }
+
+    #[test]
     fn pause_sequence_emits_one_event() {
         let mut state = KeyboardState::new();
         for byte in [0xE1, 0x1D, 0x45, 0xE1, 0x9D] {

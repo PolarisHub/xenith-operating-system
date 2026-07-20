@@ -849,6 +849,23 @@ mod tests {
     }
 
     #[test]
+    fn ps2_raw_extended_sequence_retains_every_byte_in_order() {
+        let mut controller = Ps2Controller::default();
+        assert!(controller.write_port(0x64, 1, 0xAE));
+        assert!(controller.write_port(0x60, 1, 0xF4));
+        assert_eq!(controller.read_port(0x60, 1), Some(0xFA));
+        assert!(controller.write_port(0x64, 1, 0x60));
+        assert!(controller.write_port(0x60, 1, 1));
+
+        controller.inject_scancodes(&[0xE0, 0x5B, 0xE0, 0xDB]);
+        for expected in [0xE0, 0x5B, 0xE0, 0xDB] {
+            assert_eq!(controller.interrupt(), Some(0x21));
+            assert_eq!(controller.read_port(0x60, 1), Some(expected));
+        }
+        assert_eq!(controller.interrupt(), None);
+    }
+
+    #[test]
     fn lapic_one_shot_counts_down_and_fires_once() {
         let mut apic = LocalApic::default();
         lapic_write(&mut apic, 0x0F0, 0x1FF);

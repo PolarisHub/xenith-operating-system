@@ -629,18 +629,16 @@ fn wait_for_foreground_read() {
 }
 
 /// Write bytes to the display console and COM1. Serial newlines use CRLF,
-/// while the display backend receives its native newline character.
+/// while the display backend receives its native newline character. COM1 is
+/// reached through the logger's shared line lock so userspace output cannot
+/// splice bytes into a concurrent kernel record on another CPU.
 pub fn write_output(bytes: &[u8]) -> usize {
     #[cfg(not(test))]
     {
-        let mut serial = crate::devices::serial::COM1.lock();
         for &byte in bytes {
             crate::console::write_char(byte as char);
-            if byte == b'\n' {
-                serial.send(b'\r');
-            }
-            serial.send(byte);
         }
+        crate::log::logger::write_serial_bytes_raw(bytes);
     }
     bytes.len()
 }

@@ -339,6 +339,11 @@ impl crate::util::Links for TaskNode {
 /// `unsafe extern "C" fn(u64) -> !`. Calling it from any other context is
 /// undefined.
 unsafe extern "C" fn task_trampoline() -> ! {
+    // We are now executing on the freshly-selected task's stack with
+    // interrupts still disabled.  Any task that exited immediately before
+    // this first dispatch can therefore be destroyed without freeing the
+    // stack beneath the CPU.
+    reclaim_retired_after_switch();
     let node_ptr = current_node().expect("sched: trampoline with no current task");
     // Read the entry point and argument through a shared borrow, then end the
     // borrow before the `started` write below. Keeping the `&TaskNode` alive
@@ -392,6 +397,15 @@ unsafe extern "C" fn task_trampoline() -> ! {
 /// duration the slot holds the pointer, so dereferencing a loaded non-zero
 /// value is sound. `0` is the "no current task" sentinel.
 static CURRENT_NODE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Task awaiting destruction after each CPU's next completed stack switch.
+///
+/// A task cannot free its own kernel stack.  [`exit`] publishes its stable
+/// `TaskNode` pointer here while interrupts are disabled, then switches away.
+/// The incoming context drains the same CPU's slot before enabling interrupts.
+/// One slot per CPU is sufficient: a second task cannot begin executing on a
+/// CPU until the incoming context has drained the predecessor's slot.
+static RETIRED_TASK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// The task node currently running on this CPU, or `None` if the scheduler has
 /// not yet dispatched a task (or the current task has just exited and not been
@@ -1179,6 +1193,50 @@ pub fn wake_blocked_task(id: TaskId) {
     unsafe { restore_flags(flags) };
 }
 
+/// Wake one explicitly blocked task from ordinary task context.
+///
+/// Unlike [`wake_blocked_task`], this path may wait briefly for the scheduler
+/// lock and therefore supports any number of independent waiters without a
+/// coalescing slot. It is intended for process-state producers such as child
+/// exit and signal delivery, never for hard IRQ handlers. The wake is
+/// allocation-free and returns the task to the CPU where it last ran.
+///
+/// A caller may still hold the IRQ-safe lock that protects its readiness
+/// predicate. Such wait paths acquire that producer lock before the scheduler
+/// lock both while parking and while waking, so the ordering is consistent and
+/// the registration-to-block hand-off cannot lose an event.
+#[must_use]
+pub fn wake_blocked_task_from_task(id: TaskId) -> bool {
+    if id.as_u64() == 0 {
+        return false;
+    }
+
+    let flags = save_flags_and_cli();
+    let target_cpu = {
+        let mut inner = lock();
+        inner.blocked_queue.take_task(id).map(|node| {
+            // Keep the task on its last CPU for cache locality. A blocked
+            // task's CPU remains online for the lifetime of today's static
+            // SMP topology.
+            let target_cpu = unsafe { node.as_ref() }.task.cpu as usize;
+            // SAFETY: `node` was just unlinked from the blocked queue,
+            // remains owned by `all_tasks`, and the scheduler lock excludes
+            // every other metadata mutation.
+            unsafe { (*node.as_ptr()).task.state = TaskState::Ready };
+            inner.run_queues[target_cpu].enqueue(node);
+            target_cpu
+        })
+    };
+
+    if let Some(target_cpu) = target_cpu {
+        request_prompt_reschedule(target_cpu);
+    }
+    // SAFETY: `flags` was captured on this CPU at entry and the scheduler
+    // lock has been released.
+    unsafe { restore_flags(flags) };
+    target_cpu.is_some()
+}
+
 /// Drain the coalesced event-wake slot with one non-blocking scheduler-lock
 /// acquisition per observed request.
 ///
@@ -1608,9 +1666,19 @@ pub fn exit(status: ExitStatus) -> ! {
         // sound for the duration of the `exit` call.
         let task: &mut Task = unsafe { &mut *task_ptr };
         task.exit(status);
-        // The zombie stays in `all_tasks` until `reap_zombies` drops it; it is
-        // not on any run queue (we never enqueue a zombie), so it cannot be
-        // picked again.
+        // The zombie remains owned by `all_tasks` while this CPU is still
+        // executing on its kernel stack. Publish it to this CPU's single
+        // post-switch retirement slot; the incoming context removes and
+        // drops it only after the hardware stack pointer has changed.
+        let cpu = current_cpu();
+        let retired = cur.as_ptr() as u64;
+        assert_ne!(retired, 0, "sched: null retirement pointer");
+        assert!(
+            RETIRED_TASK[cpu]
+                .compare_exchange(0, retired, Ordering::Release, Ordering::Relaxed)
+                .is_ok(),
+            "sched: CPU {cpu} retirement slot was not drained before task exit"
+        );
     } // lock released
       // Clear the current-node slot so `schedule_next` does not try to re-enqueue
       // the zombie. `schedule_next` treats a `None` current as "switch from the
@@ -1632,6 +1700,55 @@ pub fn exit(status: ExitStatus) -> ! {
     // convince the compiler we diverge — the switch away means this is
     // unreachable on the exiting task's stack.
     unreachable!("sched::exit: schedule_next returned into an exited task")
+}
+
+/// Detach the current task from its userspace page-table root.
+///
+/// Process teardown calls this before publishing an observable exit status.
+/// Loading the shared kernel CR3 first means a parent on another CPU may
+/// immediately reap the process address space without freeing a root that the
+/// exiting CPU is still executing under. The task continues on its globally
+/// mapped kernel stack and reaches [`exit`] without touching userspace again.
+///
+/// The CR3 write and task metadata update happen with local interrupts off and
+/// the scheduler lock held. The later process-table unlock is a release
+/// publication, so a parent that observes the exit also observes this detach.
+///
+/// # Panics
+///
+/// Panics if called outside a scheduled task.
+pub fn detach_current_address_space() {
+    let cur = current_node().expect("sched::detach_address_space with no current task");
+    let flags = save_flags_and_cli();
+    {
+        let _guard = lock();
+        // SAFETY: `cur` is current on this CPU, interrupts are disabled, and
+        // the scheduler lock excludes metadata mutation from every other CPU.
+        unsafe { (*cur.as_ptr()).task.address_space = None };
+        let kernel_cr3 = KERNEL_CR3.load(Ordering::Acquire);
+        debug_assert_ne!(kernel_cr3, 0, "kernel CR3 unavailable during task exit");
+        // SAFETY: scheduler initialisation captured a live kernel PML4 whose
+        // higher half maps this code and the current kernel stack.
+        if unsafe { Cr3::read_raw() } != kernel_cr3 {
+            unsafe { Cr3::write_raw(kernel_cr3) };
+        }
+        debug_assert!(exit_detach_complete(
+            unsafe { (*cur.as_ptr()).task.address_space.is_some() },
+            unsafe { Cr3::read_raw() },
+            kernel_cr3,
+        ));
+    }
+    // SAFETY: `flags` was captured on this CPU at entry.
+    unsafe { restore_flags(flags) };
+}
+
+/// Pure policy check used by the exit publication assertion and host test.
+const fn exit_detach_complete(
+    task_has_address_space: bool,
+    active_cr3: u64,
+    kernel_cr3: u64,
+) -> bool {
+    !task_has_address_space && kernel_cr3 != 0 && active_cr3 == kernel_cr3
 }
 
 // ---------------------------------------------------------------------------
@@ -2181,6 +2298,12 @@ fn do_switch(prev: Option<NonNull<TaskNode>>, next: NonNull<TaskNode>, flags: u6
     // captured when it was suspended. Restore it to re-enable interrupts iff
     // this task had them on at suspension time.
     //
+    // The outgoing task may have exited instead of saving a resumable
+    // context. We are now conclusively on this task's different kernel stack,
+    // so it is safe to remove and destroy that retired node before IF is
+    // restored. Fresh tasks perform the same hand-off in `task_trampoline`.
+    reclaim_retired_after_switch();
+
     // SAFETY: `flags` was captured by this task's own `schedule_next` (or
     // sibling) call on this CPU before it was switched out; the stack
     // preservation of the trampoline guarantees it is the correct snapshot.
@@ -2291,38 +2414,69 @@ fn prepare_incoming_task(next: NonNull<TaskNode>) {
 // Reaping
 // ---------------------------------------------------------------------------
 
-/// Drop every [`TaskState::Zombie`] or [`TaskState::Dead`] task in the master
-/// list, freeing its kernel stack.
+/// A zombie becomes reclaimable only after its owner CPU completes a switch.
 ///
-/// Called opportunistically from [`schedule_next`] (every few dispatches) and
-/// safe to call explicitly. The sweep is a swap-remove over `all_tasks`, which
-/// moves the last `Kbox` into the freed slot — that moves only the ownership
+/// `Zombie` records the logical exit; the per-CPU retirement hand-off proves
+/// the CPU no longer uses the task's kernel stack. Removal uses `swap_remove`,
+/// which moves the last `Kbox` into the freed slot; that moves only ownership
 /// handle, not the heap data, so the raw pointers other tasks hold into their
 /// own nodes stay valid.
+#[inline]
+const fn retired_task_reclaimable(state: TaskState, switch_completed: bool) -> bool {
+    switch_completed && matches!(state, TaskState::Zombie)
+}
+
+/// Destroy the task retired by the immediately preceding switch on this CPU.
+///
+/// Every caller runs on the incoming task's stack with interrupts disabled.
+/// Taking the per-CPU slot is therefore an allocation-free proof that the
+/// retired node is no longer current and that its kernel stack is inactive.
+/// The global scheduler lock removes the owning box from `all_tasks`; the box
+/// is dropped only after the lock is released.
+fn reclaim_retired_after_switch() {
+    let cpu = current_cpu();
+    let raw = RETIRED_TASK[cpu].swap(0, Ordering::AcqRel);
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: `exit` stored a non-null TaskNode address that remains owned by
+    // `all_tasks` until this exact post-switch hand-off removes it.
+    let retired = unsafe { NonNull::new_unchecked(raw as *mut TaskNode) };
+    let removed = {
+        let mut inner = lock();
+        let index = inner
+            .all_tasks
+            .iter()
+            .position(|node| core::ptr::eq(&**node, retired.as_ptr()))
+            .expect("sched: retired task disappeared from ownership list");
+        let mut removed = inner.all_tasks.swap_remove(index);
+        assert!(
+            retired_task_reclaimable(removed.task.state, true),
+            "sched: retirement slot contained a non-zombie task"
+        );
+        removed.task.state = TaskState::Dead;
+        removed
+    };
+    ::log::debug!(
+        "xenith.sched: reaped {} (tid={}) after CPU {} stack switch",
+        removed.task.name,
+        removed.task.id,
+        cpu,
+    );
+    debug_assert_eq!(removed.task.state, TaskState::Dead);
+    drop(removed);
+}
+
+/// Reclaim a completed per-CPU retirement, if one is pending.
+///
+/// Unlike a global zombie sweep, this cannot free a task merely because it is
+/// marked `Zombie`; the same CPU must first have switched to another stack.
+/// Context switches drain the slot automatically, so this public hook is only
+/// a conservative maintenance entry point.
 pub fn reap_zombies() {
     let flags = save_flags_and_cli();
-    {
-        let mut inner = lock();
-        let mut i = 0;
-        while i < inner.all_tasks.len() {
-            let state = inner.all_tasks[i].task.state;
-            if state == TaskState::Zombie || state == TaskState::Dead {
-                let removed = inner.all_tasks.swap_remove(i);
-                ::log::debug!(
-                    "xenith.sched: reaped {} (tid={})",
-                    removed.task.name,
-                    removed.task.id,
-                );
-                // `removed` drops here, freeing the `TaskNode`, the `Task`,
-                // and the kernel stack. The node must not be on any queue at
-                // this point: zombies are never enqueued, and dead tasks were
-                // already removed. A queued zombie would be a bookkeeping bug.
-            } else {
-                i += 1;
-            }
-        }
-    } // lock released
-      // SAFETY: `flags` was captured on this CPU just above.
+    reclaim_retired_after_switch();
+    // SAFETY: `flags` was captured on this CPU just above.
     unsafe { restore_flags(flags) };
 }
 
@@ -2422,6 +2576,23 @@ mod tests {
     fn allocation_free_blocked_queue_starts_empty() {
         let queue = BlockedQueue::new();
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn process_exit_may_publish_only_after_kernel_cr3_detach() {
+        let kernel_cr3 = 0x1234_5000;
+        assert!(!exit_detach_complete(true, kernel_cr3, kernel_cr3));
+        assert!(!exit_detach_complete(false, 0x9876_5000, kernel_cr3));
+        assert!(!exit_detach_complete(false, kernel_cr3, 0));
+        assert!(exit_detach_complete(false, kernel_cr3, kernel_cr3));
+    }
+
+    #[test]
+    fn zombie_stack_is_never_reclaimed_before_the_switch_handoff() {
+        assert!(!retired_task_reclaimable(TaskState::Zombie, false));
+        assert!(retired_task_reclaimable(TaskState::Zombie, true));
+        assert!(!retired_task_reclaimable(TaskState::Running, true));
+        assert!(!retired_task_reclaimable(TaskState::Dead, true));
     }
 
     #[test]

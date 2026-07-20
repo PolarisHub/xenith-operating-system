@@ -1,35 +1,40 @@
 # Roadmap
 
-The next product milestone is the first visual desktop shell. Independent
-correctness work remains ordered by runtime impact. Completed work such as COW
-fork, `/dev/pts`, SSDT loading, NIC interrupt mode, XenithFS flush barriers,
-SMP bring-up, native framebuffer-format handling, and the exclusive UI-session
-ABI is intentionally not repeated as future work.
+The first single-process visual desktop shell is complete. Independent
+correctness and application-platform work remains ordered by runtime impact.
+Completed work such as COW fork, `/dev/pts`, SSDT loading, NIC interrupt mode,
+XenithFS flush barriers, SMP bring-up, native framebuffer-format handling, the
+exclusive UI-session ABI, and the allocation-free glass desktop is not repeated
+as future work.
 
-1. Build a lean single-process visual desktop shell on the current UI-session
-   ABI: software-render one private backbuffer, use bounded damage presentation,
-   consume the ordered keyboard/pointer stream, and add polished shell chrome
-   without bundling default applications. Establish responsive layout, text,
-   cursor, focus, and low-allocation animation policies before broadening the
-   application model.
-2. Remove the BIOS emulator's semantic `stage2_main` boundary by executing the
+1. Connect the versioned `xenith-abi::compositor` records to a bounded IPC and
+   shared-memory transport. Keep direct scanout ownership in the desktop,
+   validate generation-safe object lifetimes, and add multi-process client
+   surfaces, configure/acknowledge, focus, input routing, close, and frame-done
+   behavior without adding an idle polling loop.
+2. Build Windows compatibility as an isolated userspace subsystem. First make
+   process address-space teardown last-thread/refcount driven and add the
+   thread lifecycle needed by NT semantics. Then add PE32+/PE32 loading,
+   relocations/imports/TLS/SEH and NT object, file, registry, synchronization,
+   and virtual-memory behavior; layer `ntdll`, `kernel32`, `user32`/`gdi32`
+   through a WinServer mapped onto compositor surfaces. COM/OLE, DirectX
+   translation, .NET, installers, and WoW64 follow only behind conformance
+   tests. Do not claim broad Windows-app compatibility from symbol coverage
+   alone.
+3. Remove the BIOS emulator's semantic `stage2_main` boundary by executing the
    complete packaged Rust body after the now-exact EDD preload and mode-
    transition stream.
-3. Extend the current VMware legacy-BIOS ISO/raw proof to at least one more
+4. Extend the current VMware legacy-BIOS ISO/raw proof to at least one more
    external firmware implementation, complete standalone/ISO UEFI cross-
    firmware coverage, then test physical hardware. Record exact serial output,
    platform configuration, and artifact hashes without treating internal
    firmware models as equivalent evidence.
-4. Expand the emulator from its Xenith-specific firmware/device contract toward
+5. Expand the emulator from its Xenith-specific firmware/device contract toward
    general 16/32/64-bit execution, including AP trampoline instructions, AHCI,
    e1000, PS/2 mouse, a live display backend, and bounded host networking.
-5. Add booted-guest fault injection for user-copy fixups, COW write faults,
+6. Add booted-guest fault injection for user-copy fixups, COW write faults,
    signal-frame/xstate restoration, realtime queue pressure, and fork/exec
    rollback so host structural tests are backed by adversarial runtime proof.
-6. Add a multi-process desktop application boundary: shared client surfaces,
-   lifecycle-safe handles, bounded window/compositor IPC, focus and routing,
-   and general event multiplexing suitable for input, timers, process state,
-   and IPC. Keep direct scanout ownership inside the desktop compositor.
 7. Add a frame-pacing or vsync contract where hardware permits it, and measured
    physical-display/input validation before claiming broad hardware performance
    or compatibility. PAT write-combining for the current CPU-copy scanout path

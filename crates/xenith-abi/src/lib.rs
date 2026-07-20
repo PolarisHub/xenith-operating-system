@@ -3,6 +3,7 @@
 #![no_std]
 
 pub mod boot;
+pub mod compositor;
 pub mod syscall;
 
 pub use boot::{

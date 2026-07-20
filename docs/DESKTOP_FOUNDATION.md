@@ -1,8 +1,10 @@
 # Desktop Foundation
 
-Xenith now has the kernel and userspace boundary required to start one
-full-screen graphical desktop shell. It does **not** yet contain that shell, a
-window manager, compositor, widgets, or default applications.
+Xenith now boots a lean full-screen graphical shell, `/bin/xenith-desktop`, on
+supported framebuffers. It software-composes a procedural midnight wallpaper,
+glass top bar and dock, launcher, status chrome, and pointer cursor without
+bundling default applications. Its steady-state loop allocates nothing and
+blocks indefinitely when there is no input.
 
 ## Ownership model
 
@@ -92,44 +94,62 @@ read record with `UI_EVENT_FLAG_OVERFLOW`. Routing epochs discard an IRQ event
 that was decoded across a release/acquire boundary, so input from one owner can
 never enter the next owner's queue.
 
-## First desktop-shell recipe
+## Desktop-shell implementation
 
-1. Call `libuser::ui_acquire` and retain the returned geometry and channel
-   masks. Stop cleanly if no supported framebuffer is present or another owner
-   is active.
-2. Allocate a private anonymous backbuffer. A tight buffer uses
-   `stride = width * 4` and
-   `length = (height - 1) * stride + width * 4` with checked arithmetic.
-3. Implement a small software renderer that packs logical RGB colours using
-   the reported channel masks. Draw the wallpaper, panels, cursor, text, and
-   initial shell chrome into this one buffer.
-4. Submit an empty damage list once for the initial full frame. Thereafter,
-   merge changed regions and submit no more than 64 bounded rectangles per
-   frame.
-5. Drain up to 32 input records at a time. Clamp accumulated relative pointer
-   coordinates to the screen, react to button/key transitions, redraw changed
-   UI state, then block again with an appropriate timeout.
-6. Call `ui_release` during an orderly shutdown. Kernel exit/exec cleanup is
-   the crash-safe fallback.
+The shell validates the native channel masks, maps exactly one anonymous
+backbuffer, and packs every RGB colour into the advertised framebuffer format.
+Its renderer reconstructs procedural layers only inside a fixed 12-rectangle
+damage tracker. The first frame is a full present; cursor movement and launcher
+state changes use bounded partial presents. Overflowed input conservatively
+forces one full redraw.
 
-The first shell should remain a single process and software-compose its own
-chrome. Multiple application windows require the later client-surface and IPC
-layer described in the roadmap.
+Input is read in fixed 32-record batches. Relative pointer movement is
+accelerated with integer arithmetic and clamped to the display. Super or the
+dock button toggles the launcher; Escape closes it. `Ctrl+Alt+Backspace`,
+`Ctrl+Alt+F1`, and `Super+Shift+Q` are deterministic recovery gestures. An
+orderly exit releases scanout and unmaps the backbuffer; process teardown is
+the crash-safe release path.
+
+Init probes the framebuffer session, supervises the desktop with blocking
+`waitpid`, retries signal interruptions without abandoning the live child, and
+execs `/bin/sh` if no framebuffer exists or the desktop exits or fails. The
+desktop emits `XENITH_DESKTOP_READY` only after its first successful present.
+Launcher markers are emitted only after the corresponding damaged frame is
+presented, and `XENITH_DESKTOP_CLEAN_EXIT` appears only after release and unmap
+both succeed. Failures carry
+`XENITH_DESKTOP_FAIL stage=<stage> errno=<number>`.
+
+## Future client protocol
+
+`xenith-abi::compositor` fixes the transport-neutral ABI for the next phase.
+It includes a magic/versioned bounded header, generation-safe 64-bit handles,
+shared-surface tokens and byte bounds, BGRX/BGRA formats, up to 64 damage
+rectangles, create/destroy/attach/commit/role/title/state/configure-ack
+requests, configure/close/focus/pointer/key/text/frame-done events, and
+canonical zero-reserved validation. All wire fields have fixed widths; no Rust
+pointer, `usize`, `bool`, or data-carrying enum crosses the boundary.
+
+This is a wire contract, not a live server. Kernel IPC/shared-memory handles,
+desktop client connections, and multi-process window composition remain to be
+implemented. The same boundary is intended to keep a future PE/Win32
+compatibility server out of the kernel.
 
 ## Current limits
 
-- Exactly one process owns the display and input seat.
+- Exactly one process owns the display and input seat; today that is the
+  single-process desktop shell.
 - Presentation is CPU damage-copy only: no acceleration, page flipping, or
   vertical-sync contract exists.
-- There is no compositor, window protocol, shared client surface, or default
-  application yet.
+- There is no connected multi-client compositor transport or shared client
+  surface service, and there are no default applications. The wire records for
+  that next layer exist but are not executable compatibility support.
 - Desktop input currently comes only from the PS/2 keyboard and mouse drivers.
 - PAT-capable x86_64 processors use write-combining framebuffer leaves with a
   cache-safe WB-to-WC transition and one store fence per completed present.
   Unsupported processors retain the loader's cache policy.
 - VMware/emulator paths are covered separately; broad physical-hardware
   framebuffer and input validation remains pending.
-- The four UI syscall paths have host coverage and an end-to-end ring-3
-  validation utility that acquires, presents, polls, releases, and proves
-  terminal restoration. That utility is not a desktop client; the compositor
-  and shell UI still remain to be built.
+- The four UI syscall paths retain their ring-3 lifecycle gate. A separate
+  desktop gate proves the rendered non-flat frame, launcher input and partial
+  damage, bounded idle stability, recovery chord, clean release/unmap, shell
+  fallback, and terminal repaint.

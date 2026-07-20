@@ -289,6 +289,8 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
         "-p",
         "xenith-init",
         "-p",
+        "xenith-desktop",
+        "-p",
         "xenith-sh",
         "-p",
         "xenith-coreutils",
@@ -312,6 +314,7 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
     fs::create_dir_all(&user_dir)?;
     let rust_programs = [
         ("init", "init"),
+        ("bin/xenith-desktop", "xenith-desktop"),
         ("bin/sh", "xenith-sh"),
         ("bin/coreutils", "xenith-coreutils"),
         ("bin/editor", "xenith-editor"),
@@ -765,6 +768,26 @@ mod tests {
         }
         assert!(symlink_records.len() < duplicated_records.len());
         assert!(duplicated_records.len() - symlink_records.len() > 400 * 1024);
+    }
+
+    #[test]
+    fn desktop_is_stored_as_an_executable_without_aliasing() {
+        let programs = vec![
+            ("bin/coreutils".to_owned(), vec![0x11; 64]),
+            ("bin/editor".to_owned(), vec![0x22; 64]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 64]),
+            ("bin/xenith-desktop".to_owned(), vec![0x44; 64]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+        let (_, mode, data) = entries
+            .iter()
+            .find(|(name, _, _)| *name == "bin/xenith-desktop")
+            .copied()
+            .unwrap();
+
+        assert_eq!(mode & 0o170000, 0o100000);
+        assert_eq!(data, &[0x44; 64]);
     }
 
     #[test]

@@ -21,6 +21,13 @@ a boot result, and an internal firmware model is not a physical-machine result.
   `SA_ONSTACK`, bounded `SA_RESTART`, and validated integer plus xstate frames.
   Fork and exec preserve or reset signal state according to their process
   semantics without placing the bounded queues on a 16 KiB kernel stack.
+- `waitpid` and stopped processes park instead of yield-spinning. Child state
+  changes use a lost-wake-safe process-table/scheduler handoff, and group signal
+  delivery wakes only accepted targets and parents whose children actually
+  changed state. The process table is explicitly bounded at 256 records.
+  Exiting tasks detach their address space before publishing exit, then a
+  per-CPU post-switch retirement slot reclaims each dead task and kernel stack
+  only after execution has left that stack.
 - The VFS provides ramfs/initramfs, read-only FAT32, writable journaled
   XenithFS, pipes, console TTYs, and a mounted `/dev/pts`. PTY slaves share the
   console line discipline, including canonical editing, signals, termios,
@@ -72,13 +79,17 @@ a boot result, and an internal firmware model is not a physical-machine result.
   bounded software watchpoints, frame-pointer backtraces, ELF symbols,
   bidirectional DWARF line lookup, explicit PIE load bias, and a bounded
   single-client GDB Remote Serial Protocol bridge.
-- Freestanding init, shell, coreutils, editor, network tools, examples,
-  `libuser`, and the C ABI runtime are packaged. The shell supports pipelines,
+- Freestanding init, graphical desktop, shell, coreutils, editor, network
+  tools, examples, `libuser`, and the C ABI runtime are packaged. The desktop
+  owns one native-format backbuffer, renders glass chrome procedurally, tracks
+  at most 12 merged damage rectangles, consumes fixed input batches, and parks
+  indefinitely when idle. Init supervises it and restores `/bin/sh` on missing
+  framebuffer, clean recovery, or failure. The shell supports pipelines,
   redirection, quoting, background jobs, sessions/process groups, and terminal
   job control. The shipped `/bin/c-demo` is compiled through
   `xenith-cc` -> `xenith-asm` -> `xenith-ld`.
-- The pre-desktop boundary now exposes one process-owned framebuffer/input
-  session through syscalls 54-57 and matching `libuser` wrappers. Presentation
+- The display boundary exposes one process-owned framebuffer/input session
+  through syscalls 54-57 and matching `libuser` wrappers. Presentation
   uses a private userspace backbuffer plus validated damage copies; keyboard
   and pointer events share one bounded ordered queue with transactional reads,
   overflow reporting, routing epochs, signal-aware waits, and automatic
@@ -87,6 +98,14 @@ a boot result, and an internal firmware model is not a physical-machine result.
   Event waits use a lost-wake-safe scheduler handoff with no 10 ms polling, and
   PAT-capable CPUs map scanout write-combining with cache-safe WBINVD/SFENCE
   ordering.
+- Kernel logging and userspace TTY output share one COM1 serialization lock, so
+  exact runtime markers cannot interleave across CPUs on the physical UART.
+- `xenith-abi::compositor` defines a separate version-1 transport-neutral wire
+  contract for generation-safe handles, shared-surface bounds, roles/state,
+  bounded damage commits, configure acknowledgement, focus/input/text/close,
+  and frame completion. No IPC transport or multi-process surface server is
+  connected yet; this is the boundary intended for native clients and a later
+  userspace Windows-compatibility server.
 - The kernel accepts native `XenithBootInfo` from Xenith's BIOS/UEFI loaders and
   the optional local Limine-compatible input. Xenith records are validated and
   normalized into one internal boot aggregate before subsystem initialization;
@@ -103,13 +122,14 @@ the current build.
 | `kernel_reaches_userspace_shell` | Direct kernel/initramfs load reaches ring-3 init and `xenith$` | PASS (2026-07-20) |
 | `shell_executes_builtins_and_coreutils_via_ps2` | PS/2 input drives the shell, coreutils, filesystem mutations, VM/RNG, and the ring-3 signal smoke | PASS (2026-07-20) |
 | `ring3_ui_smoke_restores_framebuffer_terminal` | Ring 3 acquires scanout, presents full and damaged frames, polls input, releases/unmaps, and the kernel terminal resumes drawing | PASS (2026-07-20) |
+| `desktop_renders_stays_stable_and_falls_back_to_shell` | Init starts the desktop; it presents the exact non-flat shell, handles Super through partial damage, reaches repeated halted idle states, survives a bounded idle window, releases cleanly on recovery input, then restores the shell and terminal framebuffer | PASS (2026-07-20) |
 | `input_script_proves_shell_pipeline_and_redirection` | Multi-stage pipelines and `<`, `>`, `>>` work through real descriptors and syscalls | PASS (2026-07-20) |
 | `xenith_built_c_utility_executes_in_ring3` | C source compiled by Xenith's compiler/assembler/linker executes at CPL3 | PASS (2026-07-20) |
 | `manifest_image_reaches_userspace_shell` | The packaged manifest, checksums, kernel, initramfs, and attached ATA image reach the shell | PASS (2026-07-20) |
-| `bios_firmware_image_reaches_userspace_shell` | Exact packaged BIOS stage streams execute through their long-mode call boundary, then the explicit semantic stage2 body reaches the shell | PASS (2026-07-20) |
-| `bios_firmware_image_reaches_shell_with_64_mib` | The compact BIOS payload layout and 8 MiB adaptive heap reach the shell with 64 MiB RAM | PASS (2026-07-20) |
-| `bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell` | The ISO's validated x86 catalog entry executes the packaged BIOS stages, preserves the native reserved-low-memory handoff, exercises the `0x70000` AP-trampoline fallback, brings an odd three-CPU topology online, and reaches the shell | PASS (2026-07-20) |
-| `uefi_iso_executes_packaged_pe_and_reaches_userspace_shell` | The platform-`0xEF` entry, FAT16 payloads, actual `BOOTX64.EFI`, strict services, `ExitBootServices`, and native handoff reach the shell with `semantic_loader_fallback=false` | PASS (2026-07-20) |
+| `bios_firmware_image_reaches_userspace_shell` | Exact packaged BIOS stage streams execute through their long-mode call boundary; the explicit semantic stage2 body supplies no firmware framebuffer, so init proves the supported text-shell fallback | PASS (2026-07-20) |
+| `bios_firmware_image_reaches_shell_with_64_mib` | The compact BIOS payload layout, 8 MiB adaptive heap, and text fallback reach the shell with 64 MiB RAM | PASS (2026-07-20) |
+| `bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell` | The ISO's validated x86 catalog entry executes the packaged BIOS stages, preserves the native reserved-low-memory handoff, exercises the `0x70000` AP-trampoline fallback, brings an odd three-CPU topology online, and reaches the text fallback | PASS (2026-07-20) |
+| `uefi_iso_executes_packaged_pe_and_reaches_userspace_shell` | The platform-`0xEF` entry, FAT16 payloads, actual `BOOTX64.EFI`, strict services, `ExitBootServices`, native GOP handoff, graphical desktop/recovery lifecycle, and restored shell complete with `semantic_loader_fallback=false` | PASS (2026-07-20) |
 | `two_processor_kernel_brings_ap_online_and_reaches_shell` | The deterministic interpreter observes guest INIT-SIPI-SIPI, brings CPU 1 online, and reaches userspace | PASS (2026-07-20) |
 | `three_processor_kernel_brings_every_ap_online_and_reaches_shell` | The deterministic interpreter observes serialized startup of both APs, brings all three CPUs online, and reaches userspace | PASS (2026-07-20) |
 | `built_kernel_supports_bidirectional_dwarf_line_lookup` | The packaged kernel's symbols and line tables resolve address-to-source and source-to-address | PASS (2026-07-20) |
@@ -120,9 +140,10 @@ the current build.
 ## Validation snapshot - 2026-07-20
 
 - Complete workspace check and the selected native workspace test suite: PASS.
-- Kernel host suite: 497 passed, 0 failed.
-- Shared ABI suite: 6 passed, 0 failed; x86 decode/encode suite: 19 passed, 0
-  failed; emulator library suite: 63 passed, 0 failed.
+- Kernel host suite: 505 passed, 0 failed.
+- Shared ABI suite: 12 passed, 0 failed; desktop host suite: 10 passed, 0
+  failed; x86 decode/encode suite: 19 passed, 0 failed; emulator library suite:
+  64 passed, 0 failed.
 - Strict native, custom-target kernel/userspace, and standalone bootloader
   Clippy with warnings denied: PASS.
 - Standalone bootloader checks/tests and root plus bootloader formatting: PASS.
@@ -130,17 +151,21 @@ the current build.
   `BOOTX64.EFI`, userspace ELFs, initramfs, raw image, hybrid ISO, and artifact
   inventory through the repository-owned toolchain.
 - Every runtime gate in the table above: PASS against the refreshed artifacts.
-- Fresh footprint: 125,452-byte initramfs and 94,856-byte kernel `.bss`.
+- Fresh footprint: 154,496-byte initramfs, 27,688-byte desktop ELF, and
+  95,368-byte kernel `.bss`.
+- Source inventory: 279 Rust files with 122,860 physical lines; 296 Rust, C,
+  assembly, and linker-script files with 124,786 physical lines total.
 
 The repository-owned gates above ran against these refreshed artifacts:
 
-- `xenith.iso`: `69C2605074FF1855A4DA06F1B420EA92D1E714ED63E31D36843725E6154023C2`
-- `xenith.img`: `A1F67CCA06CA75CC99AAB5BB05CEE10D8F4006598ADD8FEE796CB834FBED31CE`
-- `kernel.elf`: `193129C0CD3F937D31CB6828AC8E0C4C7DF3F4641E50149F63EE32CF2DDBDF92`
-- `initramfs.cpio`: `71E3F7176221B6F0C0B189AA04D32C92CD2C447A1C40A748DCEF238C785DF85E`
+- `xenith.iso`: `3978C060A5E5CD21C5AC25E26EADC6694D8F8FC52A0E685E3243849B0315D968`
+- `xenith.img`: `C26375821935B5773AF33B73E2AF70E11DEB5F2A9A420E26B6BF092DD54F33AC`
+- `kernel.elf`: `F9D6F374E5D3575FEC24B92FB1C255C18FC6E278B66D10E6613E3389BA996D98`
+- `initramfs.cpio`: `038E15B18915E8E1CD1AD3392CD05B611F4368EADE9AF53A5976641B7F758002`
 - `stage1.bin`: `A46C1CDD3774064FEFAE8EB5379245900D773A4425FF16B8AA428A39328607C0`
 - `stage2.bin`: `A8AAEE751846A29C88D067D33EE9AB94DC2CC09DA3037C5491ED029B1A3CBDB7`
-- `BOOTX64.EFI`: `24ED26304B2184E63722BD62DD04BF3E5B7A7C6C676EBD53AB8C96B7F7FBD55D`
+- `BOOTX64.EFI`: `9356A507B45C31BD09ED75F2877EC2289DAF467A12815ACE931E324A7177FA74`
+- `xenith-desktop`: `10004A94669065B2AE2DD4F733F7CA28B81D5BB72374780DB6D83E114A146D80`
 
 External VMware Workstation 17.6.3 legacy-BIOS cold boots passed earlier on
 2026-07-19 with 512 MiB RAM and 1, 3, 4, 8, 16, and 24 vCPUs. QEMU 11.0.50
@@ -150,7 +175,7 @@ APIC IDs. Those external runs used the preceding ISO
 `0949DB89FEF66AAA2A83A96858A5D97F12D5561C76ADD0580352954C9ACC110F`
 and raw image
 `074298C35B258A57D483D769C5F638D2620FBE505A968A0700BD3E629289FE20`;
-they were not rerun after the desktop-foundation rebuild and are historical
+they were not rerun after the current desktop/scheduler rebuild and are historical
 evidence, not proof of the refreshed hashes above.
 
 Native unit/integration tests also exercise the debugger protocol and GDB RSP
@@ -163,15 +188,20 @@ ordering.
 
 - Repository-owned emulator gates prove the refreshed raw disk plus BIOS and
   UEFI ISO entries. VMware Workstation and QEMU/SeaBIOS externally proved the
-  immediately preceding SMP artifact, not the refreshed desktop-foundation
+  immediately preceding SMP artifact, not the current desktop/scheduler
   hashes. Neither result establishes physical-PC compatibility or coverage
   across arbitrary firmware; physical AHCI/NVMe/USB boot, NICs, display/input,
   ACPI quirks, and cache-flush behavior remain hardware-validation work.
-- The display/input session is deliberately a single-process software-copy
-  foundation, not a desktop. There is no compositor, window protocol, shared
-  client surface, acceleration, page flipping, or default application yet.
-  Syscalls 54-57 pass a ring-3 lifecycle smoke, but multi-client compositor
-  behavior, SMP input timing stress, and real-device validation remain.
+- The current desktop is deliberately a single-process software compositor.
+  There is no live multi-client window transport, shared client surface
+  service, acceleration, page flipping, or default application yet. The
+  versioned compositor records are specification only. PE loading, NT/Win32
+  APIs, COM, DirectX translation, .NET, and WoW64 are not implemented, so no
+  Windows application compatibility is claimed. SMP input timing stress and
+  broad real-device validation also remain.
+- The current process model has one scheduler task per userspace process.
+  Multi-threaded NT compatibility requires last-thread/refcounted address-space
+  teardown before adding Windows thread semantics.
 - The supported configured CPU range is 1 through 64, including the BSP. CPU
   masks and several per-CPU stores are fixed around `MAX_CPUS=64`; supporting
   more than 64 requires dynamically sized CPU sets and per-CPU storage rather

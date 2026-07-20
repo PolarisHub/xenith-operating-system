@@ -235,6 +235,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xenith-desktop"
+version = "0.1.0"
+dependencies = [
+ "libuser",
+ "xenith-abi",
+]
+
+[[package]]
 name = "xenith-disasm"
 version = "0.1.0"
 dependencies = [
@@ -285,6 +293,7 @@ name = "xenith-init"
 version = "0.1.0"
 dependencies = [
  "libuser",
+ "xenith-abi",
 ]
 
 [[package]]

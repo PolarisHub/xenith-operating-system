@@ -40,6 +40,18 @@ pub const MAX_ARGUMENTS: usize = 256;
 /// Maximum combined argument-string storage for one process.
 pub const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 
+/// Hard bound for live and waitable process records.
+///
+/// Besides bounding kernel ownership metadata, this lets signal delivery use
+/// fixed stack batches for waiter hand-off instead of allocating while an
+/// IRQ-safe process-table guard is held.
+pub const MAX_PROCESSES: usize = 256;
+
+/// Xenith currently has one scheduler task per process, so deduplicating the
+/// two possible waiter roles needs at most one task id per process.
+const MAX_PROCESS_WAITERS: usize = MAX_PROCESSES;
+const PROCESS_MASK_WORDS: usize = MAX_PROCESSES.div_ceil(64);
+
 /// Maximum heap growth above an executable's initial break.
 const MAX_BRK_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -132,6 +144,12 @@ pub struct UserProcess {
     /// until a group-directed `SIGCONT` clears this flag.
     pub stopped: bool,
     wait_change: Option<WaitStatus>,
+    /// The process's sole task while it is blocked in `waitpid`. Registration
+    /// is protected by `PROCESS_TABLE` and handed directly to the scheduler's
+    /// intrusive blocked queue, so waiting never allocates.
+    child_waiter: Option<TaskId>,
+    /// The process's sole task while a default stop disposition is active.
+    state_waiter: Option<TaskId>,
     termination_signal: Option<Signal>,
     pub path: String,
     entry: VirtAddr,
@@ -261,6 +279,77 @@ pub struct WaitResult {
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TABLE: SpinLockIRQ<Vec<UserProcess>> = SpinLockIRQ::new(Vec::new());
 
+/// Compact fixed-capacity set of process-table indices used during group
+/// delivery. Three instances consume 96 bytes at today's 256-process limit,
+/// avoiding large boolean arrays on a 16 KiB kernel stack.
+struct ProcessIndexSet {
+    words: [u64; PROCESS_MASK_WORDS],
+}
+
+impl ProcessIndexSet {
+    const fn new() -> Self {
+        Self {
+            words: [0; PROCESS_MASK_WORDS],
+        }
+    }
+
+    fn insert(&mut self, index: usize) {
+        assert!(index < MAX_PROCESSES, "process index exceeds fixed mask");
+        self.words[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        index < MAX_PROCESSES && self.words[index / 64] & (1u64 << (index % 64)) != 0
+    }
+}
+
+/// Allocation-free baton from process-table state publication to scheduler
+/// wakeup. Waiter slots are taken while `PROCESS_TABLE` is locked, then every
+/// task is woken only after that guard has been released.
+struct ProcessWaiterBatch {
+    tasks: [TaskId; MAX_PROCESS_WAITERS],
+    len: usize,
+}
+
+impl ProcessWaiterBatch {
+    const fn new() -> Self {
+        Self {
+            tasks: [TaskId(0); MAX_PROCESS_WAITERS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, waiter: Option<TaskId>) {
+        let Some(waiter) = waiter else { return };
+        if self.tasks[..self.len].contains(&waiter) {
+            return;
+        }
+        assert!(
+            self.len < self.tasks.len(),
+            "process waiter batch exceeded MAX_PROCESSES invariant"
+        );
+        self.tasks[self.len] = waiter;
+        self.len += 1;
+    }
+
+    fn wake_all(&self) {
+        for waiter in &self.tasks[..self.len] {
+            let _ = sched::scheduler::wake_blocked_task_from_task(*waiter);
+        }
+    }
+}
+
+/// A process blocked in `waitpid` needs a group-signal wake only when it was a
+/// delivery target itself or when one of its children acquired an observable
+/// stop/continue state transition.
+#[inline]
+const fn group_child_waiter_relevant(
+    target_accepted_signal: bool,
+    parent_of_changed_child: bool,
+) -> bool {
+    target_accepted_signal || parent_of_changed_child
+}
+
 /// Spawn `path` with `argv`, returning once the process is installed on the
 /// scheduler run queue.  An empty `argv` is normalised to `[path]`.
 pub fn spawn(path: &str, argv: &[&str]) -> Result<ProcessId, ProcessError> {
@@ -363,6 +452,8 @@ pub fn spawn_in_group(
         signals,
         stopped: false,
         wait_change: None,
+        child_waiter: None,
+        state_waiter: None,
         termination_signal: None,
         path: process_path,
         entry: loaded.entry,
@@ -519,6 +610,8 @@ pub fn fork(context: ring3::UserContext) -> Result<ProcessId, ProcessError> {
         signals,
         stopped: false,
         wait_change: None,
+        child_waiter: None,
+        state_waiter: None,
         termination_signal: None,
         path: process_path,
         entry,
@@ -694,22 +787,38 @@ fn exit_with_status(status: ExitStatus) -> ! {
     // fail, or contend. A crashing compositor must never retain the session
     // merely because later process teardown cannot make progress.
     let _ = crate::ui::release_if_owner(pid);
+    let mut parent_waiter = None;
     if !pid.is_kernel() {
+        // This must precede the PROCESS_TABLE release that publishes
+        // `exit_status`: a parent may wake and destroy this address space on
+        // another CPU immediately after that publication. From here onward
+        // teardown touches only globally mapped kernel memory.
+        sched::scheduler::detach_current_address_space();
         let mut table = PROCESS_TABLE.lock();
-        if let Some(process) = table.iter_mut().find(|process| process.pid == pid) {
-            if process.exit_status.is_pending() {
-                process.exit_status = status;
-                process.fd_table.close_all();
+        if let Some(index) = table.iter().position(|process| process.pid == pid) {
+            let parent = if table[index].exit_status.is_pending() {
+                table[index].exit_status = status;
+                table[index].fd_table.close_all();
                 // Orphan children rather than leaving dangling parent ids.
-                let children = process.children.clone();
+                let children = table[index].children.clone();
                 for child in children {
                     if let Some(record) = table.iter_mut().find(|record| record.pid == child) {
                         record.parent = None;
                     }
                 }
+                table[index].parent
+            } else {
+                None
+            };
+            if let Some(parent) = parent {
+                parent_waiter = table
+                    .iter_mut()
+                    .find(|record| record.pid == parent)
+                    .and_then(|record| record.child_waiter.take());
             }
         }
     }
+    wake_process_waiter(parent_waiter);
     sched::scheduler::exit(status)
 }
 
@@ -733,113 +842,186 @@ pub fn try_wait_selector(
     let parent = try_current_pid().ok_or(ProcessError::NoCurrentProcess)?;
     let (result, reaped) = {
         let mut table = PROCESS_TABLE.lock();
-        let parent_index = table
-            .iter()
-            .position(|process| process.pid == parent)
-            .ok_or(ProcessError::NoCurrentProcess)?;
-        let parent_group = table[parent_index].process_group;
-        let mut matching_child = false;
-        let mut selected = None;
-        for child in table[parent_index].children.iter().copied() {
-            let child_index = table
-                .iter()
-                .position(|record| record.pid == child)
-                .ok_or(ProcessError::TableCorrupt)?;
-            let record = &table[child_index];
-            if !selector.matches(record.pid, record.process_group, parent_group) {
-                continue;
-            }
-            matching_child = true;
-            let status = if !record.exit_status.is_pending() {
-                Some(WaitStatus::Exited(record.exit_status))
-            } else {
-                match record.wait_change {
-                    Some(WaitStatus::Stopped(signal)) if include_stopped => {
-                        Some(WaitStatus::Stopped(signal))
-                    },
-                    Some(WaitStatus::Continued) if include_continued => Some(WaitStatus::Continued),
-                    _ => None,
-                }
-            };
-            if let Some(status) = status {
-                selected = Some((child_index, status));
-                break;
-            }
-        }
-
-        if !matching_child {
-            return if table[parent_index].children.is_empty() {
-                Err(ProcessError::NoChildren)
-            } else {
-                Err(ProcessError::NotChild(match selector {
-                    WaitSelector::Process(pid) | WaitSelector::Group(pid) => pid,
-                    WaitSelector::Any | WaitSelector::CurrentGroup => KERNEL_PROCESS_ID,
-                }))
-            };
-        }
-        let Some((child_index, status)) = selected else {
-            return Ok(None);
-        };
-        let selected_pid = table[child_index].pid;
-        if matches!(status, WaitStatus::Exited(_)) {
-            table[parent_index]
-                .children
-                .retain(|child| *child != selected_pid);
-            let reaped = table.swap_remove(child_index);
-            (
-                WaitResult {
-                    pid: selected_pid,
-                    status,
-                },
-                Some(reaped),
-            )
-        } else {
-            table[child_index].wait_change = None;
-            (
-                WaitResult {
-                    pid: selected_pid,
-                    status,
-                },
-                None,
-            )
-        }
+        poll_wait_selector_locked(
+            &mut table,
+            parent,
+            selector,
+            include_stopped,
+            include_continued,
+        )?
     };
 
     if let Some(reaped) = reaped {
         reclaim_process(reaped);
     }
-    Ok(Some(result))
+    Ok(result)
 }
 
-/// Cooperatively wait until the selected child exits, then reap it.
+/// Block until the selected child exits, then reap it.
 pub fn wait(pid: ProcessId) -> Result<WaitResult, ProcessError> {
-    loop {
-        if let Some(result) = try_wait(pid)? {
-            return Ok(result);
-        }
-        if sched::is_initialised() {
-            sched::yield_now();
-        } else {
-            core::hint::spin_loop();
-        }
-    }
+    let selector = if pid.is_kernel() {
+        WaitSelector::Any
+    } else {
+        WaitSelector::Process(pid)
+    };
+    wait_selector(selector, false, false)
 }
 
-/// Cooperatively wait for any selected child state change.
+/// Block without allocating until any selected child state changes.
+///
+/// The process-table guard protects both the child predicate and the waiter
+/// slot. [`sched::scheduler::block_current_until_releasing`] links the task in
+/// the scheduler before releasing that guard, so an exit/signal producer can
+/// neither miss the registration nor attempt to wake an unparked task.
 pub fn wait_selector(
     selector: WaitSelector,
     include_stopped: bool,
     include_continued: bool,
 ) -> Result<WaitResult, ProcessError> {
+    let parent = try_current_pid().ok_or(ProcessError::NoCurrentProcess)?;
+    let task = sched::scheduler::with_current_node(|node| node.task.id)
+        .ok_or(ProcessError::NoCurrentProcess)?;
+
     loop {
-        if let Some(result) = try_wait_selector(selector, include_stopped, include_continued)? {
+        let mut table = PROCESS_TABLE.lock();
+        let parent_index = table
+            .iter()
+            .position(|process| process.pid == parent)
+            .ok_or(ProcessError::NoCurrentProcess)?;
+        clear_waiter(&mut table[parent_index].child_waiter, task);
+
+        let (result, reaped) = poll_wait_selector_locked(
+            &mut table,
+            parent,
+            selector,
+            include_stopped,
+            include_continued,
+        )?;
+        if let Some(result) = result {
+            drop(table);
+            if let Some(reaped) = reaped {
+                reclaim_process(reaped);
+            }
             return Ok(result);
         }
-        if sched::is_initialised() {
-            sched::yield_now();
-        } else {
-            core::hint::spin_loop();
+        debug_assert!(reaped.is_none());
+
+        let parent_index = table
+            .iter()
+            .position(|process| process.pid == parent)
+            .ok_or(ProcessError::NoCurrentProcess)?;
+        if table[parent_index].signals.has_interrupting_delivery() {
+            return Err(ProcessError::Interrupted);
         }
+        if !register_waiter(&mut table[parent_index].child_waiter, task) {
+            return Err(ProcessError::TableCorrupt);
+        }
+        sched::scheduler::block_current_until_releasing(None, table);
+    }
+}
+
+fn poll_wait_selector_locked(
+    table: &mut Vec<UserProcess>,
+    parent: ProcessId,
+    selector: WaitSelector,
+    include_stopped: bool,
+    include_continued: bool,
+) -> Result<(Option<WaitResult>, Option<UserProcess>), ProcessError> {
+    let parent_index = table
+        .iter()
+        .position(|process| process.pid == parent)
+        .ok_or(ProcessError::NoCurrentProcess)?;
+    let parent_group = table[parent_index].process_group;
+    let mut matching_child = false;
+    let mut selected = None;
+    for child in table[parent_index].children.iter().copied() {
+        let child_index = table
+            .iter()
+            .position(|record| record.pid == child)
+            .ok_or(ProcessError::TableCorrupt)?;
+        let record = &table[child_index];
+        if !selector.matches(record.pid, record.process_group, parent_group) {
+            continue;
+        }
+        matching_child = true;
+        let status = if !record.exit_status.is_pending() {
+            Some(WaitStatus::Exited(record.exit_status))
+        } else {
+            match record.wait_change {
+                Some(WaitStatus::Stopped(signal)) if include_stopped => {
+                    Some(WaitStatus::Stopped(signal))
+                },
+                Some(WaitStatus::Continued) if include_continued => Some(WaitStatus::Continued),
+                _ => None,
+            }
+        };
+        if let Some(status) = status {
+            selected = Some((child_index, status));
+            break;
+        }
+    }
+
+    if !matching_child {
+        return if table[parent_index].children.is_empty() {
+            Err(ProcessError::NoChildren)
+        } else {
+            Err(ProcessError::NotChild(match selector {
+                WaitSelector::Process(pid) | WaitSelector::Group(pid) => pid,
+                WaitSelector::Any | WaitSelector::CurrentGroup => KERNEL_PROCESS_ID,
+            }))
+        };
+    }
+    let Some((child_index, status)) = selected else {
+        return Ok((None, None));
+    };
+    let selected_pid = table[child_index].pid;
+    if matches!(status, WaitStatus::Exited(_)) {
+        table[parent_index]
+            .children
+            .retain(|child| *child != selected_pid);
+        let reaped = table.swap_remove(child_index);
+        Ok((
+            Some(WaitResult {
+                pid: selected_pid,
+                status,
+            }),
+            Some(reaped),
+        ))
+    } else {
+        table[child_index].wait_change = None;
+        Ok((
+            Some(WaitResult {
+                pid: selected_pid,
+                status,
+            }),
+            None,
+        ))
+    }
+}
+
+fn register_waiter(slot: &mut Option<TaskId>, task: TaskId) -> bool {
+    match *slot {
+        None => {
+            *slot = Some(task);
+            true
+        },
+        Some(task_id) if task_id == task => {
+            *slot = Some(task);
+            true
+        },
+        Some(_) => false,
+    }
+}
+
+fn clear_waiter(slot: &mut Option<TaskId>, task: TaskId) {
+    if *slot == Some(task) {
+        *slot = None;
+    }
+}
+
+fn wake_process_waiter(waiter: Option<TaskId>) {
+    if let Some(waiter) = waiter {
+        let _ = sched::scheduler::wake_blocked_task_from_task(waiter);
     }
 }
 
@@ -951,23 +1133,14 @@ pub fn can_control_process_group(process_group: ProcessId) -> bool {
 
 /// Deliver a signal to a live process.
 pub fn signal(pid: ProcessId, signal: Signal) -> Result<DeliverOutcome, ProcessError> {
-    let result = {
-        let mut table = PROCESS_TABLE.lock();
-        let process = table
-            .iter_mut()
-            .find(|process| process.pid == pid)
-            .ok_or(ProcessError::NoSuchProcess(pid))?;
-        if process.has_exited() {
-            return Err(ProcessError::NoSuchProcess(pid));
-        }
-        delivery_result(apply_signal(process, signal))
-    };
+    let (result, waiters) = signal_one_inner(pid, signal, None)?;
+    for waiter in waiters {
+        wake_process_waiter(waiter);
+    }
     // UI readers inspect process signal state while holding their event lock,
     // so PROCESS_TABLE must be dropped before taking that lock to notify them.
-    if result.is_ok() {
-        crate::ui::notify_signal(pid);
-    }
-    result
+    crate::ui::notify_signal(pid);
+    Ok(result)
 }
 
 /// Deliver a signal with an explicit stable `siginfo` source payload.
@@ -976,20 +1149,38 @@ pub fn signal_with_info(
     signal: Signal,
     info: xenith_abi::SigInfo,
 ) -> Result<DeliverOutcome, ProcessError> {
-    let result = {
-        let mut table = PROCESS_TABLE.lock();
-        let Some(process) = table
-            .iter_mut()
-            .find(|process| process.pid == pid && !process.has_exited())
-        else {
-            return Err(ProcessError::NoSuchProcess(pid));
-        };
-        delivery_result(apply_signal_with_info(process, signal, Some(info)))
-    };
-    if result.is_ok() {
-        crate::ui::notify_signal(pid);
+    let (result, waiters) = signal_one_inner(pid, signal, Some(info))?;
+    for waiter in waiters {
+        wake_process_waiter(waiter);
     }
-    result
+    crate::ui::notify_signal(pid);
+    Ok(result)
+}
+
+fn signal_one_inner(
+    pid: ProcessId,
+    signal: Signal,
+    info: Option<xenith_abi::SigInfo>,
+) -> Result<(DeliverOutcome, [Option<TaskId>; 3]), ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    let index = table
+        .iter()
+        .position(|process| process.pid == pid && !process.has_exited())
+        .ok_or(ProcessError::NoSuchProcess(pid))?;
+    let previous_change = table[index].wait_change;
+    let outcome = delivery_result(apply_signal_with_info(&mut table[index], signal, info))?;
+    let parent = (table[index].wait_change != previous_change)
+        .then_some(table[index].parent)
+        .flatten();
+    let child_waiter = table[index].child_waiter.take();
+    let state_waiter = table[index].state_waiter.take();
+    let parent_waiter = parent.and_then(|parent| {
+        table
+            .iter_mut()
+            .find(|record| record.pid == parent)
+            .and_then(|record| record.child_waiter.take())
+    });
+    Ok((outcome, [child_waiter, state_waiter, parent_waiter]))
 }
 
 /// Deliver a signal to every live member of a process group.
@@ -1016,27 +1207,78 @@ fn signal_group_inner(
     info: Option<xenith_abi::SigInfo>,
 ) -> Result<usize, ProcessError> {
     let mut table = PROCESS_TABLE.lock();
+    assert!(
+        table.len() <= MAX_PROCESSES,
+        "process table exceeded fixed signal-wake capacity"
+    );
     let mut matched = 0usize;
     let mut delivered = 0usize;
     let mut queue_full = false;
     let mut ui_owner_to_wake = None;
-    for process in table
-        .iter_mut()
-        .filter(|process| process.process_group == process_group && !process.has_exited())
-    {
+    let mut fatal_error = None;
+    let mut accepted_targets = ProcessIndexSet::new();
+    let mut changed_children = ProcessIndexSet::new();
+    let mut changed_parents = ProcessIndexSet::new();
+    let mut waiters = ProcessWaiterBatch::new();
+
+    for index in 0..table.len() {
+        if table[index].process_group != process_group || table[index].has_exited() {
+            continue;
+        }
         matched += 1;
-        match delivery_result(apply_signal_with_info(process, signal, info)) {
+        let previous_change = table[index].wait_change;
+        match delivery_result(apply_signal_with_info(&mut table[index], signal, info)) {
             Ok(_) => {
                 delivered += 1;
-                if crate::ui::is_owner(process.pid) {
-                    ui_owner_to_wake = Some(process.pid);
+                accepted_targets.insert(index);
+                if table[index].wait_change != previous_change {
+                    changed_children.insert(index);
+                }
+                if crate::ui::is_owner(table[index].pid) {
+                    ui_owner_to_wake = Some(table[index].pid);
                 }
             },
             Err(ProcessError::SignalQueueFull) => queue_full = true,
-            Err(error) => return Err(error),
+            Err(error) => {
+                fatal_error = Some(error);
+                break;
+            },
         }
     }
-    let result = if matched == 0 {
+
+    // Resolve changed children to their actual parents while indices remain
+    // stable under the table lock. Parents outside the target group are
+    // included; unrelated waiters are not.
+    for child_index in 0..table.len() {
+        if !changed_children.contains(child_index) {
+            continue;
+        }
+        let Some(parent) = table[child_index].parent else {
+            continue;
+        };
+        if let Some(parent_index) = table.iter().position(|record| record.pid == parent) {
+            changed_parents.insert(parent_index);
+        }
+    }
+
+    // Claim the exact waiter slots before publication is unlocked. The
+    // registration-to-block protocol guarantees each claimed task is already
+    // in the scheduler's blocked queue. Waking happens below, after unlock.
+    for index in 0..table.len() {
+        if accepted_targets.contains(index) {
+            waiters.push(table[index].state_waiter.take());
+        }
+        if group_child_waiter_relevant(
+            accepted_targets.contains(index),
+            changed_parents.contains(index),
+        ) {
+            waiters.push(table[index].child_waiter.take());
+        }
+    }
+
+    let result = if let Some(error) = fatal_error {
+        Err(error)
+    } else if matched == 0 {
         Err(ProcessError::NoSuchProcess(process_group))
     } else if delivered == 0 && queue_full {
         Err(ProcessError::SignalQueueFull)
@@ -1044,6 +1286,7 @@ fn signal_group_inner(
         Ok(delivered)
     };
     drop(table);
+    waiters.wake_all();
     if result.is_ok() {
         if let Some(pid) = ui_owner_to_wake {
             crate::ui::notify_signal(pid);
@@ -1058,10 +1301,6 @@ fn delivery_result(outcome: DeliverOutcome) -> Result<DeliverOutcome, ProcessErr
         DeliverOutcome::Invalid => Err(ProcessError::InvalidArgument),
         accepted => Ok(accepted),
     }
-}
-
-fn apply_signal(process: &mut UserProcess, signal: Signal) -> DeliverOutcome {
-    apply_signal_with_info(process, signal, None)
 }
 
 fn apply_signal_with_info(
@@ -1113,19 +1352,29 @@ fn apply_signal_with_info(
 /// Park a stopped process at a syscall boundary and apply a pending default
 /// termination before returning to ring 3.
 pub fn enforce_current_state() {
+    let Some(pid) = try_current_pid() else { return };
+    let Some(task) = sched::scheduler::with_current_node(|node| node.task.id) else {
+        return;
+    };
     loop {
-        let state = with_current_process(|process| (process.stopped, process.termination_signal));
-        match state {
-            Some((_, Some(signal))) => exit_signal(signal),
-            Some((true, None)) => {
-                if sched::is_initialised() {
-                    sched::yield_now();
-                } else {
-                    core::hint::spin_loop();
-                }
-            },
-            Some((false, None)) | None => return,
+        let mut table = PROCESS_TABLE.lock();
+        let Some(index) = table.iter().position(|process| process.pid == pid) else {
+            return;
+        };
+        clear_waiter(&mut table[index].state_waiter, task);
+        if let Some(signal) = table[index].termination_signal {
+            drop(table);
+            exit_signal(signal);
         }
+        if !table[index].stopped {
+            return;
+        }
+        if !register_waiter(&mut table[index].state_waiter, task) {
+            return;
+        }
+        // SIGCONT/termination takes the registration only after this call has
+        // linked the task into the scheduler's allocation-free blocked queue.
+        sched::scheduler::block_current_until_releasing(None, table);
     }
 }
 
@@ -1547,6 +1796,9 @@ fn install_process(process: &mut Option<UserProcess>) -> Result<(), ProcessError
     let pid = record.pid;
     let parent = record.parent;
     let mut table = PROCESS_TABLE.lock();
+    if table.len() >= MAX_PROCESSES {
+        return Err(ProcessError::OutOfMemory);
+    }
     if table.try_reserve(1).is_err() {
         return Err(ProcessError::OutOfMemory);
     }
@@ -1764,6 +2016,7 @@ pub enum ProcessError {
     NotChild(ProcessId),
     NoSuchProcess(ProcessId),
     PermissionDenied,
+    Interrupted,
     SignalQueueFull,
     TableCorrupt,
     Filesystem(FsError),
@@ -1788,6 +2041,7 @@ impl fmt::Display for ProcessError {
             Self::NotChild(pid) => write!(f, "{pid} is not a child of the current process"),
             Self::NoSuchProcess(pid) => write!(f, "no such process {pid}"),
             Self::PermissionDenied => f.write_str("process operation is not permitted"),
+            Self::Interrupted => f.write_str("process wait interrupted by a signal"),
             Self::SignalQueueFull => f.write_str("real-time signal queue is full"),
             Self::TableCorrupt => f.write_str("process table invariant violated"),
             Self::Filesystem(error) => write!(f, "filesystem error: {error}"),
@@ -1834,6 +2088,59 @@ mod job_control_tests {
         assert!(WaitSelector::CurrentGroup.matches(pid, group, group));
         assert!(!WaitSelector::CurrentGroup.matches(pid, group, ProcessId(9)));
         assert!(WaitSelector::Group(group).matches(pid, group, ProcessId(9)));
+    }
+
+    #[test]
+    fn waiter_registration_is_single_owner_and_explicitly_cleared() {
+        let first = TaskId(11);
+        let second = TaskId(12);
+        let mut waiter = None;
+
+        assert!(register_waiter(&mut waiter, first));
+        assert!(register_waiter(&mut waiter, first));
+        assert!(!register_waiter(&mut waiter, second));
+        clear_waiter(&mut waiter, second);
+        assert_eq!(waiter, Some(first));
+        clear_waiter(&mut waiter, first);
+        assert_eq!(waiter, None);
+        assert!(register_waiter(&mut waiter, second));
+    }
+
+    #[test]
+    fn group_signal_wait_scope_excludes_unrelated_processes() {
+        assert!(group_child_waiter_relevant(true, false));
+        assert!(group_child_waiter_relevant(false, true));
+        assert!(group_child_waiter_relevant(true, true));
+        assert!(!group_child_waiter_relevant(false, false));
+    }
+
+    #[test]
+    fn fixed_waiter_batch_deduplicates_without_allocation() {
+        let mut batch = ProcessWaiterBatch::new();
+        batch.push(None);
+        batch.push(Some(TaskId(41)));
+        batch.push(Some(TaskId(41)));
+        batch.push(Some(TaskId(42)));
+
+        assert_eq!(batch.len, 2);
+        assert_eq!(&batch.tasks[..batch.len], &[TaskId(41), TaskId(42)]);
+        assert_eq!(batch.tasks.len(), MAX_PROCESSES);
+    }
+
+    #[test]
+    fn process_index_set_covers_the_full_process_bound() {
+        let mut set = ProcessIndexSet::new();
+        set.insert(0);
+        set.insert(63);
+        set.insert(64);
+        set.insert(MAX_PROCESSES - 1);
+
+        assert!(set.contains(0));
+        assert!(set.contains(63));
+        assert!(set.contains(64));
+        assert!(set.contains(MAX_PROCESSES - 1));
+        assert!(!set.contains(MAX_PROCESSES));
+        assert!(!set.contains(65));
     }
 
     #[test]

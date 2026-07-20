@@ -350,3 +350,24 @@ pub fn write_str_raw(s: &str) {
         console.write_str(s);
     }
 }
+
+/// Write terminal bytes to COM1 under the logger's global serial lock.
+///
+/// Kernel log records and ring-3 TTY output share the same physical UART.
+/// Routing both through this lock keeps complete records coherent on SMP
+/// instead of allowing the two formerly independent COM1 locks to interleave
+/// bytes. This intentionally does not mirror to the framebuffer: the TTY
+/// path has already updated the terminal model before calling here.
+pub fn write_serial_bytes_raw(bytes: &[u8]) {
+    let mut w = KERNEL_LOGGER.writer.lock();
+    if !w.serial_ready {
+        w.serial.init();
+        w.serial_ready = true;
+    }
+    for &byte in bytes {
+        if byte == b'\n' {
+            w.serial.write_byte(b'\r');
+        }
+        w.serial.write_byte(byte);
+    }
+}

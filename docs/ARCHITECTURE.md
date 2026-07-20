@@ -9,11 +9,13 @@ BIOS stage1/stage2 or UEFI loader
 kernel entry -> arch -> memory -> ACPI/controllers/time
                               -> scheduler/syscalls
                               -> devices/network/VFS
-                              -> ELF processes -> init -> shell
-                                      |
+                              -> ELF processes -> init
+                                      |          |
+                                      |          +-> terminal shell fallback
                                       v
-                         exclusive UI session (ABI ready)
+                              xenith-desktop
                          -> private userspace backbuffer
+                         -> bounded software composition
                          -> damage-copy scanout + ordered PS/2 input
 ```
 
@@ -23,7 +25,9 @@ Every user process owns a PML4 whose low half contains W^X ELF mappings and a gu
 
 Interrupt/syscall entry saves an explicit register frame. User pointers are range checked and copied rather than retained across locks. Device IRQ work is bounded; longer operations use polling or process context.
 
-The UI boundary gives one process exclusive ownership of framebuffer scanout and the PS/2 input seat. The process renders in private anonymous memory; the kernel validates damage and copies only affected rows into the native 32-bpp format. Keyboard and pointer IRQs share one ordered queue whose empty reader sleeps and is woken by IRQ delivery. Release, successful owner `exec`, and owner exit restore the stateful kernel console and redraw its saved contents. This is sufficient to implement the first single-process desktop shell; no desktop, compositor, client surfaces, or applications exist yet.
+The UI boundary gives `xenith-desktop` exclusive ownership of framebuffer scanout and the PS/2 input seat. It renders a procedural wallpaper, glass chrome, launcher, dock, and cursor into one private anonymous backbuffer. The kernel validates bounded damage and copies only affected rows into the native 32-bpp format. Keyboard and pointer IRQs share one ordered queue whose empty reader sleeps and is woken by IRQ delivery. Release, successful owner `exec`, and owner exit restore the stateful kernel console and redraw its saved contents. Init supervises the desktop and execs the terminal shell when no framebuffer exists or the graphical process exits.
+
+`xenith-abi::compositor` separately defines the versioned, transport-neutral records for generation-safe window handles, shared surface metadata, commits/damage, roles/state, configuration, focus/input/text, close, and frame completion. That is a future client/server contract only: no IPC transport or multi-process surface server is connected yet.
 
 The VFS presents ramfs/initramfs, FAT32, and XenithFS through common inode operations. Networking presents Ethernet/ARP/IPv4/ICMP/UDP/TCP through interface/routing/socket state. AML evaluation is bounded by namespace, package, recursion, method-step, and loop limits and denies operation-region access until a policy handler is installed.
 

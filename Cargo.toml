@@ -34,6 +34,7 @@ members = [
     "tools/xenith-debug",
     "user/libuser",
     "user/init",
+    "user/desktop",
     "user/shell",
     "user/coreutils",
     "user/libc/xenith-libc",

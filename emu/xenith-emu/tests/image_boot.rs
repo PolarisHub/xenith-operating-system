@@ -4,6 +4,10 @@ use std::path::Path;
 use xenith_boot_common::{DiskEntryKind, DiskManifest};
 use xenith_emu::{ExitReason, Machine, MachineConfig};
 
+const GRAPHICAL_PROGRESS_SLICE: u64 = 5_000_000;
+const UEFI_DESKTOP_LIMIT: u64 = 900_000_000;
+const DESKTOP_EXIT_SCANCODES: &[u8] = &[0x1d, 0x38, 0x0e, 0x8e, 0xb8, 0x9d];
+
 fn workspace_file(relative: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -21,6 +25,82 @@ fn assert_packaged_payload(image: &[u8], kind: DiskEntryKind, path: &str) {
         expected,
         "packaged {path} is stale; rerun `xenith-build all`"
     );
+}
+
+/// Prove that a firmware-supplied framebuffer reaches the desktop, then use
+/// its deterministic recovery chord to retain each gate's original shell and
+/// PS/2-input boundary.
+fn run_graphical_boot_to_shell(machine: &mut Machine, instruction_limit: u64) -> String {
+    assert!(instruction_limit != 0);
+    let mut remaining = instruction_limit;
+    let mut exit_sent = false;
+
+    loop {
+        let step = remaining.min(GRAPHICAL_PROGRESS_SLICE);
+        let summary = machine.run_for(step);
+        let serial = String::from_utf8_lossy(&machine.serial_output()).into_owned();
+        assert!(
+            !serial.contains("XENITH_DESKTOP_FAIL"),
+            "desktop failed during graphical firmware boot\n{serial}"
+        );
+
+        if !exit_sent && serial.contains("XENITH_DESKTOP_READY") {
+            machine
+                .inject_keyboard_scancodes(DESKTOP_EXIT_SCANCODES)
+                .expect("inject desktop recovery chord");
+            exit_sent = true;
+        }
+        if exit_sent
+            && serial.contains("XENITH_DESKTOP_CLEAN_EXIT")
+            && serial.contains("XENITH_DESKTOP_FALLBACK")
+            && serial.contains("Xenith shell 0.1")
+            && serial.contains("xenith$ ")
+        {
+            return serial;
+        }
+
+        assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+        remaining -= step;
+        assert!(
+            remaining != 0,
+            "graphical firmware boot did not reach desktop and recover to the shell; desktop_ready={exit_sent}\n{serial}"
+        );
+    }
+}
+
+/// BIOS semantic boots currently have no firmware framebuffer. Preserve that
+/// boundary explicitly and prove init takes its terminal-shell fallback.
+fn run_no_display_boot_to_shell(machine: &mut Machine, instruction_limit: u64) -> String {
+    assert!(instruction_limit != 0);
+    assert!(
+        machine
+            .framebuffer_ppm()
+            .expect("inspect BIOS framebuffer state")
+            .is_none(),
+        "BIOS semantic runner unexpectedly supplied a framebuffer"
+    );
+
+    let mut remaining = instruction_limit;
+    loop {
+        let step = remaining.min(10_000_000);
+        let summary = machine.run_for(step);
+        let serial = String::from_utf8_lossy(&machine.serial_output()).into_owned();
+        if serial.contains("Xenith shell 0.1") && serial.contains("xenith$ ") {
+            assert!(
+                !serial.contains("XENITH_DESKTOP_START")
+                    && !serial.contains("XENITH_DESKTOP_READY"),
+                "desktop started without a firmware framebuffer\n{serial}"
+            );
+            return serial;
+        }
+
+        assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+        remaining -= step;
+        assert!(
+            remaining != 0,
+            "BIOS boot did not reach the no-display shell fallback\n{serial}"
+        );
+    }
 }
 
 #[test]
@@ -57,7 +137,7 @@ fn manifest_image_reaches_userspace_shell() {
 }
 
 #[test]
-#[ignore = "requires `xenith-build all`; boots the packaged BIOS image for 100M iterations"]
+#[ignore = "requires `xenith-build all`; boots the packaged BIOS image to its no-display shell fallback"]
 fn bios_firmware_image_reaches_userspace_shell() {
     let image = fs::read(workspace_file("build/xenith.img")).expect("read built raw image");
     let packaged_manifest =
@@ -144,12 +224,11 @@ fn bios_firmware_image_reaches_userspace_shell() {
         xenith_boot_common::XENITH_BOOT_MAGIC
     );
 
-    let summary = machine.run();
-    let serial = String::from_utf8_lossy(&summary.serial);
-    assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+    let serial = run_no_display_boot_to_shell(&mut machine, 100_000_000);
     for marker in [
         "xenith: init",
         "user: init spawned",
+        "init: no framebuffer session; using terminal shell",
         "Xenith shell 0.1",
         "xenith$ ",
     ] {
@@ -171,12 +250,11 @@ fn bios_firmware_image_reaches_shell_with_64_mib() {
         .load_bios_image(image, true)
         .expect("load compact BIOS payload layout in 64 MiB");
 
-    let summary = machine.run();
-    let serial = String::from_utf8_lossy(&summary.serial);
-    assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+    let serial = run_no_display_boot_to_shell(&mut machine, 100_000_000);
     for marker in [
         "xenith.mm.heap: 8192 KiB heap",
         "user: init spawned",
+        "init: no framebuffer session; using terminal shell",
         "Xenith shell 0.1",
         "xenith$ ",
     ] {
@@ -251,21 +329,7 @@ fn bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell() {
         "this gate must not be mistaken for complete real-firmware stage2 execution"
     );
 
-    let mut remaining = 420_000_000;
-    let serial = loop {
-        let step = remaining.min(10_000_000);
-        let summary = machine.run_for(step);
-        let serial = String::from_utf8_lossy(&summary.serial).into_owned();
-        if serial.contains("xenith$ ") {
-            break serial;
-        }
-        assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
-        remaining -= step;
-        assert!(
-            remaining != 0,
-            "three-CPU BIOS ISO boot did not reach the shell\n{serial}"
-        );
-    };
+    let serial = run_no_display_boot_to_shell(&mut machine, 420_000_000);
     for marker in [
         "xenith: init",
         "xenith.smp: using retired BIOS bounce page 0x70000 for serialized AP startup",
@@ -290,7 +354,7 @@ fn bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell() {
 }
 
 #[test]
-#[ignore = "requires `xenith-build all`; executes packaged BOOTX64.EFI and boots for 100M iterations"]
+#[ignore = "requires `xenith-build all`; executes BOOTX64.EFI through desktop recovery"]
 fn uefi_iso_executes_packaged_pe_and_reaches_userspace_shell() {
     let iso = fs::read(workspace_file("build/xenith.iso")).expect("read built ISO");
     let bootx64 = fs::read(workspace_file("build/bootloader/BOOTX64.EFI"))
@@ -354,12 +418,12 @@ fn uefi_iso_executes_packaged_pe_and_reaches_userspace_shell() {
         xenith_boot_common::XENITH_BOOT_MAGIC
     );
 
-    let summary = machine.run();
-    let serial = String::from_utf8_lossy(&summary.serial);
-    assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+    let serial = run_graphical_boot_to_shell(&mut machine, UEFI_DESKTOP_LIMIT);
     for marker in [
         "xenith: init",
         "user: init spawned",
+        "XENITH_DESKTOP_READY",
+        "XENITH_DESKTOP_CLEAN_EXIT",
         "Xenith shell 0.1",
         "xenith$ ",
     ] {

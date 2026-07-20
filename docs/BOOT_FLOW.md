@@ -116,11 +116,13 @@ The order is load-bearing:
 10. `/init` ELF mapping and process publication;
 11. interrupts enabled and scheduler dispatch of the first task.
 
-`/init` prints its banner, spawns `/bin/sh` through the kernel process-launch
-path, and exits. The shell uses the kernel spawn/wait path for external
-utilities. Integration gates wait for `xenith: init`, `mm: ready`,
-`scheduler: ready`, `user: init spawned`, the userspace-init banner, and
-`xenith$ `.
+`/init` prints its banner and probes the exclusive framebuffer session. With a
+supported display it spawns and supervises `/bin/xenith-desktop`; otherwise it
+execs `/bin/sh` immediately. A clean recovery gesture, desktop crash, or spawn
+failure also restores the terminal and enters the shell. The shell uses the
+kernel spawn/wait path for external utilities. Graphical integration gates wait
+for `XENITH_DESKTOP_READY`; text-only gates retain the userspace-init and
+`xenith$ ` markers.
 
 Failures before the allocator use serial-only reporting or halt. Invalid boot
 metadata, corrupt initramfs, invalid ELF mappings, and exhausted critical

@@ -31,10 +31,11 @@ printed as a structured decoder, memory, or CPU error and produces a failing
 exit status. Unsupported instructions are never skipped. The implemented
 loader/kernel FPU subset includes `CLTS`, `FNINIT`, `FXSAVE`, and `FXRSTOR`.
 
-With `--serial stdio` in an interactive terminal, type commands normally after
-the shell prompt. Input is read on a background thread and delivered as PS/2
-set-1 keystrokes without pausing emulator execution. Windows CRLF is normalized
-to one Enter key, and EOF stops only the host input source.
+Without `--framebuffer`, init goes directly to the terminal shell. With
+`--serial stdio` in an interactive terminal, type commands normally after the
+shell prompt. Input is read on a background thread and delivered as PS/2 set-1
+keystrokes without pausing emulator execution. Windows CRLF is normalized to
+one Enter key, and EOF stops only the host input source.
 
 For deterministic automation, put ASCII commands in a file and add:
 
@@ -106,7 +107,12 @@ For deterministic final display artifacts, add:
 --vga-dump screen.txt
 ```
 
-These options capture final state; the emulator does not open a live window.
+Supplying `--framebuffer` starts `xenith-desktop` instead of the terminal shell.
+It presents the procedural glass desktop, sleeps when idle, toggles its empty
+launcher with Super, and has no bundled applications. `Ctrl+Alt+Backspace`,
+`Ctrl+Alt+F1`, or `Super+Shift+Q` releases the session and enters the terminal
+fallback. These options capture final state; the emulator does not open a live
+window.
 The RTL8139 device similarly has deterministic transmit completion but no host
 network backend or inbound-frame source.
 
@@ -189,9 +195,12 @@ configurations above 64 are not supported. NAT is optional; Xenith does not
 require networking to boot. The IDE/SCSI controller choice shown by VMware's
 disk wizard does not affect an ISO boot.
 
-Power on with the virtual CD connected. The tested legacy-BIOS path selects a
-VBE framebuffer when available and reaches `Xenith shell 0.1` / `xenith$`.
-If VBE is unavailable, the loader deliberately falls back to VGA text.
+Power on with the virtual CD connected. The legacy-BIOS path selects a VBE
+framebuffer when available and now starts the Xenith desktop. If VBE is
+unavailable, the loader deliberately falls back to VGA text and init starts
+`Xenith shell 0.1` / `xenith$`. From the desktop, use
+`Ctrl+Alt+Backspace`, `Ctrl+Alt+F1`, or `Super+Shift+Q` to restore the terminal
+shell deliberately.
 VMware Workstation 17.6.3 cold boots of the preceding externally tested ISO
 passed with 1, 3, 4, 8, 16, and 24 vCPUs. The corresponding cores-per-socket
 values were 1, 1, 2, 4, 8, and 12; 24 was the tested host's logical-CPU limit.

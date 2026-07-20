@@ -183,16 +183,19 @@ pub unsafe extern "sysv64" fn rust_syscall_dispatch(
 }
 
 /// Construct a replay image only for operations whose implementation proves
-/// that `EINTR` means no data or state was transferred. Today that is the
-/// blocking `read` path; partial reads return their byte count and never enter
-/// this branch. `syscall` is exactly two bytes (`0f 05`), so replay resumes at
+/// that `EINTR` means no data or state was transferred. Blocking `read`
+/// returns a partial byte count instead, and `waitpid` checks for a child
+/// change before interruption and leaves the child wait state untouched on
+/// `EINTR`. `syscall` is exactly two bytes (`0f 05`), so replay resumes at
 /// `return_ip - 2` with RAX restored to the syscall number.
 fn restart_context(
     number: u64,
     result: i64,
     return_ip: u64,
 ) -> Option<crate::user::signal::RestartContext> {
-    if number != super::table::SYS_READ || result != Errno::Eintr.as_ret() {
+    if !matches!(number, super::table::SYS_READ | super::table::SYS_WAITPID)
+        || result != Errno::Eintr.as_ret()
+    {
         return None;
     }
     let syscall_ip = return_ip.checked_sub(2)?;
@@ -265,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn only_empty_interrupted_reads_are_restartable() {
+    fn only_state_preserving_interrupted_syscalls_are_restartable() {
         assert_eq!(
             restart_context(
                 super::super::table::SYS_READ,
@@ -283,6 +286,17 @@ mod tests {
             0x401002
         )
         .is_none());
+        assert_eq!(
+            restart_context(
+                super::super::table::SYS_WAITPID,
+                Errno::Eintr.as_ret(),
+                0x401002
+            ),
+            Some(crate::user::signal::RestartContext {
+                syscall_number: super::super::table::SYS_WAITPID,
+                syscall_ip: 0x401000,
+            })
+        );
         assert!(restart_context(super::super::table::SYS_READ, 1, 0x401002).is_none());
         assert!(restart_context(super::super::table::SYS_READ, Errno::Eintr.as_ret(), 1).is_none());
     }

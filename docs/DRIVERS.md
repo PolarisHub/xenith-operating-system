@@ -3,7 +3,7 @@
 | Driver | State | Important bounds |
 | --- | --- | --- |
 | 16550 serial | Polled output and early logging | COM1, 38400 8N1 default. |
-| VGA/framebuffer | Pixel-format-aware text rendering and exclusive userspace scanout session | Validated native 32-bpp direct colour, damage-copy presentation, or VGA text fallback. No acceleration, vsync, or write-combining/PAT setup yet. |
+| VGA/framebuffer | Pixel-format-aware text rendering and exclusive userspace scanout session | Validated native 32-bpp direct colour, damage-copy presentation, PAT write-combining where supported, or VGA text fallback. No acceleration, page flipping, or vsync contract yet. |
 | PS/2 controller, keyboard, mouse | Initialization, IRQ decode, bounded device queues, or one ordered UI-session queue | Set-1 US keyboard map and relative pointer packets; no USB/HID input yet. |
 | CMOS/RTC | NVRAM and stable RTC reads | Update-in-progress and BCD handling. |
 | PCI | Legacy config-space enumeration, bounded capability walking, ACPI `_PRT`/bridge swizzling, INTx and single-vector MSI selection | Segment 0 conventional configuration; ECAM, MSI-X tables, and interrupt remapping remain outside the current backend. |
