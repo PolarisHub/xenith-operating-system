@@ -1,10 +1,11 @@
 # Desktop Foundation
 
 Xenith now boots a lean full-screen graphical shell, `/bin/xenith-desktop`, on
-supported framebuffers. It software-composes a procedural midnight wallpaper,
-glass top bar and dock, launcher, status chrome, and pointer cursor without
-bundling default applications. Its steady-state loop allocates nothing and
-blocks indefinitely when there is no input.
+supported framebuffers. It cover-crops the exact embedded 192x225 Sedat Bucan
+photo across the display and software-composes one neutral bottom bar, a
+restrained launcher, and a monochrome pointer cursor without bundling default
+applications. Its steady-state loop allocates nothing and blocks indefinitely
+when there is no input.
 
 ## Ownership model
 
@@ -109,17 +110,23 @@ never enter the next owner's queue.
 
 The shell validates the native channel masks, maps exactly one anonymous
 backbuffer, and packs every RGB colour into the advertised framebuffer format.
-Its renderer reconstructs procedural layers only inside a fixed 12-rectangle
+Its renderer bilinearly samples the checked-in RGB8 wallpaper and reconstructs
+wallpaper, client, and neutral shell layers only inside a fixed 12-rectangle
 damage tracker. The first frame is a full present; cursor movement and launcher
 state changes use bounded partial presents. Overflowed input conservatively
 forces one full redraw.
 
 Input is read in fixed 32-record batches. Relative pointer movement is
-accelerated with integer arithmetic and clamped to the display. Super or the
-dock button toggles the launcher; Escape closes it. `Ctrl+Alt+Backspace`,
-`Ctrl+Alt+F1`, and `Super+Shift+Q` are deterministic recovery gestures. An
-orderly exit releases scanout and unmaps the backbuffer; process teardown is
-the crash-safe release path.
+accumulated with Q8 fixed-point fractional precision, given a gradual bounded
+integer gain, and clamped to the display. The PS/2 mouse is configured for 4
+counts/mm at 100 Hz; start-bit checks, preserved session-transition framing,
+controller-error resets, and overflow drops prevent corrupt input from becoming
+sustained pointer motion. The Set-1 US keyboard uses a 250 ms typematic delay
+and repeats held keys at 30 Hz. Super or the bottom-bar button toggles the
+launcher; Escape closes it.
+`Ctrl+Alt+Backspace`, `Ctrl+Alt+F1`, and `Super+Shift+Q` are deterministic
+recovery gestures. An orderly exit releases scanout and unmaps the backbuffer;
+process teardown is the crash-safe release path.
 
 Init probes the framebuffer session, supervises the desktop with blocking
 `waitpid`, retries signal interruptions without abandoning the live child, and
@@ -187,8 +194,10 @@ can obtain a connection.
   desktop compositor. Its coordinator can isolate eight connections, but the
   packaged opt-in smoke is currently the only live connection path and is not
   a default application.
-- Presentation is CPU damage-copy only: no acceleration, page flipping, or
-  vertical-sync contract exists.
+- Presentation always uses the bounded CPU damage-copy path. When Limine's
+  framebuffer is exactly the attached VMware SVGA II frontbuffer, those same
+  rectangles are additionally published through FIFO `UPDATE` commands. There
+  is no page-flip, vsync, 3D, cursor-plane, or generic-GPU contract.
 - Service discovery/brokering, general client admission, desktop window-close
   policy, and a booted two-client integration gate remain to be implemented.
   There are no default applications.
@@ -198,7 +207,9 @@ can obtain a connection.
   scan value in its key-code and scan-code fields; text is a separate event.
 - Shared mappings cannot currently survive `fork`; the kernel rejects `fork`
   while any such mapping is active.
-- Desktop input currently comes only from the PS/2 keyboard and mouse drivers.
+- Desktop input accepts PS/2 plus direct-root-port xHCI boot-protocol keyboards
+  and relative mice. USB hubs, generic HID report descriptors, absolute
+  tablets, mass storage, and non-xHCI host controllers are not implemented.
 - PAT-capable x86_64 processors use write-combining framebuffer leaves with a
   cache-safe WB-to-WC transition and one store fence per completed present.
   Unsupported processors retain the loader's cache policy.

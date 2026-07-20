@@ -108,11 +108,11 @@ For deterministic final display artifacts, add:
 ```
 
 Supplying `--framebuffer` starts `xenith-desktop` instead of the terminal shell.
-It presents the procedural glass desktop, sleeps when idle, toggles its empty
-launcher with Super, and has no bundled applications. `Ctrl+Alt+Backspace`,
-`Ctrl+Alt+F1`, or `Super+Shift+Q` releases the session and enters the terminal
-fallback. These options capture final state; the emulator does not open a live
-window.
+It presents the embedded Sedat Bucan photo behind one neutral bottom bar,
+sleeps when idle, toggles its restrained empty launcher with Super, and has no
+bundled applications. `Ctrl+Alt+Backspace`, `Ctrl+Alt+F1`, or `Super+Shift+Q`
+releases the session and enters the terminal fallback. These options capture
+final state; the emulator does not open a live window.
 
 From that fallback shell, the explicit native-window proof is:
 
@@ -246,6 +246,22 @@ configurations above 64 are not supported. NAT is optional; Xenith does not
 require networking to boot. The IDE/SCSI controller choice shown by VMware's
 disk wizard does not affect an ISO boot.
 
+Leave VMware's default SVGA display enabled to use Xenith's bounded SVGA II
+FIFO damage-update path; the CPU framebuffer copy remains the fallback. A
+virtual HDA sound device may be enabled and Xenith will reset it, operate its
+CORB/RIRB command transport, and enumerate the codec, but audible PCM routing
+is not implemented yet. An xHCI/USB 3 controller can provide directly attached
+boot-protocol keyboards and relative mice. This does not add hubs, generic HID
+tablets, USB storage, or USB audio, and VMware may continue presenting its
+built-in keyboard/mouse through PS/2 unless a USB device is explicitly attached.
+
+The external USB-only runtime gate uses QEMU q35 with `i8042=off`, one
+`qemu-xhci` controller, `usb-kbd`, and `usb-mouse`. It therefore cannot pass by
+falling back to PS/2. The gate requires both interfaces to enumerate, the
+desktop-ready marker, a visible launcher change after Super, a visible cursor
+move, and an empty QEMU guest-error log. This is a focused device-model proof,
+not physical-USB or generic-HID validation.
+
 Power on with the virtual CD connected. The legacy-BIOS path selects a VBE
 framebuffer when available and now starts the Xenith desktop. If VBE is
 unavailable, the loader deliberately falls back to VGA text and init starts
@@ -256,7 +272,11 @@ shell deliberately.
 For UEFI, use the same ISO, select **UEFI**, and leave Secure Boot disabled.
 The current ISO identified in [STATUS](STATUS.md) cold-booted in VMware
 Workstation 17.6.3 with 512 MiB and 3 vCPUs under both BIOS and UEFI on
-2026-07-20. Both reached `XENITH_DESKTOP_READY`, and all three CPUs came online.
+2026-07-20. Both reached `XENITH_DESKTOP_READY`, brought all three CPUs online,
+activated VMware SVGA II FIFO damage updates, discovered the virtual HDA codec,
+and started the xHCI MSI service worker. VMware exposed no USB boot-HID
+interfaces in those noninteractive runs; USB keyboard and mouse behavior is
+proven separately by the focused QEMU gate above.
 The preceding ISO also passed legacy-BIOS boots with 1, 3, 4, 8, 16, and 24
 vCPUs. The corresponding cores-per-socket values were 1, 1, 2, 4, 8, and 12;
 24 was the tested host's logical-CPU limit. See [STATUS](STATUS.md) for exact

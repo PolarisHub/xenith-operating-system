@@ -2,11 +2,12 @@
 
 `xenith-desktop` is the first allocation-free userspace owner of Xenith's
 framebuffer and desktop input session. It maps one native-format backbuffer,
-renders a procedural desktop, submits only bounded damaged rectangles, and
-contains an eight-client compositor coordinator. When idle it sleeps
-indefinitely in one multi-source `wait` across UI input and every live channel;
-there is no frame timer or polling loop. Normal launch allocates no compositor
-channel and starts no application.
+cover-crops the exact embedded 192x225 Sedat Bucan photo as its wallpaper,
+draws one neutral bottom bar and a restrained launcher, submits only bounded
+damaged rectangles, and contains an eight-client compositor coordinator. When
+idle it sleeps indefinitely in one multi-source `wait` across UI input and
+every live channel; there is no frame timer or polling loop. Normal launch
+allocates no compositor channel and starts no application.
 
 The coordinator retains at most eight surfaces and 64 MiB of mapped buffers
 per client, with a 256 MiB global mapping quota. It validates and isolates each
@@ -37,13 +38,23 @@ the packaged smoke below is currently the only live connection path.
 - Window smoke success markers: `XENITH_WINDOW_SMOKE_PRESENTED` and
   `XENITH_WINDOW_SMOKE_PASS`.
 
-The launcher can be toggled with either Super key or the dock button and
+The launcher can be toggled with either Super key or the bottom-bar button and
 closed with Escape. The smoke client is a test utility, not a default app.
+
+The kernel configures the PS/2 mouse for 4 counts/mm at 100 Hz, preserves
+in-flight framing across session changes, and resets corrupt packets reported
+by the controller. The desktop applies bounded Q8 fixed-point gain while
+retaining fractional motion.
+The Set-1 US keyboard uses a 250 ms typematic delay and 30 Hz repeat rate.
+The same seat also accepts xHCI direct-root-port USB boot-protocol keyboards
+and relative mice. USB keys use bounded software typematic, and device removal
+releases retained keys, modifiers, and buttons. Generic HID descriptors,
+absolute tablets, hubs, and non-xHCI host controllers remain unsupported.
 
 Input protocol limits remain explicit: no pointer enter/leave,
 client-requested capture, IME/composition, distinct logical key code,
 horizontal wheel, or dedicated key-overflow marker.
 
-At the integration resolution (320x200), the unobscured wallpaper pixel at
-`(0, 0)` is RGB `(12, 20, 42)`, or `0x000c142a` in XRGB8888. This is covered
-by the host renderer test and gives emulator gates a stable visual assertion.
+The checked-in PNG is the supplied source image. Its exact row-major RGB8
+decode is embedded for allocation-free bilinear sampling, and host tests cover
+the default sampler, cover-crop geometry, and bounded damaged rendering.

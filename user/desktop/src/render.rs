@@ -178,34 +178,40 @@ impl<'a> Surface<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Palette {
-    ink: Rgb,
-    muted: Rgb,
-    accent: Rgb,
-    accent_two: Rgb,
-    success: Rgb,
-}
+const INK: Rgb = Rgb::new(246, 246, 244);
+const MUTED: Rgb = Rgb::new(174, 174, 171);
+const BAR_TINT: Rgb = Rgb::new(16, 16, 16);
+const PANEL_TINT: Rgb = Rgb::new(22, 22, 21);
 
-impl Palette {
-    const DEFAULT: Self = Self {
-        ink: Rgb::new(239, 246, 255),
-        muted: Rgb::new(157, 173, 198),
-        accent: Rgb::new(77, 218, 255),
-        accent_two: Rgb::new(147, 102, 255),
-        success: Rgb::new(91, 232, 171),
-    };
+/// Allocation-free wallpaper source used by the software renderer.
+///
+/// The callback receives the destination pixel and full screen size, so an
+/// embedded image can implement focal-point cover cropping without allocating
+/// or resizing a frame ahead of time.
+pub type WallpaperSampler = fn(x: u32, y: u32, size: Size) -> [u8; 3];
+
+#[derive(Clone, Copy)]
+enum WallpaperSource {
+    Embedded,
+    Custom(WallpaperSampler),
 }
 
 pub struct Renderer {
-    palette: Palette,
+    wallpaper: WallpaperSource,
 }
 
 impl Renderer {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            palette: Palette::DEFAULT,
+            wallpaper: WallpaperSource::Embedded,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_wallpaper(wallpaper: WallpaperSampler) -> Self {
+        Self {
+            wallpaper: WallpaperSource::Custom(wallpaper),
         }
     }
 
@@ -229,14 +235,13 @@ impl Renderer {
         }
     }
 
-    /// Rebuild shell-owned glass, chrome, and cursor above client surfaces.
+    /// Rebuild the restrained shell bar, launcher, and cursor above clients.
     pub fn render_overlay(&self, surface: &mut Surface<'_>, state: &DesktopState, damage: &[Rect]) {
         for &rect in damage {
             let Some(clip) = rect.intersect(state.layout().screen) else {
                 continue;
             };
-            self.render_glass(surface, state, clip);
-            self.render_chrome(surface, state, clip);
+            self.render_shell(surface, state, clip);
             self.render_cursor(surface, state.cursor(), clip);
         }
     }
@@ -244,170 +249,92 @@ impl Renderer {
     fn render_wallpaper(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
         let right = clip.right() as i32;
         let bottom = clip.bottom() as i32;
-        for y in clip.y..bottom {
-            for x in clip.x..right {
-                let color = wallpaper(x as u32, y as u32, state.size());
-                surface.put(x, y, color);
-            }
+        match self.wallpaper {
+            WallpaperSource::Embedded => {
+                let wallpaper = crate::wallpaper::Sampler::new(state.size());
+                for y in clip.y..bottom {
+                    for x in clip.x..right {
+                        let [r, g, b] = wallpaper.sample(x as u32, y as u32);
+                        surface.put(x, y, Rgb::new(r, g, b));
+                    }
+                }
+            },
+            WallpaperSource::Custom(sample) => {
+                for y in clip.y..bottom {
+                    for x in clip.x..right {
+                        let [r, g, b] = sample(x as u32, y as u32, state.size());
+                        surface.put(x, y, Rgb::new(r, g, b));
+                    }
+                }
+            },
         }
     }
 
-    fn render_glass(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
+    fn render_shell(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
         let layout = state.layout();
-        apply_glass_panel(surface, layout.top_bar, 18, 145, clip);
-        apply_glass_panel(surface, layout.dock, 22, 165, clip);
+        apply_tint(surface, layout.dock, BAR_TINT, 188, clip);
+        fill_rect(
+            surface,
+            Rect::new(layout.dock.x, layout.dock.y, layout.dock.width, 1),
+            Rgb::new(78, 78, 76),
+            clip,
+        );
+
+        let button = layout.launcher_button;
         if state.launcher_open() {
-            apply_glass_panel(surface, layout.launcher, 24, 205, clip);
+            apply_tint_rounded(surface, button, 5, INK, 32, clip);
         }
-    }
-
-    fn render_chrome(&self, surface: &mut Surface<'_>, state: &DesktopState, clip: Rect) {
-        let layout = state.layout();
-        let compact = state.size().width < 520 || state.size().height < 300;
-        let top_icon = Rect::new(layout.top_bar.x + 12, layout.top_bar.y + 9, 25, 25);
-        draw_logo(surface, top_icon, clip, self.palette);
+        draw_mark(surface, button.inset((button.width / 4).max(3)), INK, clip);
         draw_text(
             surface,
             Point::new(
-                top_icon.x + 35,
-                layout.top_bar.y + if compact { 13 } else { 11 },
+                button.right() as i32 + 10,
+                layout.dock.y + layout.dock.height as i32 / 2 - 3,
             ),
-            if compact { 1 } else { 2 },
+            1,
             b"XENITH",
-            self.palette.ink,
+            INK,
             clip,
         );
-
-        let status_y = layout.top_bar.y + (layout.top_bar.height as i32 / 2) - 3;
-        let status_x = layout.top_bar.right() as i32 - if compact { 18 } else { 112 };
-        fill_circle(
-            surface,
-            Point::new(status_x, status_y + 3),
-            4,
-            self.palette.success,
-            clip,
-        );
-        if !compact {
-            draw_text(
-                surface,
-                Point::new(status_x + 12, status_y),
-                1,
-                b"SYSTEM READY",
-                self.palette.muted,
-                clip,
-            );
-        }
-
-        let button = layout.launcher_button;
-        fill_rounded(
-            surface,
-            button,
-            12,
-            if state.launcher_open() {
-                self.palette.accent_two
-            } else {
-                Rgb::new(29, 52, 79)
-            },
-            clip,
-        );
-        draw_logo(
-            surface,
-            button.inset((button.width / 4).max(3)),
-            clip,
-            self.palette,
-        );
-        if layout.dock.width >= 180 {
-            draw_text(
-                surface,
-                Point::new(
-                    button.right() as i32 + 16,
-                    layout.dock.y + layout.dock.height as i32 / 2 - 3,
-                ),
-                1,
-                b"NO APPS RUNNING",
-                self.palette.muted,
-                clip,
-            );
-        }
 
         if state.launcher_open() {
-            self.render_launcher(surface, layout.launcher, clip, compact);
+            self.render_launcher(surface, layout.launcher, clip);
         }
     }
 
-    fn render_launcher(&self, surface: &mut Surface<'_>, panel: Rect, clip: Rect, compact: bool) {
-        let padding = if compact { 14 } else { 22 };
-        let icon_size = if compact { 26 } else { 34 };
-        let icon = Rect::new(panel.x + padding, panel.y + padding, icon_size, icon_size);
-        draw_logo(surface, icon, clip, self.palette);
+    fn render_launcher(&self, surface: &mut Surface<'_>, panel: Rect, clip: Rect) {
+        apply_tint_rounded(surface, panel, 8, PANEL_TINT, 230, clip);
+        draw_rounded_outline(surface, panel, 8, Rgb::new(91, 91, 88), clip);
+        let padding = 16;
+        let icon = Rect::new(panel.x + padding, panel.y + padding, 22, 22);
+        draw_mark(surface, icon, INK, clip);
         draw_text(
             surface,
-            Point::new(icon.right() as i32 + 12, panel.y + padding + 2),
-            if compact { 1 } else { 2 },
+            Point::new(icon.right() as i32 + 10, panel.y + padding + 7),
+            1,
             b"XENITH",
-            self.palette.ink,
+            INK,
             clip,
         );
-        if !compact {
-            draw_text(
-                surface,
-                Point::new(icon.right() as i32 + 13, panel.y + padding + 22),
-                1,
-                b"WORKSPACE",
-                self.palette.muted,
-                clip,
-            );
-        }
-        let divider = Rect::new(
-            panel.x + padding,
-            panel.y + padding + icon_size as i32 + 16,
-            panel.width.saturating_sub((padding as u32) * 2),
-            1,
-        );
-        fill_rect(surface, divider, Rgb::new(61, 79, 108), clip);
-
-        let center_y = panel.y + panel.height as i32 / 2;
-        let empty = Rect::new(panel.x + padding, center_y - 18, 38, 38);
-        draw_empty_grid(surface, empty, clip, self.palette);
         draw_text(
             surface,
-            Point::new(empty.right() as i32 + 14, center_y - 10),
+            Point::new(panel.x + padding, panel.bottom() as i32 - padding - 7),
             1,
-            b"YOUR DESKTOP IS READY",
-            self.palette.ink,
+            b"NO APPLICATIONS INSTALLED",
+            MUTED,
             clip,
         );
-        if !compact {
-            draw_text(
-                surface,
-                Point::new(empty.right() as i32 + 14, center_y + 5),
-                1,
-                b"APPLICATIONS WILL APPEAR HERE",
-                self.palette.muted,
-                clip,
-            );
-        }
-        if panel.height >= 170 {
-            draw_text(
-                surface,
-                Point::new(panel.x + padding, panel.bottom() as i32 - padding - 7),
-                1,
-                b"SUPER OR CLICK TO CLOSE",
-                self.palette.muted,
-                clip,
-            );
-        }
     }
 
     fn render_cursor(&self, surface: &mut Surface<'_>, cursor: Point, clip: Rect) {
         draw_cursor_shape(
             surface,
             Point::new(cursor.x + 2, cursor.y + 3),
-            Rgb::new(0, 5, 13),
+            Rgb::new(0, 0, 0),
             clip,
         );
-        draw_cursor_outline(surface, cursor, Rgb::new(3, 12, 26), clip);
-        draw_cursor_shape(surface, cursor, self.palette.ink, clip);
+        draw_cursor_outline(surface, cursor, Rgb::new(7, 7, 7), clip);
+        draw_cursor_shape(surface, cursor, INK, clip);
     }
 }
 
@@ -417,93 +344,35 @@ impl Default for Renderer {
     }
 }
 
-fn wallpaper(x: u32, y: u32, size: Size) -> Rgb {
-    let height = size.height.max(1);
-    let t = y.saturating_mul(255) / height;
-    let mut color = Rgb::new(
-        (12u32.saturating_sub(t / 42)) as u8,
-        (20u32.saturating_sub(t / 28)) as u8,
-        (42u32.saturating_sub(t / 18)) as u8,
-    );
-    let cyan_center = Point::new((size.width * 4 / 5) as i32, (size.height / 5) as i32);
-    let violet_center = Point::new((size.width / 7) as i32, (size.height * 4 / 5) as i32);
-    color = radial_glow(
-        color,
-        x,
-        y,
-        cyan_center,
-        size.width.max(size.height) / 2,
-        Rgb::new(13, 173, 222),
-        92,
-    );
-    color = radial_glow(
-        color,
-        x,
-        y,
-        violet_center,
-        size.width.max(size.height) / 2,
-        Rgb::new(111, 58, 210),
-        78,
-    );
-    let grain = ((x.wrapping_mul(17) ^ y.wrapping_mul(29) ^ (x * y).wrapping_mul(3)) & 3) as u8;
-    color.blend(Rgb::new(18 + grain, 25 + grain, 43 + grain), 10)
-}
-
-fn radial_glow(
-    base: Rgb,
-    x: u32,
-    y: u32,
-    center: Point,
-    radius: u32,
-    color: Rgb,
-    maximum_alpha: u8,
-) -> Rgb {
-    if radius == 0 {
-        return base;
-    }
-    let dx = i64::from(x).abs_diff(i64::from(center.x));
-    let dy = i64::from(y).abs_diff(i64::from(center.y));
-    let distance = dx.max(dy).saturating_add(dx.min(dy) / 2);
-    if distance >= u64::from(radius) {
-        return base;
-    }
-    let strength = u64::from(radius) - distance;
-    let alpha = strength * u64::from(maximum_alpha) / u64::from(radius);
-    base.blend(color, alpha as u8)
-}
-
-fn glass_panel(mut base: Rgb, point: Point, panel: Rect, radius: u32, alpha: u8) -> Rgb {
-    if rounded_contains(panel.expand(8), radius + 8, point)
-        && !rounded_contains(panel, radius, point)
-    {
-        base = base.blend(Rgb::new(0, 2, 10), 35);
-    }
-    if rounded_contains(panel.expand(4), radius + 4, point)
-        && !rounded_contains(panel, radius, point)
-    {
-        base = base.blend(Rgb::new(0, 2, 10), 42);
-    }
-    if rounded_contains(panel, radius, point) {
-        base = base.blend(Rgb::new(20, 31, 52), alpha);
-        let inner = panel.inset(1);
-        if !inner.is_empty() && !rounded_contains(inner, radius.saturating_sub(1), point) {
-            base = base.blend(Rgb::new(151, 208, 238), 55);
-        } else if point.y <= panel.y.saturating_add(2) {
-            base = base.blend(Rgb::new(196, 226, 247), 24);
-        }
-    }
-    base
-}
-
-fn apply_glass_panel(surface: &mut Surface<'_>, panel: Rect, radius: u32, alpha: u8, clip: Rect) {
-    let Some(bounds) = panel.expand(8).intersect(clip) else {
+fn apply_tint(surface: &mut Surface<'_>, rect: Rect, color: Rgb, alpha: u8, clip: Rect) {
+    let Some(bounds) = rect.intersect(clip) else {
         return;
     };
     for y in bounds.y..bounds.bottom() as i32 {
         for x in bounds.x..bounds.right() as i32 {
-            let point = Point::new(x, y);
             let base = surface.get(x as u32, y as u32);
-            surface.put(x, y, glass_panel(base, point, panel, radius, alpha));
+            surface.put(x, y, base.blend(color, alpha));
+        }
+    }
+}
+
+fn apply_tint_rounded(
+    surface: &mut Surface<'_>,
+    rect: Rect,
+    radius: u32,
+    color: Rgb,
+    alpha: u8,
+    clip: Rect,
+) {
+    let Some(bounds) = rect.intersect(clip) else {
+        return;
+    };
+    for y in bounds.y..bounds.bottom() as i32 {
+        for x in bounds.x..bounds.right() as i32 {
+            if rounded_contains(rect, radius, Point::new(x, y)) {
+                let base = surface.get(x as u32, y as u32);
+                surface.put(x, y, base.blend(color, alpha));
+            }
         }
     }
 }
@@ -540,89 +409,60 @@ fn fill_rect(surface: &mut Surface<'_>, rect: Rect, color: Rgb, clip: Rect) {
     }
 }
 
-fn fill_rounded(surface: &mut Surface<'_>, rect: Rect, radius: u32, color: Rgb, clip: Rect) {
+fn draw_rounded_outline(
+    surface: &mut Surface<'_>,
+    rect: Rect,
+    radius: u32,
+    color: Rgb,
+    clip: Rect,
+) {
     let Some(bounds) = rect.intersect(clip) else {
         return;
     };
+    let inner = rect.inset(1);
     for y in bounds.y..bounds.bottom() as i32 {
         for x in bounds.x..bounds.right() as i32 {
-            if rounded_contains(rect, radius, Point::new(x, y)) {
+            let point = Point::new(x, y);
+            if rounded_contains(rect, radius, point)
+                && (inner.is_empty() || !rounded_contains(inner, radius.saturating_sub(1), point))
+            {
                 surface.put(x, y, color);
             }
         }
     }
 }
 
-fn fill_circle(surface: &mut Surface<'_>, center: Point, radius: i32, color: Rgb, clip: Rect) {
-    let bounds = Rect::new(
-        center.x - radius,
-        center.y - radius,
-        (radius * 2 + 1) as u32,
-        (radius * 2 + 1) as u32,
-    );
-    let Some(bounds) = bounds.intersect(clip) else {
-        return;
-    };
-    for y in bounds.y..bounds.bottom() as i32 {
-        for x in bounds.x..bounds.right() as i32 {
-            let dx = x - center.x;
-            let dy = y - center.y;
-            if dx * dx + dy * dy <= radius * radius {
-                surface.put(x, y, color);
-            }
-        }
-    }
-}
-
-fn draw_logo(surface: &mut Surface<'_>, bounds: Rect, clip: Rect, palette: Palette) {
+fn draw_mark(surface: &mut Surface<'_>, bounds: Rect, color: Rgb, clip: Rect) {
     if bounds.is_empty() {
         return;
     }
-    let gap = (bounds.width / 8).max(1);
+    let gap = (bounds.width.min(bounds.height) / 7).max(1);
     let tile_width = bounds.width.saturating_sub(gap) / 2;
     let tile_height = bounds.height.saturating_sub(gap) / 2;
     let tiles = [
-        (
-            Rect::new(bounds.x, bounds.y, tile_width, tile_height),
-            palette.accent,
+        Rect::new(bounds.x, bounds.y, tile_width, tile_height),
+        Rect::new(
+            bounds.x + tile_width as i32 + gap as i32,
+            bounds.y,
+            tile_width,
+            tile_height,
         ),
-        (
-            Rect::new(
-                bounds.x + tile_width as i32 + gap as i32,
-                bounds.y,
-                tile_width,
-                tile_height,
-            ),
-            Rgb::new(77, 160, 255),
+        Rect::new(
+            bounds.x,
+            bounds.y + tile_height as i32 + gap as i32,
+            tile_width,
+            tile_height,
         ),
-        (
-            Rect::new(
-                bounds.x,
-                bounds.y + tile_height as i32 + gap as i32,
-                tile_width,
-                tile_height,
-            ),
-            Rgb::new(97, 119, 255),
-        ),
-        (
-            Rect::new(
-                bounds.x + tile_width as i32 + gap as i32,
-                bounds.y + tile_height as i32 + gap as i32,
-                tile_width,
-                tile_height,
-            ),
-            palette.accent_two,
+        Rect::new(
+            bounds.x + tile_width as i32 + gap as i32,
+            bounds.y + tile_height as i32 + gap as i32,
+            tile_width,
+            tile_height,
         ),
     ];
-    for (rect, color) in tiles {
-        fill_rounded(surface, rect, (tile_width / 3).max(1), color, clip);
+    for rect in tiles {
+        fill_rect(surface, rect, color, clip);
     }
-}
-
-fn draw_empty_grid(surface: &mut Surface<'_>, bounds: Rect, clip: Rect, palette: Palette) {
-    fill_rounded(surface, bounds, 10, Rgb::new(34, 54, 82), clip);
-    let inner = bounds.inset(9);
-    draw_logo(surface, inner, clip, palette);
 }
 
 fn draw_text(
@@ -796,7 +636,31 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.iter().any(|byte| *byte != 0));
         let surface = Surface::new(&mut first, size, stride, rgb_format()).unwrap();
-        assert_eq!(surface.get(0, 0), Rgb::new(12, 20, 42));
+        let [r, g, b] = crate::wallpaper::Sampler::new(size).sample(0, 0);
+        assert_eq!(surface.get(0, 0), Rgb::new(r, g, b));
+    }
+
+    #[test]
+    fn custom_wallpaper_sampler_is_used_without_touching_pixels_outside_damage() {
+        fn solid(_: u32, _: u32, _: Size) -> [u8; 3] {
+            [23, 37, 41]
+        }
+
+        let size = Size::new(64, 48);
+        let stride = size.width as usize * 4;
+        let mut bytes = vec![0u8; stride * size.height as usize];
+        let state = DesktopState::new(size);
+        let renderer = Renderer::with_wallpaper(solid);
+        let damage = Rect::new(2, 3, 4, 5);
+        renderer.render_background(
+            &mut Surface::new(&mut bytes, size, stride, rgb_format()).unwrap(),
+            &state,
+            &[damage],
+        );
+        let surface = Surface::new(&mut bytes, size, stride, rgb_format()).unwrap();
+        assert_eq!(surface.get(2, 3), Rgb::new(23, 37, 41));
+        assert_eq!(surface.get(5, 7), Rgb::new(23, 37, 41));
+        assert_eq!(surface.get(1, 3), Rgb::default());
     }
 
     #[test]
@@ -849,6 +713,11 @@ mod tests {
         let layout = Layout::new(Size::new(320, 200));
         assert!(layout.launcher.width >= 280);
         assert!(layout.launcher.height >= 70);
+        assert_eq!(layout.top_bar, layout.dock);
+        assert_eq!(layout.dock.x, 0);
+        assert_eq!(layout.dock.right(), layout.screen.right());
+        assert_eq!(layout.dock.bottom(), layout.screen.bottom());
+        assert!(layout.launcher.bottom() <= i64::from(layout.dock.y));
         let mut damage = DamageTracker::new(layout.screen);
         damage.add(layout.launcher.expand(10));
         assert!(!damage.is_full());

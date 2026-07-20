@@ -6,9 +6,10 @@ The packaged runtime still opens only one opt-in smoke connection. Independent
 correctness and application-platform work remains ordered by runtime impact.
 Completed work such as COW fork, `/dev/pts`, SSDT loading, NIC interrupt mode,
 XenithFS flush barriers, SMP bring-up, native framebuffer-format handling, the
-exclusive UI-session ABI, allocation-free glass desktop, transactional
-restricted spawn actions, and last-thread address-space teardown are not
-repeated as future work.
+exclusive UI-session ABI, allocation-free photo-backed desktop, transactional
+restricted spawn actions, last-thread address-space teardown, bounded xHCI
+direct-port boot HID, HDA command transport, and VMware SVGA II FIFO damage
+updates are not repeated as future work.
 
 1. Add compositor service identity, rendezvous, and admission. Use the existing
    restricted-spawn actions to grant each child exactly one least-rights client
@@ -52,10 +53,13 @@ repeated as future work.
 9. Add booted-guest fault injection for user-copy fixups, COW write faults,
    signal-frame/xstate restoration, realtime queue pressure, and fork/exec
    rollback so host structural tests are backed by adversarial runtime proof.
-10. Add a frame-pacing or vsync contract where hardware permits it, and measured
-   physical-display/input validation before claiming broad hardware performance
-   or compatibility. PAT write-combining for the current CPU-copy scanout path
-   is complete.
+10. Extend hardware coverage without weakening the bounded native-driver
+   contracts: add USB hubs and selected mass-storage classes, complete HDA codec
+   topology routing and scheduled PCM playback, and add display page-flipping
+   or vsync where hardware permits it. Then validate physical USB, audio,
+   display, and input devices before claiming broad compatibility. PAT
+   write-combining and VMware SVGA II FIFO damage updates are complete; neither
+   is a generic GPU stack.
 11. Add MSI-X table programming and IPv6/AF_INET6, then extend TCP with SACK and
    window scaling and DNS with TCP fallback. Validate both supported physical
    NIC drivers or equivalent exact device models under interrupt load.

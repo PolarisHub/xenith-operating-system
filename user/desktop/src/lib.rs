@@ -2,16 +2,18 @@
 //!
 //! The runtime owns one anonymous native-format backbuffer. Every input batch
 //! mutates [`DesktopState`], collects a bounded set of damaged rectangles, and
-//! asks [`Renderer`] to reconstruct only those pixels from procedural layers.
+//! asks [`Renderer`] to reconstruct only those pixels from the embedded photo,
+//! client surfaces, one restrained shell bar, and the cursor.
 
 #![no_std]
 
 pub mod compositor;
 mod render;
+mod wallpaper;
 #[cfg(test)]
 mod window_smoke_render;
 
-pub use render::{PixelFormat, RenderError, Renderer, Surface};
+pub use render::{PixelFormat, RenderError, Renderer, Surface, WallpaperSampler};
 use xenith_abi::{
     UiInputEvent, UiRect, UI_EVENT_FLAG_OVERFLOW, UI_EVENT_FLAG_PRESSED, UI_EVENT_FLAG_REPEAT,
     UI_EVENT_KEY, UI_EVENT_POINTER, UI_MODIFIER_LEFT_ALT, UI_MODIFIER_LEFT_CTRL,
@@ -193,41 +195,28 @@ impl Layout {
         let width = size.width.max(1);
         let height = size.height.max(1);
         let screen = Rect::new(0, 0, width, height);
-        let preferred_margin = if width >= 640 && height >= 480 { 16 } else { 8 };
-        let margin = preferred_margin
-            .min(width.saturating_sub(1) / 2)
-            .min(height.saturating_sub(1) / 2);
-        let top_height = (if height >= 360 { 44 } else { 34 })
-            .min(height.saturating_sub(margin * 2))
-            .max(1);
-        let top_width = width.saturating_sub(margin * 2).max(1);
-        let top_bar = Rect::new(margin as i32, margin as i32, top_width, top_height);
-
-        let dock_height = (if height >= 360 { 58 } else { 46 })
-            .min(height.saturating_sub(margin * 2))
-            .max(1);
-        let dock_width = width.saturating_sub(margin * 2).clamp(1, 300);
-        let dock_x = width.saturating_sub(dock_width) / 2;
-        let dock_y = height.saturating_sub(margin + dock_height);
-        let dock = Rect::new(dock_x as i32, dock_y as i32, dock_width, dock_height);
-        let button_margin =
-            (if dock_height >= 58 { 9 } else { 6 }).min(dock_height.saturating_sub(1) / 2);
-        let button_size = dock_height.saturating_sub(button_margin * 2).max(1);
+        let bar_height = (if height >= 360 { 38 } else { 32 }).min(height).max(1);
+        let bar_y = height.saturating_sub(bar_height);
+        let dock = Rect::new(0, bar_y as i32, width, bar_height);
+        // Keep the legacy top-bar hit region as an alias of the sole shell bar.
+        // This preserves shell pointer capture without an invisible region.
+        let top_bar = dock;
+        let button_margin = 5.min(bar_height.saturating_sub(1) / 2);
+        let button_size = bar_height.saturating_sub(button_margin * 2).max(1);
         let launcher_button = Rect::new(
-            (dock_x + button_margin) as i32,
-            (dock_y + button_margin) as i32,
+            button_margin as i32,
+            (bar_y + button_margin) as i32,
             button_size,
             button_size,
         );
 
-        let launcher_width = width.saturating_sub(margin * 2).clamp(1, 380);
-        let available_height = dock_y
-            .saturating_sub(top_bar.bottom().max(0) as u32)
-            .saturating_sub(margin * 2);
-        let launcher_height = available_height.clamp(1, 420);
-        let launcher_x = margin;
-        let launcher_y = dock_y
-            .saturating_sub(margin)
+        let panel_margin = 8.min(width.saturating_sub(1) / 2);
+        let launcher_width = width.saturating_sub(panel_margin * 2).clamp(1, 300);
+        let available_height = bar_y.saturating_sub(panel_margin);
+        let launcher_height = available_height.clamp(1, 96);
+        let launcher_x = panel_margin;
+        let launcher_y = bar_y
+            .saturating_sub(panel_margin)
             .saturating_sub(launcher_height);
         let launcher = Rect::new(
             launcher_x as i32,
@@ -258,8 +247,11 @@ pub struct DesktopState {
     size: Size,
     layout: Layout,
     cursor: Point,
+    cursor_x_q8: i64,
+    cursor_y_q8: i64,
     buttons: u16,
     shell_pointer_buttons: u16,
+    pointer_resync: bool,
     suppressed_key: u32,
     launcher_open: bool,
 }
@@ -268,12 +260,16 @@ impl DesktopState {
     #[must_use]
     pub fn new(size: Size) -> Self {
         let layout = Layout::new(size);
+        let cursor = Point::new((size.width / 2) as i32, (size.height / 2) as i32);
         Self {
             size,
             layout,
-            cursor: Point::new((size.width / 2) as i32, (size.height / 2) as i32),
+            cursor,
+            cursor_x_q8: i64::from(cursor.x) << POINTER_FRACTION_BITS,
+            cursor_y_q8: i64::from(cursor.y) << POINTER_FRACTION_BITS,
             buttons: 0,
             shell_pointer_buttons: 0,
+            pointer_resync: false,
             suppressed_key: 0,
             launcher_open: false,
         }
@@ -312,7 +308,9 @@ impl DesktopState {
     pub fn handle_event(&mut self, event: UiInputEvent, damage: &mut DamageTracker) -> EventAction {
         if event.flags & UI_EVENT_FLAG_OVERFLOW != 0 {
             damage.mark_full();
+            self.buttons = 0;
             self.shell_pointer_buttons = 0;
+            self.pointer_resync = true;
             self.suppressed_key = 0;
         }
         match event.kind {
@@ -324,16 +322,35 @@ impl DesktopState {
 
     fn handle_pointer(&mut self, event: UiInputEvent, damage: &mut DamageTracker) -> EventAction {
         let old_cursor = self.cursor_damage();
-        let dx = accelerate_axis(event.value1);
-        let dy = accelerate_axis(event.value2);
         let max_x = self.size.width.saturating_sub(1).min(i32::MAX as u32) as i32;
         let max_y = self.size.height.saturating_sub(1).min(i32::MAX as u32) as i32;
-        self.cursor.x = self.cursor.x.saturating_add(dx).clamp(0, max_x);
-        self.cursor.y = self.cursor.y.saturating_add(dy).clamp(0, max_y);
+        self.cursor_x_q8 = move_pointer_axis(self.cursor_x_q8, event.value1, max_x);
+        self.cursor_y_q8 = move_pointer_axis(self.cursor_y_q8, event.value2, max_y);
+        self.cursor.x = pointer_pixel(self.cursor_x_q8, max_x);
+        self.cursor.y = pointer_pixel(self.cursor_y_q8, max_y);
         let new_cursor = self.cursor_damage();
         if old_cursor != new_cursor {
             damage.add(old_cursor);
             damage.add(new_cursor);
+        }
+
+        let over_shell = self.layout.top_bar.contains(self.cursor)
+            || self.layout.dock.contains(self.cursor)
+            || self.launcher_open && self.layout.launcher.contains(self.cursor);
+        if self.pointer_resync {
+            // The queue no longer proves which transitions were dropped. Use
+            // the current mask as a baseline, but never turn a surviving held
+            // button into a new shell press. Normal edges resume only after a
+            // release snapshot; the compositor applies the same policy.
+            self.buttons = event.buttons;
+            if event.buttons == 0 {
+                self.pointer_resync = false;
+            }
+            return if over_shell {
+                EventAction::Consumed
+            } else {
+                EventAction::Continue
+            };
         }
 
         let old_left = self.buttons & UI_POINTER_BUTTON_LEFT != 0;
@@ -341,9 +358,6 @@ impl DesktopState {
         let old_buttons = self.buttons;
         let newly_pressed = (old_buttons ^ event.buttons) & event.buttons;
         let shell_had_capture = self.shell_pointer_buttons != 0;
-        let over_shell = self.layout.top_bar.contains(self.cursor)
-            || self.layout.dock.contains(self.cursor)
-            || self.launcher_open && self.layout.launcher.contains(self.cursor);
         if shell_had_capture {
             self.shell_pointer_buttons |= newly_pressed;
         } else if old_buttons == 0 && newly_pressed != 0 && over_shell {
@@ -404,16 +418,30 @@ impl DesktopState {
     }
 }
 
-fn accelerate_axis(value: i32) -> i32 {
+const POINTER_FRACTION_BITS: u32 = 8;
+const POINTER_ONE: i64 = 1 << POINTER_FRACTION_BITS;
+
+/// Apply a continuous, bounded pointer gain in Q8 fixed point.
+///
+/// One-count motion remains effectively one pixel, while faster packets rise
+/// gradually to 2x instead of jumping between the old 1x/2x/3x tiers. Keeping
+/// the fractional remainder makes slow diagonal and VMware relative motion
+/// feel consistent without allocating or running a timer-driven filter.
+fn accelerate_axis_q8(value: i32) -> i64 {
     let magnitude = value.unsigned_abs();
-    let factor = if magnitude <= 2 {
-        1
-    } else if magnitude <= 8 {
-        2
-    } else {
-        3
-    };
-    value.saturating_mul(factor)
+    let gain_q8 = POINTER_ONE + i64::from(magnitude.min(16)) * 16;
+    i64::from(value).saturating_mul(gain_q8)
+}
+
+fn move_pointer_axis(current_q8: i64, delta: i32, maximum: i32) -> i64 {
+    current_q8
+        .saturating_add(accelerate_axis_q8(delta))
+        .clamp(0, i64::from(maximum) << POINTER_FRACTION_BITS)
+}
+
+fn pointer_pixel(position_q8: i64, maximum: i32) -> i32 {
+    ((position_q8.saturating_add(POINTER_ONE / 2)) >> POINTER_FRACTION_BITS)
+        .clamp(0, i64::from(maximum)) as i32
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -508,6 +536,12 @@ mod tests {
         }
     }
 
+    fn place_cursor(state: &mut DesktopState, point: Point) {
+        state.cursor = point;
+        state.cursor_x_q8 = i64::from(point.x) << POINTER_FRACTION_BITS;
+        state.cursor_y_q8 = i64::from(point.y) << POINTER_FRACTION_BITS;
+    }
+
     #[test]
     fn damage_clips_and_merges_touching_regions() {
         let mut damage = DamageTracker::new(Rect::new(0, 0, 100, 80));
@@ -529,11 +563,94 @@ mod tests {
     }
 
     #[test]
+    fn stationary_pointer_events_never_drift() {
+        let mut state = DesktopState::new(Size::new(800, 600));
+        let origin = state.cursor();
+        let mut damage = DamageTracker::new(state.layout().screen);
+        for _ in 0..1_000 {
+            assert_eq!(
+                state.handle_event(pointer(0, 0, 0), &mut damage),
+                EventAction::Continue
+            );
+        }
+        assert_eq!(state.cursor(), origin);
+        assert!(damage.is_empty());
+    }
+
+    #[test]
+    fn fractional_gain_accumulates_symmetrically() {
+        let mut state = DesktopState::new(Size::new(800, 600));
+        let origin = state.cursor();
+        let mut damage = DamageTracker::new(state.layout().screen);
+        for _ in 0..16 {
+            state.handle_event(pointer(1, 0, 0), &mut damage);
+        }
+        assert_eq!(state.cursor(), Point::new(origin.x + 17, origin.y));
+        for _ in 0..16 {
+            state.handle_event(pointer(-1, 0, 0), &mut damage);
+        }
+        assert_eq!(state.cursor(), origin);
+
+        damage.clear();
+        for _ in 0..64 {
+            state.handle_event(pointer(0, 0, 0), &mut damage);
+        }
+        assert_eq!(state.cursor(), origin);
+        assert!(damage.is_empty());
+    }
+
+    #[test]
+    fn overflow_releases_local_pointer_button_state() {
+        let mut state = DesktopState::new(Size::new(800, 600));
+        let mut damage = DamageTracker::new(state.layout().screen);
+        state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage);
+        assert_eq!(state.buttons, UI_POINTER_BUTTON_LEFT);
+        state.handle_event(
+            UiInputEvent {
+                flags: UI_EVENT_FLAG_OVERFLOW,
+                ..UiInputEvent::default()
+            },
+            &mut damage,
+        );
+        assert_eq!(state.buttons, 0);
+        assert_eq!(state.shell_pointer_buttons, 0);
+        assert!(state.pointer_resync);
+        state.handle_event(pointer(0, 0, 0), &mut damage);
+        assert!(!state.pointer_resync);
+    }
+
+    #[test]
+    fn overflow_never_turns_a_held_button_into_a_launcher_click() {
+        let mut state = DesktopState::new(Size::new(800, 600));
+        let button = state.layout().launcher_button;
+        place_cursor(&mut state, Point::new(button.x + 1, button.y + 1));
+        let mut damage = DamageTracker::new(state.layout().screen);
+
+        let held_overflow = UiInputEvent {
+            flags: UI_EVENT_FLAG_OVERFLOW,
+            ..pointer(0, 0, UI_POINTER_BUTTON_LEFT)
+        };
+        assert_eq!(
+            state.handle_event(held_overflow, &mut damage),
+            EventAction::Consumed
+        );
+        assert!(!state.launcher_open());
+        assert!(state.pointer_resync);
+
+        state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage);
+        assert!(!state.launcher_open());
+        state.handle_event(pointer(0, 0, 0), &mut damage);
+        assert!(!state.pointer_resync);
+        state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage);
+        assert!(state.launcher_open());
+    }
+
+    #[test]
     fn launcher_button_uses_a_press_edge() {
         let mut state = DesktopState::new(Size::new(1024, 768));
         let button = state.layout().launcher_button;
         let target = Point::new(button.x + 2, button.y + 2);
-        state.cursor = target;
+        place_cursor(&mut state, target);
         let mut damage = DamageTracker::new(state.layout().screen);
         assert_eq!(
             state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
@@ -594,13 +711,13 @@ mod tests {
     fn shell_pointer_capture_and_escape_release_do_not_leak_to_clients() {
         let mut state = DesktopState::new(Size::new(1024, 768));
         let button = state.layout().launcher_button;
-        state.cursor = Point::new(button.x + 1, button.y + 1);
+        place_cursor(&mut state, Point::new(button.x + 1, button.y + 1));
         let mut damage = DamageTracker::new(state.layout().screen);
         assert_eq!(
             state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
             EventAction::Consumed
         );
-        state.cursor = Point::new(500, 300);
+        place_cursor(&mut state, Point::new(500, 300));
         assert_eq!(
             state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
             EventAction::Consumed

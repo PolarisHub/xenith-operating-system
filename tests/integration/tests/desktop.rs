@@ -56,8 +56,8 @@ fn desktop_renders_stays_stable_and_falls_back_to_shell() {
     let first_pixel = &desktop_pixels[..3];
     assert_eq!(
         first_pixel,
-        &[12, 20, 42],
-        "desktop did not present its native midnight background at the unobscured origin"
+        &[186, 183, 176],
+        "desktop did not present the embedded Sedat photo at the unobscured origin"
     );
     assert!(
         (3..desktop_pixels.len())

@@ -392,6 +392,14 @@ impl PciDevice {
         if index >= 6 {
             return None;
         }
+        if self.bar_is_high_half(index) {
+            return Some(PciBarInfo {
+                index,
+                kind: PciBarKind::Reserved,
+                prefetchable: false,
+                address: 0,
+            });
+        }
         let raw = self.bars[index as usize];
         // An unimplemented BAR reads back 0; surface it as a zero-address
         // 32-bit mem BAR so callers reading kind/prefetchable unconditionally
@@ -412,13 +420,21 @@ impl PciDevice {
         } else {
             let kind = match (raw >> 1) & 0b11 {
                 0b00 => PciBarKind::Mem32,
-                0b01 => PciBarKind::Mem64,
-                0b10 => PciBarKind::Mem16,
+                // PCI type 01b is the obsolete memory BAR restricted below
+                // 1 MiB. Type 10b, not 01b, consumes the following dword as
+                // the high half of a 64-bit address.
+                0b01 => PciBarKind::Mem16,
+                0b10 if (index as usize) < 5 => PciBarKind::Mem64,
+                // A 64-bit BAR in the final slot has no high dword and is a
+                // malformed header. Surface it as reserved instead of
+                // silently truncating the device address to 32 bits.
+                0b10 => PciBarKind::Reserved,
                 _ => PciBarKind::Reserved,
             };
             let prefetchable = raw & 0x8 != 0;
-            // A 64-bit BAR consumes the next slot for its high dword; if this
-            // is the last slot there is no high half, so treat as 32-bit.
+            // A validated 64-bit BAR consumes the next slot for its high
+            // dword. A final-slot 64-bit encoding was classified Reserved
+            // above and therefore cannot be truncated here.
             let address = match kind {
                 PciBarKind::Mem64 if (index as usize) < 5 => {
                     let high = self.bars[(index + 1) as usize] as u64;
@@ -443,9 +459,25 @@ impl PciDevice {
         if index == 0 || index >= 6 {
             return false;
         }
-        let prev = self.bars[(index - 1) as usize];
-        // A 64-bit memory BAR has bit 0 clear and type bits [2:1] == 0b01.
-        prev & 0x1 == 0 && (prev >> 1) & 0b11 == 0b01
+        // Walk from BAR0 so incidental type bits in a 64-bit BAR's high
+        // address dword can never consume another slot.
+        let mut slot = 0u8;
+        while slot < 6 {
+            let raw = self.bars[slot as usize];
+            let consumes_next = raw & 0x1 == 0 && (raw >> 1) & 0b11 == 0b10 && slot < 5;
+            if consumes_next {
+                if slot + 1 == index {
+                    return true;
+                }
+                slot += 2;
+            } else {
+                if slot >= index {
+                    return false;
+                }
+                slot += 1;
+            }
+        }
+        false
     }
 }
 
@@ -698,4 +730,76 @@ pub fn enumerate_and_bind() -> usize {
         probe_devices(&devices);
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device_with_bars(bars: [u32; 6]) -> PciDevice {
+        PciDevice {
+            address: PciAddress::new(0, 1, 0).expect("bounded test BDF"),
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            revision: 0,
+            prog_if: 0,
+            subclass: 0,
+            base_class: 0,
+            header_kind: PciHeaderKind::Device,
+            multifunction: false,
+            bars,
+            interrupt_line: 0,
+            interrupt_pin: 0,
+        }
+    }
+
+    #[test]
+    fn memory_bar_type_bits_follow_pci_encoding() {
+        let device = device_with_bars([
+            0x3456_7004, // type 10b: 64-bit memory BAR
+            0x0000_0012,
+            0x000f_f002, // type 01b: below-1-MiB memory BAR
+            0x8765_4006, // type 11b: reserved
+            0,
+            0,
+        ]);
+
+        let wide = device.bar(0).expect("BAR0 exists");
+        assert_eq!(wide.kind, PciBarKind::Mem64);
+        assert_eq!(wide.address, 0x0000_0012_3456_7000);
+        assert!(device.bar_is_high_half(1));
+        let wide_high = device.bar(1).expect("BAR1 exists");
+        assert_eq!(wide_high.kind, PciBarKind::Reserved);
+        assert_eq!(wide_high.address, 0);
+
+        let legacy = device.bar(2).expect("BAR2 exists");
+        assert_eq!(legacy.kind, PciBarKind::Mem16);
+        assert_eq!(legacy.address, 0x000f_f000);
+        assert!(!device.bar_is_high_half(3));
+
+        assert_eq!(
+            device.bar(3).expect("BAR3 exists").kind,
+            PciBarKind::Reserved
+        );
+    }
+
+    #[test]
+    fn final_slot_cannot_truncate_a_64_bit_bar() {
+        let device = device_with_bars([0, 0, 0, 0, 0, 0x1234_5004]);
+        let final_bar = device.bar(5).expect("BAR5 exists");
+        assert_eq!(final_bar.kind, PciBarKind::Reserved);
+        assert_eq!(final_bar.address, 0x1234_5000);
+        assert!(!device.bar_is_high_half(5));
+    }
+
+    #[test]
+    fn high_dword_type_bits_cannot_consume_the_following_bar() {
+        let device = device_with_bars([0x3456_7004, 0x0000_0004, 0x0000_c001, 0, 0, 0]);
+
+        assert!(device.bar_is_high_half(1));
+        assert!(!device.bar_is_high_half(2));
+        let bar2 = device.bar(2).expect("BAR2 exists");
+        assert_eq!(bar2.kind, PciBarKind::Io);
+        assert_eq!(bar2.address, 0x0000_c000);
+    }
 }

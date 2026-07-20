@@ -49,6 +49,21 @@ a boot result, and an internal firmware model is not a physical-machine result.
   single-vector MSI, and routed INTx. RTL8139/e1000 use bounded hard-IRQ cause
   handling with an autonomous polling fallback. AHCI exposes DMA sector I/O
   and cache flush.
+- The xHCI driver performs bounded BIOS ownership handoff, controller and
+  root-port reset, command/event/transfer ring management, Supported Protocol
+  speed and slot-type resolution, direct-port device enumeration, and USB
+  boot-protocol keyboard/mouse interrupt input. MSI is preferred, with one
+  4 ms task-context polling worker as the fallback. Disconnect teardown
+  releases retained input state before reusing each slot's fixed DMA window.
+  Hubs, other host-controller families, arbitrary HID descriptors, mass
+  storage, USB audio, and isochronous transfers are not implemented.
+- The HDA driver brings compatible PCI controllers to D0, validates BAR and
+  stream geometry, resets the link, operates CORB/RIRB DMA, queries codec and
+  function-group identity, and exposes a checked BDL/PCM stream scaffold. It
+  does not yet route a codec output path or produce audible PCM. VMware SVGA II
+  `15ad:0405` attachment validates the boot mode and FIFO, and the UI submits
+  bounded damage `UPDATE` commands only when that frontbuffer exactly matches
+  the boot framebuffer. CPU copying remains authoritative.
 - XenithFS shares its disk format with `xenith-mkfs` and `xenith-fsck`. Journal
   commit ordering and filesystem sync issue block-device flush barriers;
   focused memory-disk tests cover persistent-tree replay and remount.
@@ -92,12 +107,13 @@ a boot result, and an internal firmware model is not a physical-machine result.
 - Freestanding init, graphical desktop, opt-in window smoke, native thread
   smoke, bounded Win64 console host and fixture, shell, coreutils, editor,
   network tools, examples, `libuser`, and the C ABI runtime are packaged. The
-  desktop owns one native-format backbuffer, renders glass chrome procedurally,
-  tracks at most 12 merged damage rectangles, consumes fixed input batches, and
-  parks indefinitely when idle. Init supervises it and restores `/bin/sh` on
-  missing framebuffer, clean recovery, or failure. The shell supports pipelines,
-  redirection, quoting, background jobs, sessions/process groups, and terminal
-  job control. The shipped `/bin/c-demo` is compiled through
+  desktop owns one native-format backbuffer, cover-crops the exact embedded
+  Sedat Bucan photo, renders one neutral bottom bar and restrained launcher,
+  tracks at most 12 merged damage rectangles, consumes fixed input batches,
+  and parks indefinitely when idle. Init supervises it and restores `/bin/sh`
+  on missing framebuffer, clean recovery, or failure. The shell supports
+  pipelines, redirection, quoting, background jobs, sessions/process groups,
+  and terminal job control. The shipped `/bin/c-demo` is compiled through
   `xenith-cc` -> `xenith-asm` -> `xenith-ld`.
 - The display boundary exposes one process-owned framebuffer/input session
   through syscalls 54-57 and matching `libuser` wrappers. Presentation
@@ -108,7 +124,9 @@ a boot result, and an internal firmware model is not a physical-machine result.
   terminal retains its model while suspended and is fully restored on release.
   Event waits use a lost-wake-safe scheduler handoff with no 10 ms polling, and
   PAT-capable CPUs map scanout write-combining with cache-safe WBINVD/SFENCE
-  ordering.
+  ordering. The PS/2 mouse runs at 4 counts/mm and 100 Hz with packet
+  re-synchronization; PS/2 and USB keyboards use 250 ms/30 Hz typematic.
+  Direct-root-port xHCI boot keyboards and relative mice feed the same seat.
 - Kernel logging and userspace TTY output share one COM1 serialization lock, so
   exact runtime markers cannot interleave across CPUs on the physical UART.
 - Syscalls 58-63 provide bounded local channels, transactional attenuated
@@ -192,7 +210,9 @@ the current build.
 | `kernel_reaches_userspace_shell` | Direct kernel/initramfs load reaches ring-3 init and `xenith$` | PASS (2026-07-20) |
 | `shell_executes_builtins_and_coreutils_via_ps2` | PS/2 input drives the shell, coreutils, filesystem mutations, VM/RNG, and the ring-3 signal smoke | PASS (2026-07-20) |
 | `ring3_ui_smoke_restores_framebuffer_terminal` | Ring 3 acquires scanout, presents full and damaged frames, polls input, releases/unmaps, and the kernel terminal resumes drawing | PASS (2026-07-20) |
-| `desktop_renders_stays_stable_and_falls_back_to_shell` | Init starts the desktop; it presents the exact non-flat shell, handles Super through partial damage, reaches repeated halted idle states, survives a bounded idle window, releases cleanly on recovery input, then restores the shell and terminal framebuffer | PASS (2026-07-20) |
+| `desktop_renders_stays_stable_and_falls_back_to_shell` | Init starts the desktop; it presents the photo-backed neutral shell, handles Super through partial damage, reaches repeated halted idle states, survives a bounded idle window, releases cleanly on recovery input, then restores the shell and terminal framebuffer | PASS (2026-07-20) |
+| External QEMU xHCI boot-HID gate | A q35 VM with `i8042=off` cold-boots the exact ISO on 3 vCPUs, binds `qemu-xhci` through MSI, enumerates `usb-kbd` and `usb-mouse`, opens the launcher from an injected Super key, moves the visible cursor, and records no QEMU guest error | PASS (2026-07-20) |
+| External VMware BIOS/UEFI hardware gate | VMware Workstation cold-boots the exact ISO with 512 MiB and 3 vCPUs under legacy BIOS and UEFI, brings 3/3 CPUs online, reaches the desktop, drives SVGA II FIFO damage updates, discovers the HDA codec through CORB/RIRB, and starts the xHCI MSI service worker | PASS (2026-07-20) |
 | `opt_in_window_client_completes_shared_buffer_protocol` | With three CPUs online, the explicit desktop smoke mode restricted-spawns one native client with only stdout/stderr/endpoint 3, maps its attenuated shared buffer, composites client pixels, completes configure/release/frame events, disconnects, and reaps the child | PASS (2026-07-20) |
 | `userspace_threads_create_join_and_teardown_in_guest` | With three CPUs online, `/bin/thread-smoke` maps two private stacks, runs two simultaneous workers with distinct task IDs, joins exit codes 41/42, verifies shared atomic state, and unmaps both stacks | PASS (2026-07-20) |
 | `win64_console_fixture_executes_through_booted_host` | The packaged PE fixture is forced off its preferred base, validates the applied DIR64 relocation, enters through `/bin/xenith-winhost` on its guarded stack, calls the bootstrap console shim, exits, and returns to the shell | PASS (2026-07-20) |
@@ -220,12 +240,12 @@ promoted to a guest runtime result.
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `build/xenith.iso` | 24,723,456 | `DD64844F15ECCB7285DDC51ED988316DE2210213524CB509F71984786C04DBD2` |
-| `build/xenith.img` | 3,792,896 | `9AAE4CA0413300140E519E57A19DA378C0745F45B384CAC8950DA9A20088CECB` |
-| `build/kernel.elf` | 3,417,584 | `E1534A637724114044271F78EA7079E4CF9D69F37AC8C1103E7CDC97D65903A2` |
-| `build/initramfs.cpio` | 351,924 | `A8B2A487DEFD6DC2C5A568B40EF13E70B192D18ACED882EB8CDE0A19BE65612B` |
+| `build/xenith.iso` | 25,704,448 | `8FCC3B663A6F6546403AE79BD2EE0C5C4897C431344FEE912D69F00BACC6E28C` |
+| `build/xenith.img` | 4,255,744 | `6F0B7D7AC78EA960E53ABEFB0BABA554AA8913EECFF395ED724AAF7CFCC14F4C` |
+| `build/kernel.elf` | 3,754,680 | `FD99888065C34FD9DBE118E99B7824FF51E9020448D412921038D47B2A0C4430` |
+| `build/initramfs.cpio` | 477,804 | `B0A563A23A00A870A7714C062ADB7F3CE8A8D6968E3E1C36FB369F5FDA417BED` |
 | `build/bootloader/BOOTX64.EFI` | 624,640 | `7E57B129424F47FF85BDA6164946BFA7D5A5E101768B0EFCD9E27A4C90649676` |
-| `build/user/xenith-desktop` | 99,832 | `961E8020DCB9074631FD892FA92BB9FA2DD0A6F5109D60F1216B2104A25709E8` |
+| `build/user/xenith-desktop` | 225,712 | `B3E60F1530A75017E0956FFA8FA49923191634C1154F35BCB22DAA7547B8BA10` |
 
 The exact ISO above cold-booted in VMware Workstation 17.6.3 on 2026-07-20
 with 512 MiB RAM and 3 vCPUs under both legacy BIOS and UEFI with Secure Boot
@@ -233,7 +253,12 @@ disabled. Both firmware paths brought all three CPUs online, initialized a
 framebuffer, spawned `/init` and `/bin/xenith-desktop`, and reached
 `XENITH_DESKTOP_READY` on COM1. The legacy path additionally recorded packaged
 stage2 entering long mode and selecting VBE; the UEFI path executed the ISO's
-EFI boot entry.
+EFI boot entry. Both runs attached VMware SVGA II at 1024x768x32 and activated
+FIFO damage updates, discovered codec `15ad1975` through the `15ad:1977` HDA
+controller with 256-entry CORB/RIRB rings, and started the VMware xHCI 1.20 MSI
+service worker. VMware exposed no USB boot-HID interface in these noninteractive
+runs, so the QEMU gate above remains the direct proof of USB keyboard and mouse
+input rather than PS/2 fallback.
 
 Earlier VMware legacy-BIOS cold boots passed with 1, 3, 4, 8, 16, and 24
 vCPUs. QEMU 11.0.50 with SeaBIOS 1.17 also passed every integer CPU count from
@@ -259,14 +284,16 @@ ordering.
   its BIOS and UEFI implementations at three vCPUs; the wider VMware and
   QEMU/SeaBIOS CPU matrices belong to the preceding artifact. None establishes
   physical-PC compatibility or coverage across arbitrary firmware; physical
-  AHCI/NVMe/USB boot, NICs, display/input, ACPI quirks, and cache-flush behavior
-  remain hardware-validation work.
+  AHCI/NVMe/USB boot, NICs, physical display/input/audio, ACPI quirks, and
+  cache-flush behavior remain hardware-validation work.
 - The desktop coordinator implements bounded multi-client scene/focus/input
   policy, but the packaged smoke is still its only live connection. There is no
   service identity, rendezvous/admission protocol, booted two-client gate,
-  acceleration, page flipping, vsync, or default application. The input ABI
+  generic GPU acceleration, page flipping, vsync, or default application. The input ABI
   also lacks enter/leave, client-requested capture, IME/composition, distinct
   logical key codes, horizontal wheel, and a dedicated key-overflow marker.
+  USB input is deliberately limited to xHCI direct-root-port boot keyboards
+  and relative mice; hubs, generic HID, and absolute tablets are absent.
 - The PE host is deliberately limited to AMD64 console executables and five
   guest-wired imports. DLL/GUI images, TLS, SEH, delay imports, Authenticode,
   API sets, ordinal/arbitrary imports, Windows threads, registry, general

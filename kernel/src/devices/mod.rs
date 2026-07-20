@@ -10,7 +10,9 @@
 //! controller driver.
 
 pub mod ahci;
+pub mod audio;
 pub mod cmos;
+pub mod display;
 pub mod driver;
 pub mod fb_font;
 pub mod framebuffer;
@@ -24,6 +26,7 @@ pub mod rng;
 pub mod serial;
 pub mod serial_ext;
 pub mod term;
+pub mod usb;
 pub mod vga;
 
 // More device modules may be registered by their owners (e.g. the IOAPIC
@@ -63,12 +66,24 @@ pub fn init(_boot_info: &'static limine::BootInfo) {
     }
 
     ahci::register_pci_driver();
+    audio::register_pci_driver();
+    display::register_pci_driver();
     net::register_pci_drivers();
+    usb::register_pci_driver();
     let pci_count = pci::enumerate::enumerate_and_bind();
+    usb::start_service_worker();
     ::log::info!(
-        "devices: PCI scan found {} function(s), {} AHCI controller(s), {} network adapter(s) online",
+        "devices: PCI scan found {} function(s), {} AHCI controller(s), {} HDA controller(s), {} network adapter(s), {} xHCI controller(s), {} USB boot-HID interface(s), VMware SVGA II {}",
         pci_count,
         ahci::controller_count(),
-        net::adapter_count()
+        audio::controller_count(),
+        net::adapter_count(),
+        usb::controller_count(),
+        usb::hid_interface_count(),
+        if display::is_attached() {
+            "attached"
+        } else {
+            "absent"
+        }
     );
 }

@@ -21,8 +21,8 @@
 //! 3. Enable the auxiliary port (`0xA8`).
 //! 4. Reset the mouse (`0xFF`), expecting `ACK`, self-test-passed (`0xAA`),
 //!    and a plain-mouse ID (`0x00`).
-//! 5. Set defaults (`0xF6`), 1:1 scaling (`0xE6`), resolution 1 count/mm
-//!    (`0xE8 0x00`), sample rate 60 Hz (`0xF3 0x3C`).
+//! 5. Set defaults (`0xF6`), 1:1 scaling (`0xE6`), resolution 4 counts/mm
+//!    (`0xE8 0x02`), and later select a 100 Hz report rate (`0xF3 0x64`).
 //! 6. Negotiate the Intellimouse extension: set sample rate 200, 100, 80 in
 //!    sequence then read the device ID. An ID of `0x03` means the mouse now
 //!    emits 4-byte packets; otherwise it stays a 3-byte mouse and the scroll
@@ -138,9 +138,16 @@ const ID_INTELLIMOUSE: u8 = 0x03;
 /// the boot. Fast ACK replies complete in well under this bound.
 const POLL_LIMIT: u32 = 200_000;
 
-/// Sample rate (Hz) used for the final operating mode. 60 Hz is a quiet,
-/// responsive default that keeps the IRQ rate modest while feeling immediate.
-const SAMPLE_RATE: u8 = 60;
+/// PS/2 resolution argument `2`: four movement counts per millimetre. This
+/// gives the desktop enough low-speed precision to avoid coarse one-pixel
+/// steps without increasing interrupt frequency.
+const RESOLUTION: u8 = 2;
+
+/// Sample rate (Hz) used for the final operating mode. 100 Hz tracks a 60 Hz
+/// desktop without visibly quantising motion while keeping the PS/2 IRQ load
+/// modest. This is one of the rates defined by the PS/2 pointing-device
+/// protocol and is supported by the VMware virtual auxiliary mouse.
+const SAMPLE_RATE: u8 = 100;
 /// The magic sample-rate triplet that flips a compliant mouse into Intellimouse
 /// 4-byte mode. The controller must send each as a distinct SET_SAMPLE_RATE
 /// command; the mouse counts the sequence and switches its ID on the third.
@@ -234,11 +241,11 @@ bitflags! {
 
 /// One decoded mouse movement sample.
 ///
-/// `dx`/`dy` are in mouse counts (the device's native resolution, 1 count/mm
-/// at the configured resolution) with screen-orientation Y: positive `dy` is
-/// *down*, i.e. the raw mouse Y has already been negated. `dz` is the scroll
-/// wheel delta in notches; positive is scroll-up, negative is scroll-down, and
-/// it is zero for a 3-byte mouse that lacks the Intellimouse extension.
+/// `dx`/`dy` are in mouse counts at the configured 4-count/mm resolution, with
+/// screen-orientation Y: positive `dy` is *down*, i.e. the raw mouse Y has
+/// already been negated. `dz` is the scroll-wheel delta in notches; positive
+/// is scroll-up, negative is scroll-down, and it is zero for a 3-byte mouse
+/// that lacks the Intellimouse extension.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MouseEvent {
     /// Button state at this sample. A bit is set for as long as the button is
@@ -272,6 +279,12 @@ struct PacketDecoder {
     bytes: [u8; 4],
     /// Index of the next byte to fill within `bytes`.
     index: usize,
+    /// Input-routing epoch sampled with the packet header.
+    ///
+    /// A UI acquire/release can happen between any two IRQs. Retaining the
+    /// header epoch lets the router discard a packet that straddled that
+    /// transition without resetting the byte-stream decoder mid-packet.
+    packet_epoch: u64,
     /// Whether the mouse is in Intellimouse 4-byte mode (vs. plain 3-byte).
     four_byte: bool,
 }
@@ -283,6 +296,7 @@ impl PacketDecoder {
         Self {
             bytes: [0; 4],
             index: 0,
+            packet_epoch: 0,
             four_byte: false,
         }
     }
@@ -299,10 +313,10 @@ impl PacketDecoder {
 
     /// Absorb one byte from the IRQ handler.
     ///
-    /// Returns `Some(event)` when a full packet has been assembled and decoded,
-    /// or `None` if more bytes are needed, the byte was a dropped resync, or
-    /// the completed packet had an axis-overflow and was discarded.
-    fn feed(&mut self, byte: u8) -> Option<MouseEvent> {
+    /// Returns the header's routing epoch and decoded event when a full packet
+    /// has been assembled, or `None` if more bytes are needed, the byte was a
+    /// dropped resync, or the completed packet had an axis overflow.
+    fn feed(&mut self, byte: u8, epoch: u64) -> Option<(u64, MouseEvent)> {
         if self.index == 0 {
             // Start-of-packet position: the byte must carry the always-set
             // sync bit. If it does not, the stream is misaligned (we either
@@ -312,14 +326,14 @@ impl PacketDecoder {
                 return None;
             }
             self.bytes[0] = byte;
+            self.packet_epoch = epoch;
             self.index = 1;
             return None;
         }
-        // Mid-packet data byte: there is no sync check on these, so a single
-        // dropped data byte corrupts the current packet. That is detected at
-        // decode time only if an overflow bit is also wrong; the practical
-        // impact is one bad sample, after which the next header's sync bit
-        // realigns the stream.
+        // Mid-packet data bytes may legitimately carry bit 3, so they cannot
+        // be mistaken for a header merely from their value. A transport error
+        // resets immediately. Handler elapsed time is deliberately not used
+        // for framing because VM pauses can delay a valid mid-packet byte.
         self.bytes[self.index] = byte;
         self.index += 1;
         if self.index < self.packet_len() {
@@ -328,8 +342,15 @@ impl PacketDecoder {
         // Full packet accumulated: reset the index first so a decode error
         // (overflow drop) leaves the decoder ready for the next header, then
         // decode.
+        let packet_epoch = self.packet_epoch;
+        self.reset();
+        decode_packet(&self.bytes, self.four_byte).map(|event| (packet_epoch, event))
+    }
+
+    /// Forget a partial packet and wait for a fresh synchronisation byte.
+    fn reset(&mut self) {
         self.index = 0;
-        decode_packet(&self.bytes, self.four_byte)
+        self.packet_epoch = 0;
     }
 }
 
@@ -522,6 +543,11 @@ impl MouseState {
             initialized: false,
         }
     }
+
+    /// Drop completed legacy events without disturbing an in-flight packet.
+    fn clear_events(&mut self) {
+        self.events.clear();
+    }
 }
 
 /// The single PS/2 mouse. There is at most one auxiliary port per PC, so a
@@ -568,7 +594,7 @@ pub fn init() -> Result<(), Ps2MouseError> {
     }
     let _initial_id = read_data()?;
 
-    // 5. Defaults, 1:1 scaling, resolution 1 count/mm, then the scroll-wheel
+    // 5. Defaults, 1:1 scaling, resolution 4 counts/mm, then the scroll-wheel
     //    negotiation triplet. Every byte to the mouse — including command
     //    arguments — is preceded by `CMD_WRITE_AUX` and acknowledged, so the
     //    rate / resolution arguments go through `mouse_write` just like the
@@ -576,7 +602,7 @@ pub fn init() -> Result<(), Ps2MouseError> {
     mouse_write(MOUSE_SET_DEFAULTS)?;
     mouse_write(MOUSE_SCALING_1_1)?;
     mouse_write(MOUSE_SET_RESOLUTION)?;
-    mouse_write(0x00)?;
+    mouse_write(RESOLUTION)?;
 
     // 6. The Intellimouse magic: set sample rate 200, 100, 80 in sequence, then
     //    read the ID. A compliant mouse flips to 4-byte mode and returns 0x03.
@@ -601,7 +627,7 @@ pub fn init() -> Result<(), Ps2MouseError> {
         );
     }
 
-    // 7. Final operating-mode sample rate (60 Hz). Done after the magic
+    // 7. Final operating-mode sample rate (100 Hz). Done after the magic
     //    triplet so the negotiation is not disturbed by a stray rate change.
     mouse_write(MOUSE_SET_SAMPLE_RATE)?;
     mouse_write(SAMPLE_RATE)?;
@@ -659,7 +685,16 @@ pub fn handle_interrupt() {
     }
     let byte = CTRL_DATA.read();
 
-    let (epoch, event) = {
+    // A parity/timeout-marked byte is not part of a trustworthy packet. The
+    // controller output must still be drained, but feeding the corrupt value
+    // would shift every following packet and can turn stationary reports into
+    // continuous maximum movement. Recover at the next header instead.
+    if sts & (STS_TIMEOUT | STS_PARITY) != 0 {
+        MOUSE.lock().decoder.reset();
+        return;
+    }
+
+    let completed = {
         let mut state = MOUSE.lock();
         if !state.initialized {
             // Pre-init byte (e.g. a controller response that arrived late):
@@ -667,9 +702,9 @@ pub fn handle_interrupt() {
             return;
         }
         let epoch = crate::ui::input_epoch();
-        (epoch, state.decoder.feed(byte))
+        state.decoder.feed(byte, epoch)
     };
-    if let Some(event) = event {
+    if let Some((epoch, event)) = completed {
         crate::ui::route_mouse_event(epoch, event);
     }
 }
@@ -696,9 +731,7 @@ pub fn pop_event() -> Option<MouseEvent> {
 
 /// Discard queued pointer samples without resetting packet/device state.
 pub(crate) fn clear_events() {
-    let mut state = MOUSE.lock();
-    state.events.clear();
-    state.decoder.index = 0;
+    MOUSE.lock().clear_events();
 }
 
 /// Whether the mouse is emitting 4-byte Intellimouse packets (scroll axis
@@ -719,7 +752,7 @@ pub fn is_initialized() -> bool {
 /// re-running bring-up. The next byte must carry [`SYNC_BIT`] to be accepted as
 /// a header.
 pub fn resync() {
-    MOUSE.lock().decoder.index = 0;
+    MOUSE.lock().decoder.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +762,8 @@ pub fn resync() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_EPOCH: u64 = 7;
 
     /// A minimal right-and-down 3-byte packet with no buttons.
     #[test]
@@ -807,10 +842,10 @@ mod tests {
     fn feed_drops_desync_header() {
         let mut dec = PacketDecoder::new();
         // 0x00 has no sync bit — must be dropped, no event, index stays 0.
-        assert!(dec.feed(0x00).is_none());
+        assert!(dec.feed(0x00, TEST_EPOCH).is_none());
         assert_eq!(dec.index, 0);
         // A real header is then accepted.
-        assert!(dec.feed(SYNC_BIT).is_none());
+        assert!(dec.feed(SYNC_BIT, TEST_EPOCH).is_none());
         assert_eq!(dec.index, 1);
     }
 
@@ -818,9 +853,12 @@ mod tests {
     #[test]
     fn feed_assembles_3byte_packet() {
         let mut dec = PacketDecoder::new();
-        assert!(dec.feed(SYNC_BIT | BTN_RIGHT_BIT).is_none());
-        assert!(dec.feed(10).is_none());
-        let ev = dec.feed(0).expect("third byte completes the packet");
+        assert!(dec.feed(SYNC_BIT | BTN_RIGHT_BIT, TEST_EPOCH).is_none());
+        assert!(dec.feed(10, TEST_EPOCH).is_none());
+        let (epoch, ev) = dec
+            .feed(0, TEST_EPOCH)
+            .expect("third byte completes the packet");
+        assert_eq!(epoch, TEST_EPOCH);
         assert_eq!(ev.dx, 10);
         assert_eq!(ev.dy, 0);
         assert!(ev.buttons.contains(MouseButtons::RIGHT));
@@ -832,16 +870,72 @@ mod tests {
     fn feed_assembles_4byte_packet() {
         let mut dec = PacketDecoder::new();
         dec.four_byte = true;
-        assert!(dec.feed(SYNC_BIT).is_none());
-        assert!(dec.feed(1).is_none());
+        assert!(dec.feed(SYNC_BIT, TEST_EPOCH).is_none());
+        assert!(dec.feed(1, TEST_EPOCH).is_none());
         assert!(
-            dec.feed(2).is_none(),
+            dec.feed(2, TEST_EPOCH).is_none(),
             "three bytes do not complete a 4-byte packet"
         );
-        let ev = dec.feed(0x01).expect("fourth byte completes the packet");
+        let (_, ev) = dec
+            .feed(0x01, TEST_EPOCH)
+            .expect("fourth byte completes the packet");
         assert_eq!(ev.dx, 1);
         assert_eq!(ev.dy, -2);
         assert_eq!(ev.dz, 1);
+    }
+
+    /// Clearing a session's completed events must not reset the live hardware
+    /// stream in the middle of a packet. The completed packet retains the
+    /// epoch sampled with its header, allowing the UI router to discard it as
+    /// stale while leaving the next packet correctly aligned.
+    #[test]
+    fn queue_clear_preserves_partial_packet_and_header_epoch() {
+        let mut state = MouseState::new();
+        state.events.push(MouseEvent::default()).unwrap();
+
+        assert!(state.decoder.feed(SYNC_BIT, 11).is_none());
+        assert_eq!(state.decoder.index, 1);
+        state.clear_events();
+        assert!(state.events.is_empty());
+        assert_eq!(state.decoder.index, 1);
+
+        assert!(state.decoder.feed(4, 12).is_none());
+        let (epoch, event) = state
+            .decoder
+            .feed(0, 12)
+            .expect("the packet remains correctly framed");
+        assert_eq!(epoch, 11);
+        assert_eq!((event.dx, event.dy), (4, 0));
+        assert_eq!(state.decoder.index, 0);
+    }
+
+    #[test]
+    fn explicit_resync_discards_partial_packet_epoch() {
+        let mut decoder = PacketDecoder::new();
+        assert!(decoder.feed(SYNC_BIT, TEST_EPOCH).is_none());
+        decoder.reset();
+        assert_eq!(decoder.index, 0);
+        assert_eq!(decoder.packet_epoch, 0);
+        assert!(decoder.feed(0, TEST_EPOCH + 1).is_none());
+        assert_eq!(decoder.index, 0);
+    }
+
+    #[test]
+    fn data_byte_with_sync_bit_does_not_restart_a_partial_packet() {
+        let mut decoder = PacketDecoder::new();
+        assert!(decoder.feed(SYNC_BIT, TEST_EPOCH).is_none());
+        assert!(decoder.feed(SYNC_BIT, TEST_EPOCH + 1).is_none());
+        let (epoch, event) = decoder
+            .feed(0, TEST_EPOCH + 1)
+            .expect("bit 3 is valid in a movement byte");
+        assert_eq!(epoch, TEST_EPOCH);
+        assert_eq!((event.dx, event.dy), (i16::from(SYNC_BIT), 0));
+    }
+
+    #[test]
+    fn operating_mode_uses_precise_resolution_and_low_latency_rate() {
+        assert_eq!(RESOLUTION, 2, "PS/2 value 2 selects four counts/mm");
+        assert_eq!(SAMPLE_RATE, 100);
     }
 
     /// The sign-extension helpers cover their full ranges.

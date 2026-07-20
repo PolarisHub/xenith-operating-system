@@ -1,6 +1,6 @@
 # Xenith
 
-Xenith is a freestanding x86_64 operating-system workspace. It contains a `no_std` kernel and userspace, a lightweight glassy desktop shell, bounded channel/shared-memory IPC, native userspace threads, restricted child-descriptor launch, an eight-client compositor core, a deliberately small PE32+ AMD64 console host, BIOS and UEFI loaders, a deterministic SMP x86 interpreter, a multi-vCPU Windows Hypervisor Platform runner, image/filesystem/assembler/debugger tools, and a dependency-free C/assembly/static-link toolchain that builds a shipped userspace utility.
+Xenith is a freestanding x86_64 operating-system workspace. It contains a `no_std` kernel and userspace, a lightweight photo-backed desktop shell, bounded channel/shared-memory IPC, native userspace threads, restricted child-descriptor launch, an eight-client compositor core, a deliberately small PE32+ AMD64 console host, BIOS and UEFI loaders, a deterministic SMP x86 interpreter, a multi-vCPU Windows Hypervisor Platform runner, image/filesystem/assembler/debugger tools, and a dependency-free C/assembly/static-link toolchain that builds a shipped userspace utility.
 
 The default build path does not invoke QEMU, Limine, xorriso, NASM, GCC, GDB, or a system C library. Limine files remain only as a compatibility path.
 

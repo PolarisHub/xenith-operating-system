@@ -13,9 +13,14 @@ const CMD_ENABLE_FIRST: u8 = 0xAE;
 const KBD_RESET: u8 = 0xFF;
 const KBD_DISABLE_SCANNING: u8 = 0xF5;
 const KBD_ENABLE_SCANNING: u8 = 0xF4;
+const KBD_SET_TYPEMATIC: u8 = 0xF3;
 const KBD_SET_SCANCODE_SET: u8 = 0xF0;
 const KBD_SET_LEDS: u8 = 0xED;
 const SCANCODE_SET_1: u8 = 0x01;
+// PS/2 typematic byte: delay bits 6:5 = 00 (250 ms), rate bits 4:0 = 00000
+// (30 Hz). This keeps held navigation/editing keys responsive while ordinary
+// make/break events remain unchanged.
+const TYPEMATIC_250MS_30HZ: u8 = 0x00;
 const ACK: u8 = 0xFA;
 const RESEND: u8 = 0xFE;
 const SELF_TEST_PASSED: u8 = 0xAA;
@@ -393,6 +398,8 @@ pub fn init() -> Result<(), Ps2KeyboardError> {
     keyboard_command(KBD_DISABLE_SCANNING)?;
     keyboard_command(KBD_SET_SCANCODE_SET)?;
     keyboard_command(SCANCODE_SET_1)?;
+    keyboard_command(KBD_SET_TYPEMATIC)?;
+    keyboard_command(TYPEMATIC_250MS_30HZ)?;
     keyboard_command(KBD_SET_LEDS)?;
     keyboard_command(0)?;
 
@@ -407,7 +414,9 @@ pub fn init() -> Result<(), Ps2KeyboardError> {
         state.initialized = true;
         state.leds_dirty = false;
     }
-    ::log::info!("xenith.ps2.keyboard: scancode set 1, US keymap, IRQ 1 enabled");
+    ::log::info!(
+        "xenith.ps2.keyboard: scancode set 1, US keymap, typematic 250 ms/30 Hz, IRQ 1 enabled"
+    );
     Ok(())
 }
 
@@ -902,5 +911,13 @@ mod tests {
         let repeat = state.feed(0x3A).unwrap();
         assert!(repeat.repeat);
         assert!(repeat.modifiers.contains(KeyModifiers::CAPS_LOCK));
+    }
+
+    #[test]
+    fn configured_typematic_byte_is_fast_but_standard() {
+        assert_eq!(KBD_SET_TYPEMATIC, 0xF3);
+        assert_eq!(TYPEMATIC_250MS_30HZ, 0);
+        assert_eq!(TYPEMATIC_250MS_30HZ & 0x60, 0, "250 ms delay");
+        assert_eq!(TYPEMATIC_250MS_30HZ & 0x1f, 0, "30 Hz repeat rate");
     }
 }

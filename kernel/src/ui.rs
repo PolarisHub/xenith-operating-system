@@ -13,7 +13,7 @@
 //! keyboard events continue down the existing TTY path and mouse events stay
 //! in the device queue.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use xenith_abi::{
     UiDisplayInfo, UiInputEvent, UiRect, UI_ABI_VERSION, UI_DISPLAY_NATIVE_PIXEL_FORMAT,
@@ -21,6 +21,7 @@ use xenith_abi::{
     UI_EVENT_POINTER, UI_MAX_DAMAGE_RECTS, UI_MAX_EVENTS_PER_READ, UI_TIMEOUT_INFINITE,
     WAIT_READY_HANGUP, WAIT_READY_UI_INPUT,
 };
+use xenith_types::VirtAddr;
 
 use crate::devices::framebuffer::Scanout;
 use crate::devices::ps2::keyboard::KeyEvent;
@@ -34,6 +35,12 @@ use crate::util::RingBuffer;
 /// Fixed queue storage. At 48 bytes per event this consumes 24 KiB and holds
 /// more than eight seconds of 60 Hz pointer reports without allocating.
 const EVENT_QUEUE_CAPACITY: usize = 512;
+
+/// Suppress repeated diagnostics if the optional VMware FIFO path cannot be
+/// used. The CPU-copy scanout remains authoritative in either case.
+static SVGA_SCANOUT_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
+static SVGA_PRESENT_WARNED: AtomicBool = AtomicBool::new(false);
+static SVGA_PRESENT_CONFIRMED: AtomicBool = AtomicBool::new(false);
 
 /// Errors returned by the kernel UI-session core before errno translation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,7 +326,56 @@ pub fn present(
     // every damaged pixel is globally ordered before userspace reuses the
     // source buffer or submits another frame.
     crate::arch::x86_64::sfence();
+    notify_accelerated_display(scanout, damage);
     Ok(())
+}
+
+/// Forward the already-validated damage to VMware's FIFO only when Limine's
+/// framebuffer is the exact SVGA frontbuffer. A failed optional notification
+/// never turns a completed CPU copy into a userspace presentation failure.
+fn notify_accelerated_display(scanout: Scanout, damage: &[UiRect]) {
+    let Some(info) = crate::devices::display::device_info() else {
+        return;
+    };
+    if scanout.buffer.is_null() {
+        return;
+    }
+    let physical = crate::mm::virt_to_phys(VirtAddr::new_truncate(scanout.buffer as u64)).as_u64();
+    let Ok(pitch) = u32::try_from(scanout.pitch) else {
+        return;
+    };
+    if !info.matches_boot_framebuffer(
+        physical,
+        u32::from(scanout.width),
+        u32::from(scanout.height),
+        pitch,
+        32,
+    ) {
+        if !SVGA_SCANOUT_MISMATCH_WARNED.swap(true, Ordering::AcqRel) {
+            ::log::warn!(
+                "ui: VMware SVGA II frontbuffer differs from Limine scanout; FIFO updates disabled"
+            );
+        }
+        return;
+    }
+
+    let mut rectangles = [crate::devices::display::Rect::new(0, 0, 1, 1); UI_MAX_DAMAGE_RECTS];
+    for (destination, source) in rectangles.iter_mut().zip(damage.iter().copied()) {
+        *destination =
+            crate::devices::display::Rect::new(source.x, source.y, source.width, source.height);
+    }
+    match crate::devices::display::present(&rectangles[..damage.len()]) {
+        Ok(()) => {
+            if !SVGA_PRESENT_CONFIRMED.swap(true, Ordering::AcqRel) {
+                ::log::info!("ui: VMware SVGA II FIFO damage updates active");
+            }
+        },
+        Err(error) => {
+            if !SVGA_PRESENT_WARNED.swap(true, Ordering::AcqRel) {
+                ::log::warn!("ui: VMware SVGA II FIFO update failed: {}", error);
+            }
+        },
+    }
 }
 
 fn validate_present(
