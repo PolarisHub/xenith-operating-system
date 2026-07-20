@@ -45,7 +45,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use xenith_boot::{BootInfo, MemoryRegion};
-use xenith_types::PhysAddr;
+use xenith_types::{PhysAddr, PAGE_SIZE};
 
 // ---------------------------------------------------------------------------
 // Allocation error
@@ -316,17 +316,16 @@ impl Kmalloc for LockedHeap {
 // Heap bootstrap: claim a physical range and map it via the HHDM
 // ---------------------------------------------------------------------------
 
-/// The default heap size: 32 MiB. Large enough for the kernel's working set
-/// during early bring-up (VFS caches, scheduler structures, driver state) and
-/// small enough that it fits in the smallest RAM configuration Xenith targets
-/// (256 MiB VMs). Tunable by editing this constant; no runtime knob exists
-/// because the heap is carved before the frame allocator exists.
+/// Maximum initial heap size. Larger machines retain the existing 32 MiB cap;
+/// smaller machines no longer have to provide a fixed 48 MiB contiguous span.
 pub const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
-/// The minimum usable region size we will claim the heap from. We require some
-/// headroom above [`HEAP_SIZE`] so the frame allocator still gets frames from
-/// the same region after we carve our chunk.
-const HEAP_REGION_MIN: u64 = (HEAP_SIZE as u64) + 16 * 1024 * 1024;
+/// Smallest initial heap supported on memory-constrained machines.
+pub const MIN_HEAP_SIZE: usize = 8 * 1024 * 1024;
+
+/// Frames left in the selected region for page tables, stacks, DMA, and
+/// userspace before boot-reclaimable ranges are returned.
+const HEAP_HEADROOM: u64 = 8 * 1024 * 1024;
 
 /// The physical range claimed for the kernel heap, set by [`init_heap`].
 ///
@@ -347,24 +346,45 @@ pub fn heap_phys_claim() -> Option<(PhysAddr, u64)> {
     HEAP_PHYS_CLAIM.get().copied()
 }
 
-/// Pick the best usable memory region for the heap.
-///
-/// "Best" is the largest usable region, because a larger region leaves more
-/// leftover frames for the frame allocator after the heap carves its chunk.
-/// Returns `None` if no usable region is at least [`HEAP_REGION_MIN`] bytes.
-fn pick_heap_region(boot: &BootInfo) -> Option<MemoryRegion> {
-    boot.memory_map()
-        .filter(|r| r.is_usable())
-        .filter(|r| r.len >= HEAP_REGION_MIN)
-        .max_by_key(|r| r.len)
+/// Page-align a usable region and return its complete-frame interval.
+fn complete_region(region: MemoryRegion) -> Option<(u64, u64)> {
+    let start = region.start.as_u64().checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+    let end = region.start.as_u64().checked_add(region.len)? & !(PAGE_SIZE - 1);
+    (end > start).then_some((start, end))
+}
+
+/// Scale the initial heap to one quarter of the selected usable span, bounded
+/// to 8..=32 MiB. Small VMs keep most RAM available to the frame allocator;
+/// normal desktop configurations retain the full heap.
+fn adaptive_heap_size(available: u64) -> Option<u64> {
+    if available < MIN_HEAP_SIZE as u64 + HEAP_HEADROOM {
+        return None;
+    }
+    let quarter = (available / 4) & !(PAGE_SIZE - 1);
+    let size = quarter.clamp(MIN_HEAP_SIZE as u64, HEAP_SIZE as u64);
+    (available.saturating_sub(size) >= HEAP_HEADROOM).then_some(size)
+}
+
+/// Pick an aligned physical heap claim from the largest eligible usable span.
+fn pick_heap_claim(boot: &BootInfo) -> Option<(PhysAddr, usize)> {
+    let (start, end) = boot
+        .memory_map()
+        .filter(MemoryRegion::is_usable)
+        .filter_map(complete_region)
+        .filter(|(start, end)| adaptive_heap_size(end - start).is_some())
+        .max_by_key(|(start, end)| end - start)?;
+    let heap_size = adaptive_heap_size(end - start)?;
+    let claim = end.checked_sub(heap_size)?;
+    debug_assert!(claim >= start);
+    Some((PhysAddr::new(claim)?, heap_size as usize))
 }
 
 /// Bring up the kernel heap.
 ///
 /// Called once from `mm::init` after the Limine memory map is available. It:
 ///
-/// 1. Finds the largest usable physical region (at least [`HEAP_REGION_MIN`]).
-/// 2. Carves [`HEAP_SIZE`] bytes off the *end* of that region for the heap —
+/// 1. Finds the largest usable physical region with at least 8 MiB headroom.
+/// 2. Carves an adaptive 8..=32 MiB chunk off the *end* of that region —
 ///    carving from the end leaves the low frames of the region for the frame
 ///    allocator, which is the more natural allocation direction.
 /// 3. Records the claim in [`HEAP_PHYS_CLAIM`] so the frame allocator can
@@ -380,30 +400,17 @@ fn pick_heap_region(boot: &BootInfo) -> Option<MemoryRegion> {
 ///
 /// # Panics
 ///
-/// Panics if no usable region is large enough to hold the heap. A kernel
-/// without 32 MiB of contiguous usable RAM cannot boot — there is no
-/// fallback.
+/// Panics if no usable region can supply the minimum heap plus headroom.
 pub fn init_heap(boot_info: &'static limine::BootInfo) {
     let boot = BootInfo::new(boot_info);
 
-    let region = pick_heap_region(&boot).unwrap_or_else(|| {
+    let (claim_phys, heap_size) = pick_heap_claim(&boot).unwrap_or_else(|| {
         panic!(
             "xenith.mm.heap: no usable memory region >= {} bytes for the heap",
-            HEAP_REGION_MIN
+            MIN_HEAP_SIZE as u64 + HEAP_HEADROOM
         );
     });
-
-    // Carve from the end of the region: claim_phys = region.end - HEAP_SIZE.
-    // Carving from the end leaves the lower frames of the region for the frame
-    // allocator, which is the more natural allocation direction.
-    let region_end = region
-        .end()
-        .unwrap_or_else(|| panic!("xenith.mm.heap: usable region end overflows PhysAddr"));
-    // `region_end - HEAP_SIZE` is a bare physical address with no flag bits, so
-    // `PhysAddr::new` always returns `Some`; the expect documents that invariant.
-    let claim_phys = PhysAddr::new(region_end.as_u64() - HEAP_SIZE as u64)
-        .expect("heap claim physical address is within 52-bit space");
-    let claim_len = HEAP_SIZE as u64;
+    let claim_len = heap_size as u64;
 
     // Publish the claim so the frame allocator (initialised after the heap) can
     // skip this physical range. `Once` is written exactly once during boot and
@@ -419,20 +426,50 @@ pub fn init_heap(boot_info: &'static limine::BootInfo) {
     let heap_virt = boot.phys_to_virt(claim_phys);
     let heap_base = heap_virt.as_u64() as *mut u8;
 
-    // Bind the global heap. SAFETY: `[heap_base, heap_base + HEAP_SIZE)` is
+    // Bind the global heap. SAFETY: `[heap_base, heap_base + heap_size)` is
     // the HHDM mapping of the carved physical range, which Limine guarantees
     // is valid, writable, mapped kernel memory for the program's lifetime and
     // is not referenced by anything else (we just carved it out of the free
     // pool and the frame allocator will respect `heap_phys_claim`).
     unsafe {
-        ALLOCATOR.init(heap_base, HEAP_SIZE);
+        ALLOCATOR.init(heap_base, heap_size);
     }
-    STATS.capacity.store(HEAP_SIZE, Ordering::Relaxed);
+    STATS.capacity.store(heap_size, Ordering::Relaxed);
 
     ::log::info!(
         "xenith.mm.heap: {} KiB heap at virt:{:#x} (phys:{:#x})",
-        HEAP_SIZE / 1024,
+        heap_size / 1024,
         heap_virt.as_u64(),
         claim_phys.as_u64()
     );
+}
+
+#[cfg(test)]
+mod heap_claim_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_heap_scales_and_caps() {
+        assert_eq!(adaptive_heap_size(15 * 1024 * 1024), None);
+        assert_eq!(adaptive_heap_size(32 * 1024 * 1024), Some(8 * 1024 * 1024));
+        assert_eq!(adaptive_heap_size(64 * 1024 * 1024), Some(16 * 1024 * 1024));
+        assert_eq!(
+            adaptive_heap_size(128 * 1024 * 1024),
+            Some(32 * 1024 * 1024)
+        );
+        assert_eq!(
+            adaptive_heap_size(1024 * 1024 * 1024),
+            Some(32 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn complete_region_discards_partial_boundary_frames() {
+        let region = MemoryRegion::new(
+            PhysAddr::new_truncate(0x1003),
+            0x3ffe,
+            xenith_boot::RegionKind::Usable,
+        );
+        assert_eq!(complete_region(region), Some((0x2000, 0x5000)));
+    }
 }

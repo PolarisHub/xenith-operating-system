@@ -51,6 +51,7 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{fmt, hint};
@@ -270,6 +271,31 @@ pub struct SpinLockIRQGuard<'a, T: ?Sized + 'a> {
     _pin: PhantomData<*mut ()>,
 }
 
+impl<'a, T: ?Sized + 'a> SpinLockIRQGuard<'a, T> {
+    /// Release the lock bit while deliberately leaving interrupts disabled.
+    ///
+    /// This is the scheduler hand-off primitive for an IRQ-backed wait queue:
+    /// the caller first links the current task into a blocked queue while this
+    /// guard still excludes the producer IRQ, then releases the data lock
+    /// immediately before switching away. Restoring IF at that point would let
+    /// an interrupt re-enter the scheduler after the current-task slot changed
+    /// but before the context switch completed, so the saved RFLAGS are
+    /// returned to the scheduler instead.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep interrupts disabled and restore the returned
+    /// RFLAGS on this same CPU, normally on the resuming side of a scheduler
+    /// context switch. Dropping the returned value without restoring it leaves
+    /// interrupts disabled indefinitely.
+    #[must_use]
+    pub(crate) unsafe fn unlock_without_restoring_interrupts(self) -> u64 {
+        let guard = ManuallyDrop::new(self);
+        guard.lock.locked.store(false, Ordering::Release);
+        guard.flags
+    }
+}
+
 impl<'a, T: ?Sized + 'a> Drop for SpinLockIRQGuard<'a, T> {
     fn drop(&mut self) {
         // Release the lock first, then restore interrupts. If we restored
@@ -339,5 +365,19 @@ mod tests {
         // interrupts disabled after the failed attempt.
         assert!(lock.try_lock().is_none());
         drop(g);
+    }
+
+    #[test]
+    fn scheduler_handoff_unlocks_without_losing_saved_irq_state() {
+        let lock = SpinLockIRQ::new(9u8);
+        let guard = lock.lock();
+        // SAFETY: the same test thread restores these host-modelled flags
+        // immediately after checking the lock-bit hand-off.
+        let flags = unsafe { guard.unlock_without_restoring_interrupts() };
+        assert!(!lock.is_locked());
+        assert_ne!(flags & RFLAGS_IF, 0);
+        // SAFETY: `flags` came from the guard above on this same thread.
+        unsafe { restore_rflags(flags) };
+        assert_eq!(lock.into_inner(), 9);
     }
 }

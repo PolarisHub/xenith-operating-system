@@ -53,7 +53,7 @@ pub use page_table::{
     index_for, indices, p1_index, p2_index, p3_index, p4_index, PageTable, PageTableEntry,
     PageTableFlags,
 };
-pub use paging::{active_p4_phys, FrameAllocator, MapError, Mapper, UnmapError};
+pub use paging::{active_p4_phys, CachePolicyError, FrameAllocator, MapError, Mapper, UnmapError};
 use xenith_boot::BootInfo;
 
 /// Bring the virtual-memory subsystem online.
@@ -96,4 +96,34 @@ pub fn init(bi: BootInfo) {
         "xenith.mm.virtual: kernel mapper adopted, PML4 @ {:?}",
         mapper.p4_frame()
     );
+
+    // Linear scanout is a write-mostly MMIO workload. On PAT-capable CPUs,
+    // split only the direct-map pages covering the boot framebuffer and mark
+    // their 4 KiB leaves write-combining. This avoids uncached/WB store stalls
+    // without changing the cache policy of ordinary RAM. The operation runs
+    // before AP startup, so the active table has a single mutator.
+    if let Some(framebuffer) = bi.framebuffer() {
+        if crate::arch::x86_64::framebuffer_write_combining_available() {
+            let virtual_start = bi.phys_to_virt(framebuffer.phys_addr);
+            match mapper.set_write_combining_range(
+                virtual_start,
+                framebuffer.phys_addr,
+                framebuffer.size,
+                &crate::mm::physical::GLOBAL_FRAME_ALLOCATOR,
+            ) {
+                Ok(pages) => ::log::info!(
+                    "xenith.mm.virtual: framebuffer write-combining enabled ({} pages)",
+                    pages
+                ),
+                Err(error) => ::log::warn!(
+                    "xenith.mm.virtual: framebuffer WC unavailable ({:?}); retaining loader cache policy",
+                    error
+                ),
+            }
+        } else {
+            ::log::warn!(
+                "xenith.mm.virtual: CPU has no PAT; retaining loader framebuffer cache policy"
+            );
+        }
+    }
 }

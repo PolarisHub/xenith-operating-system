@@ -659,19 +659,27 @@ pub fn handle_interrupt() {
     }
     let byte = CTRL_DATA.read();
 
-    let mut state = MOUSE.lock();
-    if !state.initialized {
-        // Pre-init byte (e.g. a controller response that arrived late): drop
-        // it so the decoder never sees non-movement data.
-        return;
+    let (epoch, event) = {
+        let mut state = MOUSE.lock();
+        if !state.initialized {
+            // Pre-init byte (e.g. a controller response that arrived late):
+            // drop it so the decoder never sees non-movement data.
+            return;
+        }
+        let epoch = crate::ui::input_epoch();
+        (epoch, state.decoder.feed(byte))
+    };
+    if let Some(event) = event {
+        crate::ui::route_mouse_event(epoch, event);
     }
-    if let Some(event) = state.decoder.feed(byte) {
-        // The ring is bounded; a full queue drops the new event rather than
-        // blocking the IRQ handler. Under sustained input this loses the
-        // newest movements, which is preferable to stalling the interrupt
-        // path and dropping IRQs system-wide.
-        let _ = state.events.push(event);
-    }
+}
+
+/// Queue a decoded sample for the kernel device path.
+///
+/// The UI router calls this while holding its epoch lock so acquiring a new
+/// graphical input session cannot race a late device-queue insertion.
+pub(crate) fn enqueue_device_event(event: MouseEvent) {
+    let _ = MOUSE.lock().events.push(event);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +692,13 @@ pub fn handle_interrupt() {
 /// IRQ-safe lock so a concurrent IRQ 12 cannot mutate the ring mid-pop.
 pub fn pop_event() -> Option<MouseEvent> {
     MOUSE.lock().events.pop()
+}
+
+/// Discard queued pointer samples without resetting packet/device state.
+pub(crate) fn clear_events() {
+    let mut state = MOUSE.lock();
+    state.events.clear();
+    state.decoder.index = 0;
 }
 
 /// Whether the mouse is emitting 4-byte Intellimouse packets (scroll axis

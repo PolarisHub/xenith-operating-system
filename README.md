@@ -38,7 +38,7 @@ The thin Makefile exposes the same paths as `make all`, `make run`, `make test`,
 
 Kernel and userspace require their separate custom targets and build-std flags; host tools use the native target. CI checks the complete workspace, runs host/kernel/bootloader tests and strict Clippy, builds every artifact with `xenith-build all`, then gates direct, packaged-image, BIOS-stage, SMP, shell/coreutils, pipeline, C-toolchain, and debugger execution in Xenith's own emulator.
 
-See [BUILD](docs/BUILD.md), [TOOLCHAIN](docs/TOOLCHAIN.md), [EMULATOR](docs/EMULATOR.md), [BOOT_PROTOCOL](docs/BOOT_PROTOCOL.md), and [STATUS](docs/STATUS.md). `STATUS.md` distinguishes compile-tested code from emulator-, firmware-, or hardware-tested behavior.
+See [BUILD](docs/BUILD.md), [TOOLCHAIN](docs/TOOLCHAIN.md), [EMULATOR](docs/EMULATOR.md), [BOOT_PROTOCOL](docs/BOOT_PROTOCOL.md), [DESKTOP_FOUNDATION](docs/DESKTOP_FOUNDATION.md), and [STATUS](docs/STATUS.md). `STATUS.md` distinguishes compile-tested code from emulator-, firmware-, or hardware-tested behavior.
 
 ## License
 

@@ -5,10 +5,11 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use xenith_abi::{
-    SigAction, SigAltStack, SigInfo, SigSet, SignalFrame, GRND_NONBLOCK, MAP_ANONYMOUS,
-    MAP_PRIVATE, MINSIGSTKSZ, PROT_READ, PROT_WRITE, SA_ONSTACK, SA_SIGINFO, SIGNAL_FRAME_ALTSTACK,
-    SIGNAL_FRAME_XSTATE, SIGNAL_XSTATE_MAX, SIGUSR1, SIGUSR2, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
-    SI_USER, SS_DISABLE,
+    SigAction, SigAltStack, SigInfo, SigSet, SignalFrame, UiDisplayInfo, UiInputEvent, UiRect,
+    GRND_NONBLOCK, MAP_ANONYMOUS, MAP_PRIVATE, MINSIGSTKSZ, PROT_READ, PROT_WRITE, SA_ONSTACK,
+    SA_SIGINFO, SIGNAL_FRAME_ALTSTACK, SIGNAL_FRAME_XSTATE, SIGNAL_XSTATE_MAX, SIGUSR1, SIGUSR2,
+    SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SI_USER, SS_DISABLE, UI_ABI_VERSION,
+    UI_DISPLAY_NATIVE_PIXEL_FORMAT,
 };
 
 const PAGE_SIZE: usize = 4096;
@@ -31,6 +32,200 @@ const BAD_FRAME_POINTERS: u64 = 1 << 6;
 const BAD_FRAME_SIGNO: u64 = 1 << 7;
 const BAD_FRAME_FLAGS: u64 = 1 << 8;
 const BAD_XSTATE_METADATA: u64 = 1 << 9;
+
+enum UiSmokeOutcome {
+    Ok,
+    SkipNoFramebuffer,
+    Failed {
+        stage: &'static str,
+        errno: i32,
+        cleanup_failures: u8,
+    },
+}
+
+fn ui_failed(stage: &'static str, errno: i32, mapping: Option<(*mut u8, usize)>) -> UiSmokeOutcome {
+    let mut cleanup_failures = 0;
+    if libuser::ui_release().is_err() {
+        cleanup_failures |= 1;
+    }
+    if let Some((address, length)) = mapping {
+        if libuser::syscall::munmap(address, length).is_err() {
+            cleanup_failures |= 2;
+        }
+    }
+    UiSmokeOutcome::Failed {
+        stage,
+        errno,
+        cleanup_failures,
+    }
+}
+
+fn channel_mask(shift: u8, size: u8) -> Option<u32> {
+    let end = u16::from(shift).checked_add(u16::from(size))?;
+    if size == 0 || end > 32 {
+        return None;
+    }
+    let low_mask = if size == 32 {
+        u32::MAX
+    } else {
+        (1u32 << size) - 1
+    };
+    low_mask.checked_shl(u32::from(shift))
+}
+
+fn pack_channel(value: u8, shift: u8, size: u8) -> u32 {
+    let maximum = if size == 32 {
+        u64::from(u32::MAX)
+    } else {
+        (1u64 << size) - 1
+    };
+    ((((u64::from(value) * maximum) + 127) / 255) << shift) as u32
+}
+
+fn pack_pixel(display: &UiDisplayInfo, red: u8, green: u8, blue: u8) -> u32 {
+    pack_channel(red, display.red_shift, display.red_size)
+        | pack_channel(green, display.green_shift, display.green_size)
+        | pack_channel(blue, display.blue_shift, display.blue_size)
+}
+
+fn paint_rect(mapping: *mut u8, stride: usize, rect: UiRect, color: impl Fn(usize, usize) -> u32) {
+    for y in rect.y as usize..(rect.y + rect.height) as usize {
+        // SAFETY: the caller bounds `rect` to the mapped display and validates
+        // that every stride-wide row is present in the mapping.
+        let row = unsafe { mapping.add(y * stride).cast::<u32>() };
+        for x in rect.x as usize..(rect.x + rect.width) as usize {
+            // SAFETY: x is inside the visible width and the stride covers all
+            // visible pixels. Anonymous mappings are writable and aligned.
+            unsafe { row.add(x).write(color(x, y)) };
+        }
+    }
+}
+
+fn ui_runtime_smoke() -> UiSmokeOutcome {
+    let mut display = UiDisplayInfo::default();
+    if let Err(libuser::Error(errno)) = libuser::ui_acquire(&mut display) {
+        if errno == xenith_abi::Errno::Enodev as i32 {
+            return UiSmokeOutcome::SkipNoFramebuffer;
+        }
+        return UiSmokeOutcome::Failed {
+            stage: "acquire",
+            errno,
+            cleanup_failures: 0,
+        };
+    }
+
+    let Some(red_mask) = channel_mask(display.red_shift, display.red_size) else {
+        return ui_failed("format-red", 0, None);
+    };
+    let Some(green_mask) = channel_mask(display.green_shift, display.green_size) else {
+        return ui_failed("format-green", 0, None);
+    };
+    let Some(blue_mask) = channel_mask(display.blue_shift, display.blue_size) else {
+        return ui_failed("format-blue", 0, None);
+    };
+    let Some(visible_row_bytes) = (display.width as usize).checked_mul(4) else {
+        return ui_failed("geometry-width", 0, None);
+    };
+    let stride = display.stride as usize;
+    let height = display.height as usize;
+    if display.version != UI_ABI_VERSION
+        || display.width == 0
+        || display.height == 0
+        || display.bits_per_pixel != 32
+        || display.flags & UI_DISPLAY_NATIVE_PIXEL_FORMAT == 0
+        || display.reserved != 0
+        || stride < visible_row_bytes
+        || !stride.is_multiple_of(4)
+        || red_mask & green_mask != 0
+        || red_mask & blue_mask != 0
+        || green_mask & blue_mask != 0
+    {
+        return ui_failed("display-info", 0, None);
+    }
+    let Some(backbuffer_len) = stride.checked_mul(height) else {
+        return ui_failed("geometry-size", 0, None);
+    };
+    let mapping = match libuser::syscall::mmap(
+        core::ptr::null_mut(),
+        backbuffer_len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    ) {
+        Ok(mapping) => mapping,
+        Err(libuser::Error(errno)) => return ui_failed("mmap", errno, None),
+    };
+
+    let colors = [
+        pack_pixel(&display, 0x12, 0x1a, 0x31),
+        pack_pixel(&display, 0x1d, 0x4e, 0x68),
+        pack_pixel(&display, 0x25, 0xb9, 0x9a),
+        pack_pixel(&display, 0xa8, 0xed, 0xd8),
+    ];
+    let full = UiRect {
+        x: 0,
+        y: 0,
+        width: display.width,
+        height: display.height,
+    };
+    paint_rect(mapping, stride, full, |x, y| {
+        colors[((x >> 4) ^ (y >> 4)) & 3]
+    });
+    // SAFETY: mmap returned a readable range of exactly this byte length, and
+    // it remains mapped until the cleanup below.
+    let full_present = libuser::ui_present(
+        unsafe { core::slice::from_raw_parts(mapping, backbuffer_len) },
+        stride,
+        &[],
+    );
+    if let Err(libuser::Error(errno)) = full_present {
+        return ui_failed("present-full", errno, Some((mapping, backbuffer_len)));
+    }
+
+    let mut events = [UiInputEvent::default(); 1];
+    if let Err(libuser::Error(errno)) = libuser::ui_read_events(&mut events, 0) {
+        return ui_failed("events-zero-time", errno, Some((mapping, backbuffer_len)));
+    }
+
+    let damage_width = display.width.min(16);
+    let damage_height = display.height.min(16);
+    let damage = UiRect {
+        x: (display.width - damage_width) / 2,
+        y: (display.height - damage_height) / 2,
+        width: damage_width,
+        height: damage_height,
+    };
+    let accent = pack_pixel(&display, 0xf5, 0x7f, 0x50);
+    paint_rect(mapping, stride, damage, |_, _| accent);
+    // SAFETY: the mapping remains readable and live for this presentation.
+    let damage_present = libuser::ui_present(
+        unsafe { core::slice::from_raw_parts(mapping, backbuffer_len) },
+        stride,
+        &[damage],
+    );
+    if let Err(libuser::Error(errno)) = damage_present {
+        return ui_failed("present-damage", errno, Some((mapping, backbuffer_len)));
+    }
+
+    if let Err(libuser::Error(errno)) = libuser::ui_release() {
+        let cleanup_failures =
+            u8::from(libuser::syscall::munmap(mapping, backbuffer_len).is_err()) << 1;
+        return UiSmokeOutcome::Failed {
+            stage: "release",
+            errno,
+            cleanup_failures,
+        };
+    }
+    if let Err(libuser::Error(errno)) = libuser::syscall::munmap(mapping, backbuffer_len) {
+        return UiSmokeOutcome::Failed {
+            stage: "munmap",
+            errno,
+            cleanup_failures: 2,
+        };
+    }
+    UiSmokeOutcome::Ok
+}
 
 extern "C" fn signal_handler(signo: u32, info: *const SigInfo, frame: *const SignalFrame) {
     let invocation = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
@@ -278,7 +473,6 @@ pub extern "C" fn _start() -> ! {
     match signal_runtime_smoke() {
         Ok(()) => {
             libuser::println!("XENITH_RING3_SIGNAL_OK");
-            libuser::syscall::exit(0)
         },
         Err(stage) => {
             libuser::println!(
@@ -288,6 +482,29 @@ pub extern "C" fn _start() -> ! {
                 SIGNAL_COUNT.load(Ordering::SeqCst)
             );
             libuser::syscall::exit(2)
+        },
+    }
+    match ui_runtime_smoke() {
+        UiSmokeOutcome::Ok => {
+            libuser::println!("XENITH_RING3_UI_OK");
+            libuser::syscall::exit(0)
+        },
+        UiSmokeOutcome::SkipNoFramebuffer => {
+            libuser::println!("XENITH_RING3_UI_SKIP_NO_FRAMEBUFFER");
+            libuser::syscall::exit(0)
+        },
+        UiSmokeOutcome::Failed {
+            stage,
+            errno,
+            cleanup_failures,
+        } => {
+            libuser::println!(
+                "XENITH_RING3_UI_FAIL stage={} errno={} cleanup={:#x}",
+                stage,
+                errno,
+                cleanup_failures
+            );
+            libuser::syscall::exit(3)
         },
     }
 }

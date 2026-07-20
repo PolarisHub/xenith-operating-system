@@ -47,17 +47,29 @@ pub mod usercopy;
 // Keeping these at the `x86_64` root means downstream `use` lines stay short
 // (`use crate::arch::x86_64::Port8`) and do not have to track which submodule
 // a primitive happens to live in.
+use core::sync::atomic::{AtomicBool, Ordering};
+
 pub use instructions::{
-    cli, cpuid, hlt, invlpg, lgdt, lidt, ltr, pause, rdmsr, rdrand, rdseed, read_cr0, read_cr2,
-    read_cr3, read_cr4, sgdt, sidt, sti, tlb_flush_all, write_cr0, write_cr3, write_cr4, wrmsr,
-    InterruptGuard,
+    cli, cpuid, hlt, interrupts_enabled, invlpg, lgdt, lidt, ltr, pause, rdmsr, rdrand, rdseed,
+    read_cr0, read_cr2, read_cr3, read_cr4, sfence, sgdt, sidt, sti, tlb_flush_all, wbinvd,
+    write_cr0, write_cr3, write_cr4, wrmsr, InterruptGuard,
 };
 pub use msr::{
     Msr, IA32_EFER, IA32_FMASK, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_LAPIC_BASE, IA32_LSTAR,
-    IA32_STAR, IA32_TSC_AUX,
+    IA32_PAT, IA32_STAR, IA32_TSC_AUX,
 };
 pub use port::{Port, Port16, Port32, Port8};
 pub use registers::{Cr0, Cr3, Cr4};
+
+/// Whether initialized CPUs interpret PAT entry 4 as write-combining.
+static FRAMEBUFFER_WC_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Return whether framebuffer write-combining is available on this machine.
+#[inline]
+#[must_use]
+pub fn framebuffer_write_combining_available() -> bool {
+    FRAMEBUFFER_WC_AVAILABLE.load(Ordering::Acquire)
+}
 
 /// Very early, allocation-free CPU setup.
 ///
@@ -134,6 +146,22 @@ pub fn early_init() {
     // SAFETY: CPUID advertised NX, IA32_EFER exists on every x86_64 CPU, and
     // preserving the other bits keeps the bootloader's LME setting intact.
     unsafe { IA32_EFER.write(efer) };
+
+    // PAT is present when CPUID.01H:EDX[16] is set. Entry 4 is selected by a
+    // 4 KiB leaf PTE with PAT=1, PCD=0, PWT=0. Install one canonical table on
+    // every CPU instead of preserving firmware-provided per-CPU values: PAT
+    // is a per-logical-processor MSR and inconsistent AP tables would make
+    // the same framebuffer PTE mean different things on different cores.
+    // Entries 0..3 retain the architectural reset policy (WB, WT, UC-, UC),
+    // entry 4 is WC, and entries 5..7 mirror WT, UC-, UC.
+    let has_pat = unsafe { cpuid(1) }.edx & (1 << 16) != 0;
+    if has_pat {
+        const XENITH_PAT: u64 = 0x0007_0401_0007_0406;
+        // SAFETY: CPUID advertised PAT, IA32_PAT is therefore a valid MSR,
+        // and every byte contains an architecturally-defined memory type.
+        unsafe { IA32_PAT.write(XENITH_PAT) };
+        FRAMEBUFFER_WC_AVAILABLE.store(true, Ordering::Release);
+    }
 
     // CR0: clear EM (emulate x87), set MP (monitor coprocessor), set NE
     // (native x87 error reporting via #MF rather than IRQ 13). With EM clear

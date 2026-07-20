@@ -1,4 +1,4 @@
-use xenith_emu::{ExitReason, Machine};
+use xenith_emu::{ExitReason, FramebufferConfig, Machine};
 
 const BOOT_LIMIT: u64 = 100_000_000;
 const COMMAND_SLICE: u64 = 2_000_000;
@@ -107,9 +107,11 @@ fn shell_executes_builtins_and_coreutils_via_ps2() {
     let memory = run_command(&mut machine, "/bin/hello\n", "XENITH_RING3_SIGNAL_OK", 1).unwrap();
     assert!(
         memory.contains("XENITH_VM_RANDOM_OK")
+            && memory.contains("XENITH_RING3_UI_SKIP_NO_FRAMEBUFFER")
             && !memory.contains("XENITH_VM_RANDOM_FAIL")
-            && !memory.contains("XENITH_RING3_SIGNAL_FAIL"),
-        "userspace VM/RNG/signal smoke failed: {memory:?}"
+            && !memory.contains("XENITH_RING3_SIGNAL_FAIL")
+            && !memory.contains("XENITH_RING3_UI_FAIL"),
+        "userspace VM/RNG/signal/UI-no-framebuffer smoke failed: {memory:?}"
     );
 
     let mkdir = run_command(&mut machine, "mkdir /smoke\n", "mkdir /smoke", 1).unwrap();
@@ -147,4 +149,48 @@ fn shell_executes_builtins_and_coreutils_via_ps2() {
 
     let date = run_command(&mut machine, "date\n", " UTC (Unix)", 1).unwrap();
     assert!(date.contains(" UTC (Unix)"));
+}
+
+#[test]
+#[ignore = "requires `xenith-build all`; run explicitly after the framebuffer shell gate"]
+fn ring3_ui_smoke_restores_framebuffer_terminal() {
+    let mut machine = xenith_integration::load_built_kernel_with_framebuffer(
+        BOOT_LIMIT,
+        Some(FramebufferConfig {
+            width: 320,
+            height: 200,
+        }),
+    )
+    .unwrap();
+    let boot = machine.run();
+    assert_eq!(boot.reason, ExitReason::InstructionLimit);
+    let boot_serial = String::from_utf8_lossy(&boot.serial);
+    assert!(
+        boot_serial.contains("Xenith shell 0.1 (type 'help')") && boot_serial.ends_with("xenith$ "),
+        "framebuffer gate did not reach an idle userspace shell:\n{boot_serial}"
+    );
+
+    let hello = run_command(&mut machine, "/bin/hello\n", "XENITH_RING3_UI_OK", 1).unwrap();
+    assert!(
+        hello.contains("XENITH_VM_RANDOM_OK")
+            && hello.contains("XENITH_RING3_SIGNAL_OK")
+            && !hello.contains("XENITH_RING3_UI_SKIP_NO_FRAMEBUFFER")
+            && !hello.contains("XENITH_RING3_UI_FAIL"),
+        "ring-3 UI ABI smoke failed: {hello:?}"
+    );
+
+    let before_echo = machine.framebuffer_ppm().unwrap().unwrap();
+    let echo = run_command(
+        &mut machine,
+        "echo UI_TERMINAL_RESTORED\n",
+        "UI_TERMINAL_RESTORED",
+        2,
+    )
+    .unwrap();
+    assert!(echo.contains("UI_TERMINAL_RESTORED\n"));
+    let after_echo = machine.framebuffer_ppm().unwrap().unwrap();
+    assert_ne!(
+        before_echo, after_echo,
+        "shell survived, but terminal output did not resume on the framebuffer"
+    );
 }

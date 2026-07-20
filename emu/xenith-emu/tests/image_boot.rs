@@ -158,6 +158,33 @@ fn bios_firmware_image_reaches_userspace_shell() {
 }
 
 #[test]
+#[ignore = "requires `xenith-build all`; boots the packaged BIOS image with 64 MiB"]
+fn bios_firmware_image_reaches_shell_with_64_mib() {
+    let image = fs::read(workspace_file("build/xenith.img")).expect("read built raw image");
+    let mut machine = Machine::new(MachineConfig {
+        memory_bytes: 64 * 1024 * 1024,
+        instruction_limit: 100_000_000,
+        mirror_serial: false,
+        ..MachineConfig::default()
+    });
+    machine
+        .load_bios_image(image, true)
+        .expect("load compact BIOS payload layout in 64 MiB");
+
+    let summary = machine.run();
+    let serial = String::from_utf8_lossy(&summary.serial);
+    assert_eq!(summary.reason, ExitReason::InstructionLimit, "{serial}");
+    for marker in [
+        "xenith.mm.heap: 8192 KiB heap",
+        "user: init spawned",
+        "Xenith shell 0.1",
+        "xenith$ ",
+    ] {
+        assert!(serial.contains(marker), "missing {marker:?}\n{serial}");
+    }
+}
+
+#[test]
 #[ignore = "requires `xenith-build all`; executes the ISO BIOS path and boots three CPUs to the shell"]
 fn bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell() {
     let iso = fs::read(workspace_file("build/xenith.iso")).expect("read built ISO");

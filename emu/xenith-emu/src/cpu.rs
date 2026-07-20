@@ -30,6 +30,7 @@ const TSS_IST1_OFFSET: u64 = 0x24;
 
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_APIC_BASE: u32 = 0x0000_001B;
+const IA32_PAT: u32 = 0x0000_0277;
 const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_FMASK: u32 = 0xC000_0084;
@@ -175,6 +176,8 @@ impl Cpu {
             IA32_APIC_BASE,
             0xFEE0_0000 | (1 << 11) | if bsp { 1 << 8 } else { 0 },
         );
+        // Architectural reset value: WB, WT, UC-, UC repeated twice.
+        msrs.insert(IA32_PAT, 0x0007_0406_0007_0406);
         msrs.insert(IA32_STAR, 0);
         msrs.insert(IA32_LSTAR, 0);
         msrs.insert(IA32_FMASK, 0);
@@ -306,7 +309,10 @@ impl Cpu {
         let second = instruction.operands[1];
         let third = instruction.operands[2];
         match instruction.mnemonic {
+            // The interpreter has a coherent RAM model and no host cache
+            // aliases, so architectural cache/TLB maintenance is a no-op.
             Mnemonic::Nop | Mnemonic::Fence | Mnemonic::Invlpg => {},
+            Mnemonic::Wbinvd => self.wbinvd()?,
             Mnemonic::Hlt => {
                 self.state.halted = true;
                 return Ok(Some(ExitReason::Halted));
@@ -630,6 +636,16 @@ impl Cpu {
             return Err(CpuFault::GeneralProtection("CLTS requires CPL0"));
         }
         self.state.cr0 &= !CR0_TS;
+        Ok(())
+    }
+
+    fn wbinvd(&self) -> Result<(), CpuFault> {
+        if self.state.cs & 3 != 0 {
+            return Err(CpuFault::GeneralProtection("WBINVD requires CPL0"));
+        }
+        // Guest RAM is immediately coherent and has no modeled cache, so the
+        // architectural write-back/invalidate operation needs no further
+        // state change after its privilege check.
         Ok(())
     }
 
@@ -1226,6 +1242,7 @@ impl Cpu {
                     | (1 << 8)
                     | (1 << 9)
                     | (1 << 15)
+                    | (1 << 16)
                     | (1 << 23)
                     | (1 << 24)
                     | (1 << 25)
@@ -1717,6 +1734,8 @@ mod tests {
         assert_eq!((cpu.state.register(Register::Rbx) >> 16) & 0xff, 2);
         assert_ne!(cpu.state.register(Register::Rcx) & (1 << 21), 0);
         assert_ne!(cpu.state.register(Register::Rdx) & (1 << 9), 0);
+        assert_ne!(cpu.state.register(Register::Rdx) & (1 << 16), 0);
+        assert_eq!(cpu.msrs.get(&IA32_PAT), Some(&0x0007_0406_0007_0406));
 
         cpu.state.set_register(Register::Rax, 0xB);
         cpu.state.set_register(Register::Rcx, 1);
@@ -2143,6 +2162,23 @@ mod tests {
             Err(CpuFault::GeneralProtection("CLTS requires CPL0"))
         );
         assert_ne!(cpu.state.cr0 & CR0_TS, 0);
+    }
+
+    #[test]
+    fn wbinvd_is_cpl0_only() {
+        let mut bus = MemoryBus::new(0x1000);
+        bus.write_physical(0, &[0x0f, 0x09]).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.cs = 8;
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+
+        cpu.state.rip = 0;
+        cpu.state.cs = 0x2b;
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(CpuFault::GeneralProtection("WBINVD requires CPL0"))
+        );
     }
 
     #[test]

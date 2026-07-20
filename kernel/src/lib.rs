@@ -42,6 +42,7 @@ pub mod sync;
 pub mod syscall;
 pub mod time;
 pub mod tty;
+pub mod ui;
 pub mod user;
 pub mod util;
 

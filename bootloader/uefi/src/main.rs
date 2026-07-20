@@ -420,45 +420,20 @@ unsafe fn framebuffer(boot_services: &BootServices) -> XenithFramebuffer {
     let Some(info) = (unsafe { mode.info.as_ref() }) else {
         return XenithFramebuffer::default();
     };
-    let (red_shift, red_size, green_shift, green_size, blue_shift, blue_size) =
-        match info.pixel_format {
-            0 => (0, 8, 8, 8, 16, 8),
-            1 => (16, 8, 8, 8, 0, 8),
-            2 => (
-                mask_shift(info.pixel_information.red_mask),
-                mask_size(info.pixel_information.red_mask),
-                mask_shift(info.pixel_information.green_mask),
-                mask_size(info.pixel_information.green_mask),
-                mask_shift(info.pixel_information.blue_mask),
-                mask_size(info.pixel_information.blue_mask),
-            ),
-            _ => return XenithFramebuffer::default(),
-        };
-    XenithFramebuffer {
-        address: mode.frame_buffer_base,
-        pitch: info.pixels_per_scan_line.saturating_mul(4),
-        width: info.horizontal_resolution,
-        height: info.vertical_resolution,
-        bpp: 32,
-        red_shift,
-        red_size,
-        green_shift,
-        green_size,
-        blue_shift,
-        blue_size,
-    }
-}
-
-fn mask_shift(mask: u32) -> u8 {
-    if mask == 0 {
-        0
-    } else {
-        mask.trailing_zeros() as u8
-    }
-}
-
-fn mask_size(mask: u32) -> u8 {
-    mask.count_ones() as u8
+    xenith_uefi_loader::gop_framebuffer(
+        mode.frame_buffer_base,
+        mode.frame_buffer_size,
+        info.horizontal_resolution,
+        info.vertical_resolution,
+        info.pixels_per_scan_line,
+        info.pixel_format,
+        [
+            info.pixel_information.red_mask,
+            info.pixel_information.green_mask,
+            info.pixel_information.blue_mask,
+        ],
+    )
+    .unwrap_or_default()
 }
 
 fn find_rsdp(system_table: &SystemTable) -> u64 {

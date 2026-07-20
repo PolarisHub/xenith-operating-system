@@ -613,6 +613,11 @@ pub fn exec(path: &str, argv: &[&str]) -> Result<(), ProcessError> {
     let entry = loaded.entry;
     let initial_break = loaded.initial_break();
     let pages = loaded.into_pages();
+    // The UI session is an implicit, process-bound capability rather than an
+    // ordinary file descriptor. Do not transfer it across exec into an
+    // unrelated image; restore the text console only after the replacement
+    // image has been fully prepared so a failed exec preserves ownership.
+    let _ = crate::ui::release_if_owner(pid);
     // From publication through the CR3 switch and old-image teardown, no
     // timer interrupt may switch this task against a half-committed process
     // record. The guard intentionally lives through the diverging ring3 jump.
@@ -685,6 +690,10 @@ pub fn exit_signal(signal: Signal) -> ! {
 
 fn exit_with_status(status: ExitStatus) -> ! {
     let pid = current_pid();
+    // Revoke scanout/input before descriptor or child cleanup can allocate,
+    // fail, or contend. A crashing compositor must never retain the session
+    // merely because later process teardown cannot make progress.
+    let _ = crate::ui::release_if_owner(pid);
     if !pid.is_kernel() {
         let mut table = PROCESS_TABLE.lock();
         if let Some(process) = table.iter_mut().find(|process| process.pid == pid) {
@@ -942,15 +951,23 @@ pub fn can_control_process_group(process_group: ProcessId) -> bool {
 
 /// Deliver a signal to a live process.
 pub fn signal(pid: ProcessId, signal: Signal) -> Result<DeliverOutcome, ProcessError> {
-    let mut table = PROCESS_TABLE.lock();
-    let process = table
-        .iter_mut()
-        .find(|process| process.pid == pid)
-        .ok_or(ProcessError::NoSuchProcess(pid))?;
-    if process.has_exited() {
-        return Err(ProcessError::NoSuchProcess(pid));
+    let result = {
+        let mut table = PROCESS_TABLE.lock();
+        let process = table
+            .iter_mut()
+            .find(|process| process.pid == pid)
+            .ok_or(ProcessError::NoSuchProcess(pid))?;
+        if process.has_exited() {
+            return Err(ProcessError::NoSuchProcess(pid));
+        }
+        delivery_result(apply_signal(process, signal))
+    };
+    // UI readers inspect process signal state while holding their event lock,
+    // so PROCESS_TABLE must be dropped before taking that lock to notify them.
+    if result.is_ok() {
+        crate::ui::notify_signal(pid);
     }
-    delivery_result(apply_signal(process, signal))
+    result
 }
 
 /// Deliver a signal with an explicit stable `siginfo` source payload.
@@ -959,14 +976,20 @@ pub fn signal_with_info(
     signal: Signal,
     info: xenith_abi::SigInfo,
 ) -> Result<DeliverOutcome, ProcessError> {
-    let mut table = PROCESS_TABLE.lock();
-    let Some(process) = table
-        .iter_mut()
-        .find(|process| process.pid == pid && !process.has_exited())
-    else {
-        return Err(ProcessError::NoSuchProcess(pid));
+    let result = {
+        let mut table = PROCESS_TABLE.lock();
+        let Some(process) = table
+            .iter_mut()
+            .find(|process| process.pid == pid && !process.has_exited())
+        else {
+            return Err(ProcessError::NoSuchProcess(pid));
+        };
+        delivery_result(apply_signal_with_info(process, signal, Some(info)))
     };
-    delivery_result(apply_signal_with_info(process, signal, Some(info)))
+    if result.is_ok() {
+        crate::ui::notify_signal(pid);
+    }
+    result
 }
 
 /// Deliver a signal to every live member of a process group.
@@ -996,24 +1019,37 @@ fn signal_group_inner(
     let mut matched = 0usize;
     let mut delivered = 0usize;
     let mut queue_full = false;
+    let mut ui_owner_to_wake = None;
     for process in table
         .iter_mut()
         .filter(|process| process.process_group == process_group && !process.has_exited())
     {
         matched += 1;
         match delivery_result(apply_signal_with_info(process, signal, info)) {
-            Ok(_) => delivered += 1,
+            Ok(_) => {
+                delivered += 1;
+                if crate::ui::is_owner(process.pid) {
+                    ui_owner_to_wake = Some(process.pid);
+                }
+            },
             Err(ProcessError::SignalQueueFull) => queue_full = true,
             Err(error) => return Err(error),
         }
     }
-    if matched == 0 {
+    let result = if matched == 0 {
         Err(ProcessError::NoSuchProcess(process_group))
     } else if delivered == 0 && queue_full {
         Err(ProcessError::SignalQueueFull)
     } else {
         Ok(delivered)
+    };
+    drop(table);
+    if result.is_ok() {
+        if let Some(pid) = ui_owner_to_wake {
+            crate::ui::notify_signal(pid);
+        }
     }
+    result
 }
 
 fn delivery_result(outcome: DeliverOutcome) -> Result<DeliverOutcome, ProcessError> {

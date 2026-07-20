@@ -62,6 +62,11 @@ pub fn init(boot_info: &'static limine::BootInfo) {
         crate::kprintln!("xenith: failed to launch /init");
     }
 
+    // Every consumer of boot metadata has completed, the initramfs payload is
+    // owned by ramfs, and /init has been copied into its process image. Native
+    // handoffs can now return disjoint loader-only regions to the frame pool.
+    let _ = crate::mm::physical::reclaim_bootloader_memory(xenith_boot::BootInfo::new(boot_info));
+
     // Interrupts must be live before the first user task is dispatched: its
     // timeslicing and blocking I/O depend on the timer and device IRQs.
     // SAFETY: the IDT, interrupt controllers, scheduler, and per-CPU state

@@ -526,61 +526,76 @@ fn append_newc(output: &mut Vec<u8>, ino: u32, name: &str, mode: u32, data: &[u8
     }
 }
 
-pub fn pack_initramfs(
-    layout: &Layout,
-    programs: &[(String, PathBuf)],
-) -> Result<PathBuf, BuildError> {
+const INITRAMFS_MULTICALL_ALIASES: &[(&str, &str, &str)] = &[
+    ("bin/ls", "bin/coreutils", "coreutils"),
+    ("bin/cat", "bin/coreutils", "coreutils"),
+    ("bin/cp", "bin/coreutils", "coreutils"),
+    ("bin/mv", "bin/coreutils", "coreutils"),
+    ("bin/rm", "bin/coreutils", "coreutils"),
+    ("bin/mkdir", "bin/coreutils", "coreutils"),
+    ("bin/rmdir", "bin/coreutils", "coreutils"),
+    ("bin/echo", "bin/coreutils", "coreutils"),
+    ("bin/ps", "bin/coreutils", "coreutils"),
+    ("bin/uname", "bin/coreutils", "coreutils"),
+    ("bin/date", "bin/coreutils", "coreutils"),
+    ("bin/sleep", "bin/coreutils", "coreutils"),
+    ("bin/head", "bin/coreutils", "coreutils"),
+    ("bin/tail", "bin/coreutils", "coreutils"),
+    ("bin/wc", "bin/coreutils", "coreutils"),
+    ("bin/touch", "bin/coreutils", "coreutils"),
+    ("bin/env", "bin/coreutils", "coreutils"),
+    ("bin/kill", "bin/coreutils", "coreutils"),
+    ("bin/mount", "bin/coreutils", "coreutils"),
+    ("bin/umount", "bin/coreutils", "coreutils"),
+    ("bin/ln", "bin/coreutils", "coreutils"),
+    ("bin/chmod", "bin/coreutils", "coreutils"),
+    ("bin/chown", "bin/coreutils", "coreutils"),
+    ("bin/true", "bin/coreutils", "coreutils"),
+    ("bin/false", "bin/coreutils", "coreutils"),
+    ("bin/ed", "bin/editor", "editor"),
+    ("bin/vi", "bin/editor", "editor"),
+    ("bin/ifconfig", "bin/xenith-net", "xenith-net"),
+    ("bin/ping", "bin/xenith-net", "xenith-net"),
+    ("bin/nslookup", "bin/xenith-net", "xenith-net"),
+    ("bin/httpget", "bin/xenith-net", "xenith-net"),
+    ("bin/telnet", "bin/xenith-net", "xenith-net"),
+];
+
+fn build_initramfs(programs: &[(String, Vec<u8>)]) -> Result<Vec<u8>, BuildError> {
     let mut archive = Vec::new();
     let mut inode = 1u32;
     append_newc(&mut archive, inode, ".", 0o040755, &[]);
     inode += 1;
     append_newc(&mut archive, inode, "bin", 0o040755, &[]);
     inode += 1;
-    for (name, path) in programs {
-        append_newc(&mut archive, inode, name, 0o100755, &fs::read(path)?);
+    for (name, image) in programs {
+        append_newc(&mut archive, inode, name, 0o100755, image);
         inode += 1;
     }
-    let coreutils = programs
-        .iter()
-        .find(|(name, _)| name == "bin/coreutils")
-        .ok_or_else(|| BuildError::Usage("coreutils artifact not supplied".to_owned()))?;
-    for utility in [
-        "ls", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "echo", "ps", "uname", "date", "sleep",
-        "head", "tail", "wc", "touch", "env", "kill", "mount", "umount", "ln", "chmod", "chown",
-        "true", "false",
-    ] {
-        append_newc(
-            &mut archive,
-            inode,
-            &format!("bin/{utility}"),
-            0o100755,
-            &fs::read(&coreutils.1)?,
-        );
-        inode += 1;
-    }
-    for (utility, source_name) in [
-        ("ed", "bin/editor"),
-        ("vi", "bin/editor"),
-        ("ifconfig", "bin/xenith-net"),
-        ("ping", "bin/xenith-net"),
-        ("nslookup", "bin/xenith-net"),
-        ("httpget", "bin/xenith-net"),
-        ("telnet", "bin/xenith-net"),
-    ] {
-        let source = programs
-            .iter()
-            .find(|(name, _)| name == source_name)
-            .ok_or_else(|| BuildError::Usage(format!("{source_name} artifact not supplied")))?;
-        append_newc(
-            &mut archive,
-            inode,
-            &format!("bin/{utility}"),
-            0o100755,
-            &fs::read(&source.1)?,
-        );
+
+    for &(alias, source, target) in INITRAMFS_MULTICALL_ALIASES {
+        if !programs.iter().any(|(name, _)| name == source) {
+            return Err(BuildError::Usage(format!("{source} artifact not supplied")));
+        }
+        // These relative targets are resolved from /bin. Keeping each alias
+        // as a real symlink preserves argv[0] for multicall dispatch while
+        // storing the executable payload exactly once in the archive.
+        append_newc(&mut archive, inode, alias, 0o120777, target.as_bytes());
         inode += 1;
     }
     append_newc(&mut archive, inode, "TRAILER!!!", 0, &[]);
+    Ok(archive)
+}
+
+pub fn pack_initramfs(
+    layout: &Layout,
+    programs: &[(String, PathBuf)],
+) -> Result<PathBuf, BuildError> {
+    let images = programs
+        .iter()
+        .map(|(name, path)| Ok((name.clone(), fs::read(path)?)))
+        .collect::<Result<Vec<_>, BuildError>>()?;
+    let archive = build_initramfs(&images)?;
     let path = layout.output.join("initramfs.cpio");
     fs::write(&path, archive)?;
     Ok(path)
@@ -663,6 +678,38 @@ pub fn build_all(layout: &Layout) -> Result<Vec<PathBuf>, BuildError> {
 mod tests {
     use super::*;
 
+    fn parse_newc_hex(field: &[u8]) -> u32 {
+        u32::from_str_radix(core::str::from_utf8(field).unwrap(), 16).unwrap()
+    }
+
+    fn align_newc(value: usize) -> usize {
+        (value + 3) & !3
+    }
+
+    fn newc_entries(image: &[u8]) -> Vec<(&str, u32, &[u8])> {
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        while offset + 110 <= image.len() {
+            let header = &image[offset..offset + 110];
+            assert_eq!(&header[..6], b"070701");
+            let mode = parse_newc_hex(&header[14..22]);
+            let size = parse_newc_hex(&header[54..62]) as usize;
+            let name_size = parse_newc_hex(&header[94..102]) as usize;
+            let name_start = offset + 110;
+            let name_end = name_start + name_size;
+            assert_eq!(image[name_end - 1], 0);
+            let name = core::str::from_utf8(&image[name_start..name_end - 1]).unwrap();
+            let data_start = align_newc(name_end);
+            let data_end = data_start + size;
+            entries.push((name, mode, &image[data_start..data_end]));
+            offset = align_newc(data_end);
+            if name == "TRAILER!!!" {
+                break;
+            }
+        }
+        entries
+    }
+
     #[test]
     fn newc_header_and_alignment_are_valid() {
         let mut image = Vec::new();
@@ -671,6 +718,53 @@ mod tests {
         assert_eq!(image.len() % 4, 0);
         assert_eq!(&image[94..102], b"00000009");
         assert_eq!(&image[54..62], b"00000003");
+    }
+
+    #[test]
+    fn multicall_aliases_are_symlinks_and_smaller_than_copied_executables() {
+        let programs = vec![
+            ("bin/coreutils".to_owned(), vec![0x11; 16 * 1024]),
+            ("bin/editor".to_owned(), vec![0x22; 12 * 1024]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 20 * 1024]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+
+        for &(alias, _, target) in INITRAMFS_MULTICALL_ALIASES {
+            let (_, mode, data) = entries
+                .iter()
+                .find(|(name, _, _)| *name == alias)
+                .copied()
+                .unwrap();
+            assert_eq!(mode & 0o170000, 0o120000, "{alias} is not a symlink");
+            assert_eq!(data, target.as_bytes(), "wrong target for {alias}");
+        }
+
+        let mut symlink_records = Vec::new();
+        let mut duplicated_records = Vec::new();
+        for (index, &(alias, source, target)) in INITRAMFS_MULTICALL_ALIASES.iter().enumerate() {
+            let source_image = &programs
+                .iter()
+                .find(|(name, _)| name == source)
+                .expect("alias source exists")
+                .1;
+            append_newc(
+                &mut symlink_records,
+                index as u32 + 1,
+                alias,
+                0o120777,
+                target.as_bytes(),
+            );
+            append_newc(
+                &mut duplicated_records,
+                index as u32 + 1,
+                alias,
+                0o100755,
+                source_image,
+            );
+        }
+        assert!(symlink_records.len() < duplicated_records.len());
+        assert!(duplicated_records.len() - symlink_records.len() > 400 * 1024);
     }
 
     #[test]

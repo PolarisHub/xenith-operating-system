@@ -119,6 +119,13 @@ bitflags! {
 }
 
 impl PageTableFlags {
+    /// Bit 7 when used by a 4 KiB leaf PTE: the high PAT selector bit.
+    ///
+    /// Hardware reuses the same bit as `HUGE` in level-2/3 entries. The
+    /// mapper always knows the current level, so this alias lets leaf cache
+    /// policy code state its intent without changing the binary encoding.
+    pub const PAT_4K: Self = Self::HUGE;
+
     /// The "default kernel page" flag set: present, writable, global, no-execute.
     ///
     /// This is the combination used for most kernel data mappings (the HHDM,
@@ -615,6 +622,12 @@ mod tests {
         // The NX bit survives the round trip through bits().
         assert_eq!(f.bits() >> 63, 1);
         assert_eq!(f.bits() & (1 << 9), 1 << 9);
+    }
+
+    #[test]
+    fn leaf_pat_alias_uses_architectural_bit_seven() {
+        assert_eq!(PageTableFlags::PAT_4K.bits(), 1 << 7);
+        assert_eq!(PageTableFlags::PAT_4K.bits(), PageTableFlags::HUGE.bits());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use xenith_emu::{Machine, MachineConfig, RunSummary};
+use xenith_emu::{FramebufferConfig, Machine, MachineConfig, RunSummary};
 
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -18,6 +18,13 @@ pub fn boot_built_kernel(instruction_limit: u64) -> Result<RunSummary, String> {
 }
 
 pub fn load_built_kernel(instruction_limit: u64) -> Result<Machine, String> {
+    load_built_kernel_with_framebuffer(instruction_limit, None)
+}
+
+pub fn load_built_kernel_with_framebuffer(
+    instruction_limit: u64,
+    framebuffer: Option<FramebufferConfig>,
+) -> Result<Machine, String> {
     let root = workspace_root();
     let kernel_path = root.join("build/kernel.elf");
     let initrd_path = root.join("build/initramfs.cpio");
@@ -29,6 +36,7 @@ pub fn load_built_kernel(instruction_limit: u64) -> Result<Machine, String> {
         memory_bytes: 512 * 1024 * 1024,
         instruction_limit,
         mirror_serial: false,
+        framebuffer,
         ..MachineConfig::default()
     });
     machine

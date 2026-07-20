@@ -54,9 +54,10 @@ EFI/XENITH/initrd.cpio
 
 The builder reparses the raw manifest and FAT tree, validates the active
 partition and exact CHS geometry, checks the raw-disk prefix and zero cylinder
-tail, and compares all installed payloads byte-for-byte. External VMware
-legacy-BIOS and QEMU/SeaBIOS boots additionally prove the current BIOS ISO and
-raw artifacts to the userspace shell; arbitrary firmware and physical hardware
+tail, and compares all installed payloads byte-for-byte. Repository firmware
+gates prove the current BIOS ISO and raw artifacts to the userspace shell;
+external VMware legacy-BIOS and QEMU/SeaBIOS proof belongs to the preceding
+hashes recorded in `docs/STATUS.md`. Arbitrary firmware and physical hardware
 remain separate validation boundaries.
 
 ## Raw image format (`XENITHIM` version 1)

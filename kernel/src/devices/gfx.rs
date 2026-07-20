@@ -20,24 +20,20 @@
 //!
 //! # Pixel format
 //!
-//! Pixels are 32 bpp `0xRRGGBB` (the high byte is ignored / treated as padding
-//! by most Limine framebuffers, which are XRGB8888). [`Color::to_u32`] packs
-//! an RGB triple into that layout; the [`from_console`] constructor adapts the
-//! shared [`console::Color`] VGA palette so callers can mix console and gfx
-//! colours freely.
+//! [`Color`] is always a logical RGB value. [`PixelFormat`] describes how the
+//! firmware's 32-bit scanout stores those channels, and every pixel primitive
+//! packs through that descriptor. Both common XRGB8888 and RGBX8888 byte
+//! layouts therefore render correctly without exposing native byte order to
+//! higher-level drawing code.
 //!
 //! # Safety
 //!
 //! [`Framebuffer`] carries a `*mut u8` to video memory, which makes it
-//! `!Send`/`!Sync` by default. The unsafe impls below assert the same access
-//! discipline as the framebuffer console: the pointer is set once at init and
-//! every pixel store is a naturally-aligned volatile `u32` write within the
-//! `pitch * height` span. All drawing methods are `&self`; they perform only
-//! write-only volatile stores, so concurrent draws from multiple CPUs race
-//! only at the pixel granularity (last writer wins) and never corrupt memory
-//! outside the framebuffer.
+//! `!Send`/`!Sync` by default. It may be moved into one synchronized owner, but
+//! is deliberately not `Sync`: volatile stores are not atomic and concurrent
+//! writers would be a Rust data race. Every drawing method therefore requires
+//! `&mut self`.
 
-use alloc::boxed::Box;
 use core::ptr;
 
 use crate::console::Color as ConsoleColor;
@@ -47,12 +43,10 @@ use crate::devices::fb_font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
 // Colour
 // ---------------------------------------------------------------------------
 
-/// A 24-bit RGB colour packed as `0x00RRGGBB` for a 32 bpp framebuffer.
+/// A logical 24-bit RGB colour stored internally as `0x00RRGGBB`.
 ///
-/// The high byte is zero; on an XRGB8888 framebuffer it is written as padding
-/// and ignored by the scan-out hardware. Construct one with [`Color::new`]
-/// from raw `r/g/b` components, or with [`Color::from_console`] from a VGA
-/// palette entry so gfx and console output match on screen.
+/// Native scanout placement is deliberately not encoded here; every drawing
+/// primitive packs this value through its framebuffer's [`PixelFormat`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Color(u32);
 
@@ -113,6 +107,133 @@ impl Color {
 }
 
 // ---------------------------------------------------------------------------
+// Native 32-bit pixel layout
+// ---------------------------------------------------------------------------
+
+/// Validated channel layout for a 32-bit direct-colour framebuffer.
+///
+/// Each channel occupies one non-empty contiguous bit range. Ranges may use
+/// any width that fits in the 32-bit word and must not overlap. Logical
+/// [`Color`] values remain 8-bit RGB; [`pack_rgb`](Self::pack_rgb) scales each
+/// component to its native channel width with rounding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PixelFormat {
+    red_shift: u8,
+    red_size: u8,
+    green_shift: u8,
+    green_size: u8,
+    blue_shift: u8,
+    blue_size: u8,
+}
+
+impl PixelFormat {
+    /// Conventional little-endian B, G, R, unused-byte scanout layout.
+    pub const XRGB8888: Self = Self {
+        red_shift: 16,
+        red_size: 8,
+        green_shift: 8,
+        green_size: 8,
+        blue_shift: 0,
+        blue_size: 8,
+    };
+
+    /// Validate and construct a direct-colour layout.
+    #[must_use]
+    pub const fn new(
+        red_shift: u8,
+        red_size: u8,
+        green_shift: u8,
+        green_size: u8,
+        blue_shift: u8,
+        blue_size: u8,
+    ) -> Option<Self> {
+        if !channel_fits(red_shift, red_size)
+            || !channel_fits(green_shift, green_size)
+            || !channel_fits(blue_shift, blue_size)
+        {
+            return None;
+        }
+        let red = channel_mask(red_shift, red_size);
+        let green = channel_mask(green_shift, green_size);
+        let blue = channel_mask(blue_shift, blue_size);
+        if red & green != 0 || red & blue != 0 || green & blue != 0 {
+            return None;
+        }
+        Some(Self {
+            red_shift,
+            red_size,
+            green_shift,
+            green_size,
+            blue_shift,
+            blue_size,
+        })
+    }
+
+    #[must_use]
+    pub const fn red_shift(self) -> u8 {
+        self.red_shift
+    }
+
+    #[must_use]
+    pub const fn red_size(self) -> u8 {
+        self.red_size
+    }
+
+    #[must_use]
+    pub const fn green_shift(self) -> u8 {
+        self.green_shift
+    }
+
+    #[must_use]
+    pub const fn green_size(self) -> u8 {
+        self.green_size
+    }
+
+    #[must_use]
+    pub const fn blue_shift(self) -> u8 {
+        self.blue_shift
+    }
+
+    #[must_use]
+    pub const fn blue_size(self) -> u8 {
+        self.blue_size
+    }
+
+    /// Pack a logical 8-bit RGB triple into this native layout.
+    #[must_use]
+    pub const fn pack_rgb(self, red: u8, green: u8, blue: u8) -> u32 {
+        (scale_channel(red, self.red_size) << self.red_shift)
+            | (scale_channel(green, self.green_size) << self.green_shift)
+            | (scale_channel(blue, self.blue_size) << self.blue_shift)
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn pack(self, color: Color) -> u32 {
+        self.pack_rgb(color.r(), color.g(), color.b())
+    }
+}
+
+impl Default for PixelFormat {
+    fn default() -> Self {
+        Self::XRGB8888
+    }
+}
+
+const fn channel_fits(shift: u8, size: u8) -> bool {
+    size != 0 && (shift as u16) + (size as u16) <= 32
+}
+
+const fn channel_mask(shift: u8, size: u8) -> u32 {
+    ((((1_u64 << size) - 1) << shift) & u32::MAX as u64) as u32
+}
+
+const fn scale_channel(value: u8, size: u8) -> u32 {
+    let maximum = (1_u64 << size) - 1;
+    ((value as u64 * maximum + 127) / 255) as u32
+}
+
+// ---------------------------------------------------------------------------
 // Framebuffer geometry + clipping
 // ---------------------------------------------------------------------------
 
@@ -151,14 +272,14 @@ impl Rect {
     #[must_use]
     #[inline]
     pub const fn right(self) -> i32 {
-        self.x + self.w
+        self.x.saturating_add(self.w)
     }
 
     /// Bottom edge (exclusive): `y + h`.
     #[must_use]
     #[inline]
     pub const fn bottom(self) -> i32 {
-        self.y + self.h
+        self.y.saturating_add(self.h)
     }
 
     /// Returns `true` if `(px, py)` lies inside this rect.
@@ -179,7 +300,7 @@ impl Rect {
         let y = self.y.max(other.y);
         let right = self.right().min(other.right());
         let bottom = self.bottom().min(other.bottom());
-        Rect::new(x, y, right - x, bottom - y)
+        Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
     }
 }
 
@@ -204,16 +325,13 @@ pub struct Framebuffer {
     width: i32,
     /// Visible height in pixels.
     height: i32,
+    /// Native channel placement for each 32-bit scanout pixel.
+    format: PixelFormat,
 }
 
-// SAFETY: `Framebuffer` performs only write-only volatile `u32` stores into the
-// `pitch * height` span of the buffer, every store bounds-checked against the
-// visible rect before the pointer is formed. The pointer itself is set once at
-// construction and never mutated thereafter, so a `&Framebuffer` is safe to
-// share across CPUs: concurrent draws race only at pixel granularity (last
-// writer wins) and never write outside the framebuffer.
+// SAFETY: moving the handle transfers its unique logical ownership. It is not
+// Sync, and every write requires `&mut self`, so callers must serialize access.
 unsafe impl Send for Framebuffer {}
-unsafe impl Sync for Framebuffer {}
 
 impl Framebuffer {
     /// Construct a drawing surface from raw framebuffer parameters.
@@ -229,11 +347,25 @@ impl Framebuffer {
     #[must_use]
     #[inline]
     pub const fn new(buffer: *mut u8, pitch: usize, width: u16, height: u16) -> Self {
+        Self::with_format(buffer, pitch, width, height, PixelFormat::XRGB8888)
+    }
+
+    /// Construct a surface with an explicitly validated native pixel layout.
+    #[must_use]
+    #[inline]
+    pub const fn with_format(
+        buffer: *mut u8,
+        pitch: usize,
+        width: u16,
+        height: u16,
+        format: PixelFormat,
+    ) -> Self {
         Self {
             buffer,
             pitch,
             width: width as i32,
             height: height as i32,
+            format,
         }
     }
 
@@ -256,6 +388,13 @@ impl Framebuffer {
     #[inline]
     pub const fn pitch(&self) -> usize {
         self.pitch
+    }
+
+    /// Native channel layout used by the scanout.
+    #[must_use]
+    #[inline]
+    pub const fn pixel_format(&self) -> PixelFormat {
+        self.format
     }
 
     /// The full visible rectangle `{0, 0, width, height}`.
@@ -283,13 +422,13 @@ impl Framebuffer {
     /// drawing methods route through [`put_pixel`] (which bounds-checks) or
     /// call this after establishing bounds themselves.
     #[inline]
-    unsafe fn put_pixel_raw(&self, x: i32, y: i32, c: Color) {
+    unsafe fn put_pixel_raw(&mut self, x: i32, y: i32, c: Color) {
         let off = (y as usize) * self.pitch + (x as usize) * 4;
         // SAFETY: caller guarantees (x, y) in bounds, so `off` is within
         // `pitch * height`; the store is naturally aligned because `pitch` is
         // a multiple of 4 on any real 32 bpp framebuffer and `x*4` is too.
         unsafe {
-            ptr::write_volatile(self.buffer.add(off) as *mut u32, c.to_u32());
+            ptr::write_volatile(self.buffer.add(off) as *mut u32, self.format.pack(c));
         }
     }
 
@@ -298,7 +437,7 @@ impl Framebuffer {
     /// Out-of-bounds coordinates are silently dropped — this is the building
     /// block every other primitive uses, so a clipped draw never faults.
     #[inline]
-    pub fn put_pixel(&self, x: i32, y: i32, c: Color) {
+    pub fn put_pixel(&mut self, x: i32, y: i32, c: Color) {
         if self.in_bounds(x, y) {
             // SAFETY: just verified (x, y) is within the visible rect.
             unsafe { self.put_pixel_raw(x, y, c) };
@@ -312,12 +451,12 @@ impl Framebuffer {
     /// The rect is intersected with the visible framebuffer first, so a fill
     /// that extends past an edge paints only the visible portion. An empty or
     /// fully off-screen rect is a no-op.
-    pub fn fill_rect(&self, r: Rect, c: Color) {
+    pub fn fill_rect(&mut self, r: Rect, c: Color) {
         let clip = r.intersect(self.view_rect());
         if clip.is_empty() {
             return;
         }
-        let c32 = c.to_u32();
+        let c32 = self.format.pack(c);
         // Iterate scanlines; for each row write the run of pixels in one
         // linear pass. A volatile u32 store per pixel keeps ordering with
         // respect to other draws on the same core and matches what the
@@ -343,7 +482,7 @@ impl Framebuffer {
     /// right), each clipped to the visible rect. A rect thinner or shorter
     /// than 2 pixels collapses to a single filled bar, which is the correct
     /// degenerate behaviour.
-    pub fn draw_rect(&self, r: Rect, c: Color) {
+    pub fn draw_rect(&mut self, r: Rect, c: Color) {
         if r.is_empty() {
             return;
         }
@@ -355,11 +494,14 @@ impl Framebuffer {
         }
         // Left edge (skip the corners already drawn by top/bottom).
         if r.h > 2 {
-            self.fill_rect(Rect::new(r.x, r.y + 1, 1, r.h - 2), c);
+            self.fill_rect(Rect::new(r.x, r.y.saturating_add(1), 1, r.h - 2), c);
         }
         // Right edge.
         if r.h > 2 && r.w > 1 {
-            self.fill_rect(Rect::new(r.right() - 1, r.y + 1, 1, r.h - 2), c);
+            self.fill_rect(
+                Rect::new(r.right() - 1, r.y.saturating_add(1), 1, r.h - 2),
+                c,
+            );
         }
     }
 
@@ -372,17 +514,19 @@ impl Framebuffer {
     /// classic integer-error-accumulator formulation. Every plotted pixel goes
     /// through [`put_pixel`], so a line that runs off any edge is clipped
     /// rather than faulting.
-    pub fn draw_line(&self, x0: i32, y0: i32, x1: i32, y1: i32, c: Color) {
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
+    pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, c: Color) {
+        let dx = (i64::from(x1) - i64::from(x0)).abs();
+        let dy = -(i64::from(y1) - i64::from(y0)).abs();
+        let sx = if x0 < x1 { 1_i64 } else { -1_i64 };
+        let sy = if y0 < y1 { 1_i64 } else { -1_i64 };
         let mut err = dx + dy; // 2*dx + 2*dy before scaling; we use the /2 form.
-        let mut x = x0;
-        let mut y = y0;
+        let mut x = i64::from(x0);
+        let mut y = i64::from(y0);
         loop {
-            self.put_pixel(x, y, c);
-            if x == x1 && y == y1 {
+            if let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) {
+                self.put_pixel(x, y, c);
+            }
+            if x == i64::from(x1) && y == i64::from(y1) {
                 break;
             }
             // e2 = 2 * err; the standard Bresenham update.
@@ -409,15 +553,15 @@ impl Framebuffer {
     /// is filled even for blank rows, so successive characters tile cleanly
     /// without needing a separate clear pass. Both axes are clipped: a glyph
     /// that straddles the right or bottom edge draws only its visible pixels.
-    pub fn draw_char(&self, x: i32, y: i32, ch: u8, fg: Color, bg: Color) {
+    pub fn draw_char(&mut self, x: i32, y: i32, ch: u8, fg: Color, bg: Color) {
         let glyph = fb_font::glyph(ch);
         for (gy, bits) in glyph.into_iter().enumerate() {
-            let py = y + gy as i32;
+            let py = y.saturating_add(gy as i32);
             if py < 0 || py >= self.height {
                 continue;
             }
             for gx in 0..GLYPH_WIDTH {
-                let px = x + gx as i32;
+                let px = x.saturating_add(gx as i32);
                 if px < 0 || px >= self.width {
                     continue;
                 }
@@ -436,7 +580,7 @@ impl Framebuffer {
     /// return (`\r`) resets the x cursor to the original `x`. Other control
     /// bytes render as their (blank) glyph. The whole string is clipped to
     /// the visible framebuffer, so text running off any edge is dropped.
-    pub fn draw_str(&self, x: i32, y: i32, s: &str, fg: Color, bg: Color) {
+    pub fn draw_str(&mut self, x: i32, y: i32, s: &str, fg: Color, bg: Color) {
         let mut cx = x;
         let mut cy = y;
         let cell_w = GLYPH_WIDTH as i32;
@@ -444,7 +588,7 @@ impl Framebuffer {
         for b in s.bytes() {
             match b {
                 b'\n' => {
-                    cy += cell_h;
+                    cy = cy.saturating_add(cell_h);
                     cx = x;
                     continue;
                 },
@@ -454,7 +598,7 @@ impl Framebuffer {
                 },
                 _ => self.draw_char(cx, cy, b, fg, bg),
             }
-            cx += cell_w;
+            cx = cx.saturating_add(cell_w);
         }
     }
 
@@ -473,7 +617,7 @@ impl Framebuffer {
     /// primitive a scrolling console or drag-rect redraw would use. A
     /// cross-surface blit would take a second `&Framebuffer`; that is left for
     /// a future compositing layer.
-    pub fn blit(&self, src_rect: Rect, dst_x: i32, dst_y: i32) {
+    pub fn blit(&mut self, src_rect: Rect, dst_x: i32, dst_y: i32) {
         // Clip the source to the visible rect first; this also makes empty
         // sources a no-op.
         let src = src_rect.intersect(self.view_rect());
@@ -488,10 +632,10 @@ impl Framebuffer {
         if dst.is_empty() {
             return;
         }
-        let dx = dst.x - dst_full.x;
-        let dy = dst.y - dst_full.y;
-        let src_x = src.x + dx;
-        let src_y = src.y + dy;
+        let dx = dst.x.saturating_sub(dst_full.x);
+        let dy = dst.y.saturating_sub(dst_full.y);
+        let src_x = src.x.saturating_add(dx);
+        let src_y = src.y.saturating_add(dy);
         let w = dst.w;
         let h = dst.h;
         let row_bytes = (w as usize) * 4;
@@ -500,26 +644,32 @@ impl Framebuffer {
         // top-to-bottom so an upward scroll does not clobber rows it has yet
         // to read. Otherwise copy bottom-to-top.
         let forward = dst_y <= src_y;
-        let row_range: Box<dyn Iterator<Item = i32>> = if forward {
-            Box::new(0..h)
-        } else {
-            Box::new((0..h).rev())
-        };
-        for i in row_range {
-            let sy = src_y + i;
-            let dy_row = dst.y + i;
-            let src_off = (sy as usize) * self.pitch + (src_x as usize) * 4;
-            let dst_off = (dy_row as usize) * self.pitch + (dst.x as usize) * 4;
-            // SAFETY: both spans are within `pitch * height` (src and dst were
-            // clipped to the view rect) and `row_bytes <= pitch`. The copy
-            // direction was chosen above to be correct for overlap.
-            unsafe {
-                ptr::copy(
-                    self.buffer.add(src_off),
-                    self.buffer.add(dst_off),
-                    row_bytes,
-                );
+        if forward {
+            for i in 0..h {
+                self.copy_blit_row(src_x, src_y, dst, row_bytes, i);
             }
+        } else {
+            for i in (0..h).rev() {
+                self.copy_blit_row(src_x, src_y, dst, row_bytes, i);
+            }
+        }
+    }
+
+    #[inline]
+    fn copy_blit_row(&mut self, src_x: i32, src_y: i32, dst: Rect, row_bytes: usize, i: i32) {
+        let sy = src_y.saturating_add(i);
+        let dy_row = dst.y.saturating_add(i);
+        let src_off = (sy as usize) * self.pitch + (src_x as usize) * 4;
+        let dst_off = (dy_row as usize) * self.pitch + (dst.x as usize) * 4;
+        // SAFETY: both spans are within `pitch * height` (src and dst were
+        // clipped to the view rect) and `row_bytes <= pitch`. `ptr::copy`
+        // handles horizontal overlap; the caller selected vertical order.
+        unsafe {
+            ptr::copy(
+                self.buffer.add(src_off),
+                self.buffer.add(dst_off),
+                row_bytes,
+            );
         }
     }
 
@@ -529,7 +679,7 @@ impl Framebuffer {
     /// the inner loop can stride by `pitch`, but the visible result is the
     /// same. Used by the console backend's `clear` and by a splash screen's
     /// background fill.
-    pub fn clear(&self, c: Color) {
+    pub fn clear(&mut self, c: Color) {
         self.fill_rect(self.view_rect(), c);
     }
 }
@@ -563,6 +713,55 @@ mod tests {
     }
 
     #[test]
+    fn pixel_format_defaults_to_xrgb8888() {
+        let format = PixelFormat::default();
+        assert_eq!(format, PixelFormat::XRGB8888);
+        assert_eq!(format.red_shift(), 16);
+        assert_eq!(format.red_size(), 8);
+        assert_eq!(format.green_shift(), 8);
+        assert_eq!(format.green_size(), 8);
+        assert_eq!(format.blue_shift(), 0);
+        assert_eq!(format.blue_size(), 8);
+        assert_eq!(format.pack_rgb(0x12, 0x34, 0x56), 0x0012_3456);
+    }
+
+    #[test]
+    fn pixel_format_rejects_empty_out_of_word_and_overlapping_channels() {
+        assert!(PixelFormat::new(16, 0, 8, 8, 0, 8).is_none());
+        assert!(PixelFormat::new(31, 2, 8, 8, 0, 8).is_none());
+        assert!(PixelFormat::new(16, 8, 20, 8, 0, 8).is_none());
+    }
+
+    #[test]
+    fn pixel_format_scales_channels_and_supports_the_full_word() {
+        let rgb444 = PixelFormat::new(0, 4, 4, 4, 8, 4).expect("valid RGB444 layout");
+        assert_eq!(rgb444.pack_rgb(0, 128, 255), 0x0000_0f80);
+
+        let full = PixelFormat::new(0, 30, 30, 1, 31, 1).expect("valid 32-bit layout");
+        assert_eq!(full.pack_rgb(255, 255, 255), u32::MAX);
+        for width in 1..=32 {
+            assert_eq!(scale_channel(0, width), 0);
+            assert_eq!(u64::from(scale_channel(255, width)), (1_u64 << width) - 1);
+        }
+    }
+
+    #[test]
+    fn framebuffer_writes_use_the_native_channel_order() {
+        let mut pixels = [0_u32; 2];
+        let rgbx = PixelFormat::new(0, 8, 8, 8, 16, 8).expect("valid RGBX layout");
+        let mut framebuffer = Framebuffer::with_format(
+            pixels.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of_val(&pixels),
+            2,
+            1,
+            rgbx,
+        );
+        framebuffer.put_pixel(0, 0, Color::new(0x11, 0x22, 0x33));
+        framebuffer.put_pixel(1, 0, Color::new(0xaa, 0xbb, 0xcc));
+        assert_eq!(pixels, [0x0033_2211, 0x00cc_bbaa]);
+    }
+
+    #[test]
     fn rect_intersect_overlap() {
         let a = Rect::new(0, 0, 10, 10);
         let b = Rect::new(5, 5, 10, 10);
@@ -583,6 +782,14 @@ mod tests {
         assert!(r.contains(9, 9));
         assert!(!r.contains(10, 0));
         assert!(!r.contains(0, 10));
+    }
+
+    #[test]
+    fn rect_edge_arithmetic_saturates_at_integer_limits() {
+        let huge = Rect::new(i32::MAX - 2, i32::MAX - 3, 100, 100);
+        assert_eq!(huge.right(), i32::MAX);
+        assert_eq!(huge.bottom(), i32::MAX);
+        assert!(huge.intersect(Rect::new(0, 0, 10, 10)).is_empty());
     }
 
     #[test]

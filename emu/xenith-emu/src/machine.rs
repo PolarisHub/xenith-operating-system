@@ -202,6 +202,12 @@ struct FramebufferSurface {
     width: u16,
     height: u16,
     pitch: u16,
+    red_shift: u8,
+    red_size: u8,
+    green_shift: u8,
+    green_size: u8,
+    blue_shift: u8,
+    blue_size: u8,
 }
 
 pub struct Machine {
@@ -451,6 +457,12 @@ impl Machine {
                 width: geometry.width,
                 height: geometry.height,
                 pitch,
+                red_shift: 16,
+                red_size: 8,
+                green_shift: 8,
+                green_size: 8,
+                blue_shift: 0,
+                blue_size: 8,
             };
             let descriptor = Framebuffer {
                 address: payload as *mut u8,
@@ -458,6 +470,12 @@ impl Machine {
                 height: geometry.height,
                 pitch,
                 bpp: 32,
+                red_shift: 16,
+                red_size: 8,
+                green_shift: 8,
+                green_size: 8,
+                blue_shift: 0,
+                blue_size: 8,
             };
             write_struct(&mut self.bus, FRAMEBUFFER_INFO_PHYS, &descriptor)?;
             self.bus
@@ -699,6 +717,12 @@ impl Machine {
             width: boot.framebuffer.width,
             height: boot.framebuffer.height,
             pitch: boot.framebuffer.pitch,
+            red_shift: 16,
+            red_size: 8,
+            green_shift: 8,
+            green_size: 8,
+            blue_shift: 0,
+            blue_size: 8,
         });
         self.uefi_trace = Some(boot.trace);
         Ok(())
@@ -746,7 +770,17 @@ impl Machine {
             let row = y * usize::from(surface.pitch);
             for x in 0..usize::from(surface.width) {
                 let offset = row + x * 4;
-                ppm.extend_from_slice(&[pixels[offset + 2], pixels[offset + 1], pixels[offset]]);
+                let packed = u32::from_le_bytes([
+                    pixels[offset],
+                    pixels[offset + 1],
+                    pixels[offset + 2],
+                    pixels[offset + 3],
+                ]);
+                ppm.extend_from_slice(&[
+                    unpack_framebuffer_channel(packed, surface.red_shift, surface.red_size),
+                    unpack_framebuffer_channel(packed, surface.green_shift, surface.green_size),
+                    unpack_framebuffer_channel(packed, surface.blue_shift, surface.blue_size),
+                ]);
             }
         }
         Ok(Some(ppm))
@@ -1061,6 +1095,13 @@ impl Machine {
     }
 }
 
+fn unpack_framebuffer_channel(pixel: u32, shift: u8, size: u8) -> u8 {
+    debug_assert!(size != 0 && u16::from(shift) + u16::from(size) <= 32);
+    let maximum = (1_u64 << size) - 1;
+    let native = (u64::from(pixel) >> shift) & maximum;
+    ((native * 255 + maximum / 2) / maximum) as u8
+}
+
 fn install_acpi_tables(bus: &mut MemoryBus, processor_count: usize) -> Result<(), MemoryError> {
     debug_assert!((1..=MAX_EMULATED_CPUS).contains(&processor_count));
 
@@ -1360,6 +1401,12 @@ mod tests {
             width: 2,
             height: 1,
             pitch: 8,
+            red_shift: 16,
+            red_size: 8,
+            green_shift: 8,
+            green_size: 8,
+            blue_shift: 0,
+            blue_size: 8,
         });
         machine
             .bus
@@ -1368,6 +1415,35 @@ mod tests {
         assert_eq!(
             machine.framebuffer_ppm().unwrap().unwrap(),
             b"P6\n2 1\n255\n\x11\x22\x33\xAA\xBB\xCC"
+        );
+    }
+
+    #[test]
+    fn framebuffer_renderer_scales_native_channel_widths_to_ppm() {
+        let mut machine = Machine::new(MachineConfig {
+            memory_bytes: 1024 * 1024,
+            mirror_serial: false,
+            ..MachineConfig::default()
+        });
+        machine.framebuffer = Some(FramebufferSurface {
+            physical: 0x1000,
+            width: 1,
+            height: 1,
+            pitch: 4,
+            red_shift: 0,
+            red_size: 5,
+            green_shift: 5,
+            green_size: 6,
+            blue_shift: 11,
+            blue_size: 5,
+        });
+        machine
+            .bus
+            .write_physical(0x1000, &0x0000_841f_u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            machine.framebuffer_ppm().unwrap().unwrap(),
+            b"P6\n1 1\n255\n\xff\x82\x84"
         );
     }
 

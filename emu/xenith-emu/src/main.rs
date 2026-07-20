@@ -240,9 +240,10 @@ fn run() -> Result<(), String> {
         return Err("--uefi-iso supplies its packaged initrd".to_owned());
     }
     if (bios_image.is_some() || bios_iso.is_some() || uefi_iso.is_some()) && !memory_explicit {
-        // Stage2 deliberately reserves its 32 MiB kernel staging window and
-        // fixed 96 MiB initrd window. 256 MiB leaves the kernel's required
-        // contiguous heap while preserving that real BIOS-loader layout.
+        // Stage2 uses a 16 MiB kernel staging window at 16 MiB and loads the
+        // initrd from 32 MiB. Keep the CLI default comfortably above those
+        // compact low-memory ranges so larger development initrds and the
+        // kernel's adaptive runtime heap retain useful headroom.
         config.memory_bytes = 256 * 1024 * 1024;
     }
     let debug_limit = config.instruction_limit;

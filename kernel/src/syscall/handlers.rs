@@ -571,7 +571,7 @@ pub fn sys_exit(ctx: &SyscallContext) -> i64 {
     ::log::debug!(
         "syscall: exit({}) called by tid {}",
         code,
-        sched::task::with_current(|t| t.id.as_u64()).unwrap_or(0)
+        sched::scheduler::with_current_node(|node| node.task.id.as_u64()).unwrap_or(0)
     );
     crate::user::process::exit(code);
 }
@@ -739,31 +739,18 @@ pub fn sys_nanosleep(ctx: &SyscallContext) -> i64 {
         return e.as_ret();
     }
 
-    // Read the timespec from user memory. We read each field as a volatile
-    // byte sequence to avoid alignment assumptions about the user pointer,
-    // then assemble the struct from little-endian bytes.
-    let mut req = Timespec::default();
-    let req_arr = req_ptr as *const u8;
-    // SAFETY: `req_ptr` is a validated user address and the full 16-byte
-    // range was checked above. The `Timespec` layout is two i64s (16 bytes);
-    // we read them as raw byte sequences and reassemble so a misaligned user
-    // pointer does not trip an alignment fault.
-    let tv_sec = unsafe {
-        let mut bytes = [0u8; 8];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = core::ptr::read_volatile(req_arr.add(i));
-        }
-        i64::from_le_bytes(bytes)
+    // Use the architecture fault-fixup copy path rather than dereferencing a
+    // merely range-checked pointer. A mapped-range change or supervisor-only
+    // page now returns EFAULT instead of reaching the fatal kernel-fault path.
+    let mut bytes = [0u8; core::mem::size_of::<Timespec>()];
+    let byte_count = bytes.len();
+    if let Err(error) = copy_from_user(req_ptr, &mut bytes, byte_count) {
+        return error.as_ret();
+    }
+    let req = Timespec {
+        tv_sec: i64::from_ne_bytes(bytes[..8].try_into().expect("timespec seconds bytes")),
+        tv_nsec: i64::from_ne_bytes(bytes[8..].try_into().expect("timespec nanoseconds bytes")),
     };
-    let tv_nsec = unsafe {
-        let mut bytes = [0u8; 8];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = core::ptr::read_volatile(req_arr.add(8 + i));
-        }
-        i64::from_le_bytes(bytes)
-    };
-    req.tv_sec = tv_sec;
-    req.tv_nsec = tv_nsec;
 
     let dur = match req.to_duration() {
         Some(d) => d,
@@ -2163,6 +2150,147 @@ pub fn sys_net_info(ctx: &SyscallContext) -> i64 {
     match copy_to_user(ctx.arg(1), bytes, size) {
         Ok(_) => 0,
         Err(error) => error.as_ret(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exclusive userspace display and input session
+// ---------------------------------------------------------------------------
+
+fn ui_errno(error: crate::ui::UiError) -> Errno {
+    match error {
+        crate::ui::UiError::NoDisplay => Errno::Enodev,
+        crate::ui::UiError::Busy => Errno::Ebusy,
+        crate::ui::UiError::NotOwner | crate::ui::UiError::NoCurrentTask => Errno::Eperm,
+        crate::ui::UiError::InvalidArgument => Errno::Einval,
+        crate::ui::UiError::Fault => Errno::Efault,
+        crate::ui::UiError::Interrupted => Errno::Eintr,
+    }
+}
+
+/// `ui_acquire(info)` — exclusively acquire scanout and the desktop input seat.
+pub fn sys_ui_acquire(ctx: &SyscallContext) -> i64 {
+    let output = ctx.arg(0);
+    let size = core::mem::size_of::<xenith_abi::UiDisplayInfo>();
+    if let Err(error) = check_user_buf(output, size as u64) {
+        return error.as_ret();
+    }
+    let Some(pid) = crate::user::process::try_current_pid() else {
+        return Errno::Eperm.as_ret();
+    };
+    let already_owned = crate::ui::is_owner(pid);
+    let info = match crate::ui::acquire(pid) {
+        Ok(info) => info,
+        Err(error) => return ui_errno(error).as_ret(),
+    };
+    // SAFETY: UiDisplayInfo is repr(C), Copy, and every byte is initialized.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const xenith_abi::UiDisplayInfo).cast::<u8>(),
+            size,
+        )
+    };
+    match copy_to_user(output, bytes, size) {
+        Ok(_) => 0,
+        Err(error) => {
+            // A failed first acquisition must not strand the display. An
+            // idempotent acquire by the existing owner keeps its session.
+            if !already_owned {
+                let _ = crate::ui::release_if_owner(pid);
+            }
+            error.as_ret()
+        },
+    }
+}
+
+/// `ui_present(pixels, len, stride, rects, count, flags)` — publish damage.
+pub fn sys_ui_present(ctx: &SyscallContext) -> i64 {
+    if ctx.arg(5) != 0 {
+        return Errno::Einval.as_ret();
+    }
+    let Some(pid) = crate::user::process::try_current_pid() else {
+        return Errno::Eperm.as_ret();
+    };
+    let source = ctx.arg(0);
+    let source_len = match usize::try_from(ctx.arg(1)) {
+        Ok(0) | Err(_) => return Errno::Einval.as_ret(),
+        Ok(length) => length,
+    };
+    let source_stride = match usize::try_from(ctx.arg(2)) {
+        Ok(0) | Err(_) => return Errno::Einval.as_ret(),
+        Ok(stride) => stride,
+    };
+    if let Err(error) = check_user_buf(source, source_len as u64) {
+        return error.as_ret();
+    }
+
+    let damage_count = match usize::try_from(ctx.arg(4)) {
+        Ok(count) if count <= xenith_abi::UI_MAX_DAMAGE_RECTS => count,
+        _ => return Errno::Einval.as_ret(),
+    };
+    let mut damage = [xenith_abi::UiRect::default(); xenith_abi::UI_MAX_DAMAGE_RECTS];
+    if damage_count != 0 {
+        let byte_count = match damage_count.checked_mul(core::mem::size_of::<xenith_abi::UiRect>())
+        {
+            Some(length) => length,
+            None => return Errno::Einval.as_ret(),
+        };
+        // SAFETY: `damage` is initialized storage for UI_MAX_DAMAGE_RECTS
+        // repr(C) records containing only integers. The byte view is bounded
+        // to the requested prefix and any bit pattern is valid for UiRect.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(damage.as_mut_ptr().cast::<u8>(), byte_count)
+        };
+        if let Err(error) = copy_from_user(ctx.arg(3), bytes, byte_count) {
+            return error.as_ret();
+        }
+    }
+
+    match crate::ui::present(
+        pid,
+        source,
+        source_len,
+        source_stride,
+        &damage[..damage_count],
+    ) {
+        Ok(()) => 0,
+        Err(error) => ui_errno(error).as_ret(),
+    }
+}
+
+/// `ui_read_events(events, capacity, timeout_ns)` — read an ordered batch.
+pub fn sys_ui_read_events(ctx: &SyscallContext) -> i64 {
+    let capacity = match usize::try_from(ctx.arg(1)) {
+        Ok(0) => return 0,
+        Ok(capacity) if capacity <= xenith_abi::UI_MAX_EVENTS_PER_READ => capacity,
+        _ => return Errno::Einval.as_ret(),
+    };
+    let record_size = core::mem::size_of::<xenith_abi::UiInputEvent>();
+    let byte_count = match capacity.checked_mul(record_size) {
+        Some(length) => length,
+        None => return Errno::Einval.as_ret(),
+    };
+    if let Err(error) = check_user_buf(ctx.arg(0), byte_count as u64) {
+        return error.as_ret();
+    }
+    let Some(pid) = crate::user::process::try_current_pid() else {
+        return Errno::Eperm.as_ret();
+    };
+    let count = match crate::ui::read_events(pid, ctx.arg(0), capacity, ctx.arg(2)) {
+        Ok(count) => count,
+        Err(error) => return ui_errno(error).as_ret(),
+    };
+    count as i64
+}
+
+/// `ui_release()` — return scanout/input ownership to the kernel console.
+pub fn sys_ui_release(_ctx: &SyscallContext) -> i64 {
+    let Some(pid) = crate::user::process::try_current_pid() else {
+        return Errno::Eperm.as_ret();
+    };
+    match crate::ui::release(pid) {
+        Ok(()) => 0,
+        Err(error) => ui_errno(error).as_ret(),
     }
 }
 

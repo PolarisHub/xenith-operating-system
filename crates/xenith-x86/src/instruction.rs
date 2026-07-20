@@ -104,6 +104,8 @@ pub enum Mnemonic {
     Int3,
     /// CLTS: clear CR0.TS at CPL0.
     Clts,
+    /// WBINVD: write back modified cache lines and invalidate all caches.
+    Wbinvd,
     /// FNINIT: reset the architectural x87 state.
     Fninit,
     /// FXSAVE/FXSAVE64 legacy 512-byte state image.

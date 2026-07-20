@@ -422,13 +422,25 @@ pub fn handle_interrupt() {
             return;
         },
     };
-    let mut state = KEYBOARD.lock();
-    if !state.initialized {
-        return;
+    let (epoch, event) = {
+        let mut state = KEYBOARD.lock();
+        if !state.initialized {
+            return;
+        }
+        let epoch = crate::ui::input_epoch();
+        (epoch, state.feed(byte))
+    };
+    if let Some(event) = event {
+        crate::ui::route_key_event(epoch, event);
     }
-    if let Some(event) = state.feed(byte) {
-        state.enqueue(event);
-    }
+}
+
+/// Queue a decoded event for the kernel TTY path.
+///
+/// The UI router calls this while holding its epoch lock so acquiring a new
+/// graphical input session cannot race a late console-queue insertion.
+pub(crate) fn enqueue_console_event(event: KeyEvent) {
+    KEYBOARD.lock().enqueue(event);
 }
 
 /// Pop the oldest decoded key event.
@@ -440,6 +452,17 @@ pub fn pop_event() -> Option<KeyEvent> {
 #[must_use]
 pub fn pending_events() -> usize {
     KEYBOARD.lock().events.len()
+}
+
+/// Discard all decoded events while preserving pressed-key/modifier state.
+///
+/// Session transitions use this to prevent a keystroke queued for the text
+/// console from leaking into the newly acquired graphical input epoch.
+pub(crate) fn clear_events() {
+    let mut state = KEYBOARD.lock();
+    state.events.clear();
+    state.extended = false;
+    state.pause_index = 0;
 }
 
 /// Current modifier and lock state.

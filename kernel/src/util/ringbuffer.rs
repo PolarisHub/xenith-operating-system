@@ -184,6 +184,22 @@ impl<T, const N: usize> RingBuffer<T, N> {
         Some(unsafe { &*self.buf[slot].as_ptr() })
     }
 
+    /// Borrow the `index`th queued item without removing it.
+    ///
+    /// Index zero is the same item returned by [`peek`](Self::peek). This is
+    /// useful for staging a transactional batch before the consumer commits
+    /// it with the corresponding number of [`pop`](Self::pop) calls.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            return None;
+        }
+        let slot = (self.tail + index) % N;
+        // SAFETY: `index < len` identifies one of the initialized logical
+        // queue entries, and `slot` is reduced into the backing-array range.
+        Some(unsafe { &*self.buf[slot].as_ptr() })
+    }
+
     /// Borrow the oldest item mutably without removing it.
     ///
     /// Useful when the consumer wants to update an entry in place before
@@ -326,6 +342,22 @@ mod tests {
         assert_eq!(rb.len(), 2);
         assert_eq!(rb.pop(), Some(7));
         assert_eq!(rb.peek(), Some(&8));
+    }
+
+    #[test]
+    fn get_indexes_live_items_across_wrap_without_consuming() {
+        let mut rb: RingBuffer<u32, 3> = RingBuffer::new();
+        rb.push(1).unwrap();
+        rb.push(2).unwrap();
+        assert_eq!(rb.pop(), Some(1));
+        rb.push(3).unwrap();
+        rb.push(4).unwrap();
+
+        assert_eq!(rb.get(0), Some(&2));
+        assert_eq!(rb.get(1), Some(&3));
+        assert_eq!(rb.get(2), Some(&4));
+        assert_eq!(rb.get(3), None);
+        assert_eq!(rb.len(), 3);
     }
 
     #[test]

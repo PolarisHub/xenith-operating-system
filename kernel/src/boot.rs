@@ -33,6 +33,9 @@ const COMMAND_LINE_STORAGE_BYTES: usize = MAX_COMMAND_LINE_BYTES + 1;
 const BOOT_STATE_EMPTY: u8 = 0;
 const BOOT_STATE_WRITING: u8 = 1;
 const BOOT_STATE_READY: u8 = 2;
+const HANDOFF_UNKNOWN: u8 = 0;
+const HANDOFF_LEGACY: u8 = 1;
+const HANDOFF_XENITH: u8 = 2;
 
 const LIMINE_USABLE: u32 = 0;
 const LIMINE_RESERVED: u32 = 1;
@@ -211,6 +214,12 @@ const EMPTY_FRAMEBUFFER: limine::Framebuffer = limine::Framebuffer {
     height: 0,
     pitch: 0,
     bpp: 0,
+    red_shift: 0,
+    red_size: 0,
+    green_shift: 0,
+    green_size: 0,
+    blue_shift: 0,
+    blue_size: 0,
 };
 
 struct CompatStorage {
@@ -247,6 +256,16 @@ unsafe impl Sync for CompatStorageCell {}
 static COMPAT_STORAGE: CompatStorageCell =
     CompatStorageCell(UnsafeCell::new(CompatStorage::empty()));
 static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_STATE_EMPTY);
+static HANDOFF_KIND: AtomicU8 = AtomicU8::new(HANDOFF_UNKNOWN);
+
+/// Whether the active handoff was normalized from Xenith's owned-data boot
+/// protocol. Only that protocol gives the kernel enough provenance to reclaim
+/// loader memory without depending on legacy bootloader allocation details.
+#[inline]
+#[must_use]
+pub fn has_native_handoff() -> bool {
+    HANDOFF_KIND.load(Ordering::Acquire) == HANDOFF_XENITH
+}
 
 /// Detect the entry-point handoff without following nested pointers.
 ///
@@ -297,10 +316,15 @@ pub unsafe fn detect(raw: *const u8) -> Result<BootSource, BootError> {
 /// additional requirements for constructing a source from the entry pointer.
 pub unsafe fn normalize(source: BootSource) -> Result<&'static limine::BootInfo, BootError> {
     match source {
-        BootSource::Limine(info) => Ok(info),
+        BootSource::Limine(info) => {
+            HANDOFF_KIND.store(HANDOFF_LEGACY, Ordering::Release);
+            Ok(info)
+        },
         BootSource::Xenith(info) => {
             // SAFETY: the caller upholds the Xenith physical-memory contract.
-            unsafe { normalize_xenith(info) }
+            let normalized = unsafe { normalize_xenith(info)? };
+            HANDOFF_KIND.store(HANDOFF_XENITH, Ordering::Release);
+            Ok(normalized)
         },
     }
 }
@@ -389,7 +413,7 @@ unsafe fn populate_compat(
     let module_count = unsafe { copy_modules(info, storage, memory_count)? };
     // SAFETY: caller upholds physical metadata readability.
     let command_line = unsafe { copy_command_line(info, storage)? };
-    let framebuffer_count = copy_framebuffer(info.framebuffer, storage)?;
+    let framebuffer_count = copy_framebuffer(info.framebuffer, storage, memory_count)?;
     validate_rsdp(info.rsdp)?;
 
     let framebuffer = if framebuffer_count == 0 {
@@ -581,17 +605,39 @@ unsafe fn copy_command_line(
 fn copy_framebuffer(
     framebuffer: XenithFramebuffer,
     storage: &mut CompatStorage,
+    memory_count: usize,
 ) -> Result<u64, BootError> {
     if framebuffer.address == 0 {
         storage.framebuffer = EMPTY_FRAMEBUFFER;
         return Ok(0);
     }
-    if framebuffer.width == 0
-        || framebuffer.height == 0
-        || framebuffer.pitch == 0
-        || framebuffer.bpp == 0
-    {
+    if framebuffer.width == 0 || framebuffer.height == 0 || framebuffer.pitch == 0 {
         return Err(BootError::InvalidFramebuffer("zero geometry"));
+    }
+    if framebuffer.bpp != 32 {
+        return Err(BootError::InvalidFramebuffer(
+            "only 32-bpp modes are supported",
+        ));
+    }
+    if framebuffer.address & 3 != 0 {
+        return Err(BootError::InvalidFramebuffer(
+            "address is not 4-byte aligned",
+        ));
+    }
+    if framebuffer.pitch & 3 != 0 {
+        return Err(BootError::InvalidFramebuffer("pitch is not 4-byte aligned"));
+    }
+    if crate::devices::gfx::PixelFormat::new(
+        framebuffer.red_shift,
+        framebuffer.red_size,
+        framebuffer.green_shift,
+        framebuffer.green_size,
+        framebuffer.blue_shift,
+        framebuffer.blue_size,
+    )
+    .is_none()
+    {
+        return Err(BootError::InvalidFramebuffer("invalid RGB channel layout"));
     }
     let width = u16::try_from(framebuffer.width)
         .map_err(|_| BootError::InvalidFramebuffer("width exceeds u16"))?;
@@ -618,6 +664,15 @@ fn copy_framebuffer(
         .address
         .checked_add(byte_length)
         .ok_or(BootError::InvalidFramebuffer("byte range overflows"))?;
+    if overlaps_usable(
+        framebuffer.address,
+        byte_end,
+        &storage.memory_map[..memory_count],
+    ) {
+        return Err(BootError::InvalidFramebuffer(
+            "range overlaps allocator-usable memory",
+        ));
+    }
     if framebuffer.address < TRANSITION_PHYSICAL_LIMIT && byte_end > TRANSITION_PHYSICAL_LIMIT {
         return Err(BootError::InvalidFramebuffer(
             "range crosses the 4-GiB transition boundary",
@@ -632,6 +687,12 @@ fn copy_framebuffer(
         height,
         pitch,
         bpp: framebuffer.bpp,
+        red_shift: framebuffer.red_shift,
+        red_size: framebuffer.red_size,
+        green_shift: framebuffer.green_shift,
+        green_size: framebuffer.green_size,
+        blue_shift: framebuffer.blue_shift,
+        blue_size: framebuffer.blue_size,
     };
     Ok(1)
 }
@@ -813,14 +874,81 @@ mod tests {
             blue_shift: 0,
             blue_size: 8,
         };
-        assert_eq!(copy_framebuffer(valid, &mut storage), Ok(1));
+        assert_eq!(copy_framebuffer(valid, &mut storage, 0), Ok(1));
         assert_eq!(storage.framebuffer.width, 1024);
+        assert_eq!(storage.framebuffer.red_shift, 16);
+        assert_eq!(storage.framebuffer.red_size, 8);
+        assert_eq!(storage.framebuffer.green_shift, 8);
+        assert_eq!(storage.framebuffer.green_size, 8);
+        assert_eq!(storage.framebuffer.blue_shift, 0);
+        assert_eq!(storage.framebuffer.blue_size, 8);
 
         let mut too_wide = valid;
         too_wide.width = u32::from(u16::MAX) + 1;
         assert_eq!(
-            copy_framebuffer(too_wide, &mut storage),
+            copy_framebuffer(too_wide, &mut storage, 0),
             Err(BootError::InvalidFramebuffer("width exceeds u16"))
+        );
+    }
+
+    #[test]
+    fn framebuffer_conversion_rejects_unsupported_layout_and_usable_overlap() {
+        let mut storage = CompatStorage::empty();
+        let valid = XenithFramebuffer {
+            address: 0xe000_0000,
+            pitch: 4096,
+            width: 1024,
+            height: 768,
+            bpp: 32,
+            red_shift: 16,
+            red_size: 8,
+            green_shift: 8,
+            green_size: 8,
+            blue_shift: 0,
+            blue_size: 8,
+        };
+
+        let mut zero_channel = valid;
+        zero_channel.red_size = 0;
+        assert_eq!(
+            copy_framebuffer(zero_channel, &mut storage, 0),
+            Err(BootError::InvalidFramebuffer("invalid RGB channel layout"))
+        );
+
+        let mut overlap = valid;
+        overlap.green_shift = 20;
+        assert_eq!(
+            copy_framebuffer(overlap, &mut storage, 0),
+            Err(BootError::InvalidFramebuffer("invalid RGB channel layout"))
+        );
+
+        let mut unaligned_address = valid;
+        unaligned_address.address += 1;
+        assert_eq!(
+            copy_framebuffer(unaligned_address, &mut storage, 0),
+            Err(BootError::InvalidFramebuffer(
+                "address is not 4-byte aligned"
+            ))
+        );
+
+        let mut unaligned_pitch = valid;
+        unaligned_pitch.pitch += 2;
+        assert_eq!(
+            copy_framebuffer(unaligned_pitch, &mut storage, 0),
+            Err(BootError::InvalidFramebuffer("pitch is not 4-byte aligned"))
+        );
+
+        storage.memory_map[0] = limine::MemmapEntry {
+            base: valid.address,
+            length: 0x1000,
+            kind: LIMINE_USABLE,
+            reserved: 0,
+        };
+        assert_eq!(
+            copy_framebuffer(valid, &mut storage, 1),
+            Err(BootError::InvalidFramebuffer(
+                "range overlaps allocator-usable memory"
+            ))
         );
     }
 

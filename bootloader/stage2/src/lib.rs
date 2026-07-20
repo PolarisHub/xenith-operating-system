@@ -5,9 +5,9 @@
 pub const BIOS_SECTOR_SIZE: u64 = 512;
 pub const BIOS_MAX_TRANSFER_SECTORS: u64 = 64;
 pub const STAGE2_LOAD_ADDRESS: u64 = 0x8000;
-pub const KERNEL_STAGING_ADDRESS: u64 = 0x0200_0000;
-pub const KERNEL_STAGING_CAPACITY: u64 = 32 * 1024 * 1024;
-pub const INITRD_LOAD_ADDRESS: u64 = 0x0600_0000;
+pub const KERNEL_STAGING_ADDRESS: u64 = 0x0100_0000;
+pub const KERNEL_STAGING_CAPACITY: u64 = 16 * 1024 * 1024;
+pub const INITRD_LOAD_ADDRESS: u64 = 0x0200_0000;
 pub const INITRD_CAPACITY: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,5 +51,13 @@ mod tests {
     #[test]
     fn rejects_buffers_beyond_the_documented_bound() {
         assert_eq!(checked_buffer(1025, 1024), Err(BoundsError::TooLarge));
+    }
+
+    #[test]
+    fn bios_payload_staging_is_compact_and_non_overlapping() {
+        assert_eq!(
+            KERNEL_STAGING_ADDRESS + KERNEL_STAGING_CAPACITY,
+            INITRD_LOAD_ADDRESS
+        );
     }
 }

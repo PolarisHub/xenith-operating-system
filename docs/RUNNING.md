@@ -192,9 +192,10 @@ disk wizard does not affect an ISO boot.
 Power on with the virtual CD connected. The tested legacy-BIOS path selects a
 VBE framebuffer when available and reaches `Xenith shell 0.1` / `xenith$`.
 If VBE is unavailable, the loader deliberately falls back to VGA text.
-VMware Workstation 17.6.3 cold boots of the current ISO passed with 1, 3, 4,
-8, 16, and 24 vCPUs. The corresponding cores-per-socket values were 1, 1, 2,
-4, 8, and 12; 24 was the tested host's logical-CPU limit.
+VMware Workstation 17.6.3 cold boots of the preceding externally tested ISO
+passed with 1, 3, 4, 8, 16, and 24 vCPUs. The corresponding cores-per-socket
+values were 1, 1, 2, 4, 8, and 12; 24 was the tested host's logical-CPU limit.
+See [STATUS](STATUS.md) for its hash and the current artifact boundary.
 
 The ISO is the normal VMware path. Booting `build/xenith.img` directly requires
 a VMDK wrapper that maps the raw image; VMware does not accept the raw `.img`
@@ -219,10 +220,12 @@ before using a platform imaging tool.
 The packaged execution gates prove Xenith's exact BIOS stage streams and its
 exact UEFI application under the repository's deterministic service models.
 Separately, VMware Workstation 17.6.3 legacy BIOS cold boots on 2026-07-19
-proved the current ISO at 1, 3, 4, 8, 16, and 24 vCPUs. QEMU 11.0.50 with
-SeaBIOS 1.17 proved every integer ISO CPU count from 1 through 64, the raw image
-at 64 CPUs, and a 2-socket by 3-core topology with non-contiguous APIC IDs.
-Every tested configuration brought the requested CPUs online and reached
-`xenith$`. These results do not prove arbitrary firmware, option ROMs,
-physical devices, or physical hardware. QEMU/Limine scripts remain optional
-cross-validation aids and are not required by the primary build/test path.
+proved the preceding externally tested ISO at 1, 3, 4, 8, 16, and 24 vCPUs.
+QEMU 11.0.50 with SeaBIOS 1.17 proved every integer CPU count from 1 through
+64 for that ISO, its raw image at 64 CPUs, and a 2-socket by 3-core topology
+with non-contiguous APIC IDs. Every tested configuration brought the requested
+CPUs online and reached `xenith$`. [STATUS](STATUS.md) records the exact hashes
+and distinguishes that snapshot from the current repository-owned gates.
+These results do not prove arbitrary firmware, option ROMs, physical devices,
+or physical hardware. QEMU/Limine scripts remain optional cross-validation
+aids and are not required by the primary build/test path.

@@ -67,12 +67,16 @@ jobs:
         run: cargo test -p xenith-integration --test boot kernel_reaches_userspace_shell -- --ignored --exact
       - name: Emulator shell and coreutils gate
         run: cargo test -p xenith-integration --test shell shell_executes_builtins_and_coreutils_via_ps2 -- --ignored --exact
+      - name: Ring-3 framebuffer lifecycle gate
+        run: cargo test -p xenith-integration --test shell ring3_ui_smoke_restores_framebuffer_terminal -- --ignored --exact
       - name: Packaged image and BIOS firmware gates
         shell: pwsh
         run: |
           cargo test -p xenith-emu --test image_boot manifest_image_reaches_userspace_shell -- --ignored --exact
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p xenith-emu --test image_boot bios_firmware_image_reaches_userspace_shell -- --ignored --exact
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p xenith-emu --test image_boot bios_firmware_image_reaches_shell_with_64_mib -- --ignored --exact
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test -p xenith-emu --test image_boot bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell -- --ignored --exact
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

@@ -788,6 +788,41 @@ impl SignalState {
         *self.blocked.lock()
     }
 
+    /// Return whether a pending signal should interrupt a blocking syscall.
+    ///
+    /// Explicitly ignored signals and default-ignore/default-continue signals
+    /// do not produce a spurious `EINTR`. The normal syscall-return path
+    /// remains the sole owner of pending-state consumption.
+    #[must_use]
+    pub fn has_interrupting_delivery(&self) -> bool {
+        let blocked = *self.blocked.lock();
+        let pending = self.pending.lock();
+        let dispositions = self.dispositions.lock();
+        let mut scan = pending.set;
+        while let Some(sig) = scan.pop_lowest() {
+            if !sig.is_uncatchable() && blocked.is_blocked(sig) {
+                continue;
+            }
+            let disposition = if sig.is_uncatchable() {
+                SignalAction::Default
+            } else {
+                dispositions[(sig.as_number() - 1) as usize]
+            };
+            let ignored = match disposition {
+                SignalAction::Ignore => true,
+                SignalAction::Default => matches!(
+                    sig.default_action(),
+                    DefaultAction::Ignore | DefaultAction::Continue
+                ),
+                SignalAction::Catch { .. } => false,
+            };
+            if !ignored {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Install/disable/query the alternate stack for the calling userspace
     /// thread. The old value is always computed before a successful update.
     pub fn sigaltstack(
@@ -1858,6 +1893,32 @@ mod tests {
             deliver_signal(&st, Signal::Int),
             DeliverOutcome::AlreadyPending
         );
+    }
+
+    #[test]
+    fn blocking_wait_is_interrupted_only_by_effective_delivery() {
+        let ignored_default = SignalState::new();
+        assert_eq!(
+            deliver_signal(&ignored_default, Signal::Chld),
+            DeliverOutcome::NewlyPending
+        );
+        assert!(!ignored_default.has_interrupting_delivery());
+
+        let ignored_explicit = SignalState::new();
+        assert!(ignored_explicit.set_handler(Signal::Int, SignalAction::Ignore));
+        let _ = deliver_signal(&ignored_explicit, Signal::Int);
+        assert!(!ignored_explicit.has_interrupting_delivery());
+
+        let terminating = SignalState::new();
+        let _ = deliver_signal(&terminating, Signal::Term);
+        assert!(terminating.has_interrupting_delivery());
+
+        let blocked = SignalState::new();
+        let mut mask = SignalMask::empty();
+        mask.block(Signal::Int);
+        blocked.set_blocked(mask);
+        let _ = deliver_signal(&blocked, Signal::Int);
+        assert!(!blocked.has_interrupting_delivery());
     }
 
     #[test]

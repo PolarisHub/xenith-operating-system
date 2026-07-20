@@ -61,7 +61,7 @@
 
 use core::ptr;
 
-use xenith_types::{Page, PageRange, PageTableLevel, PhysAddr, PhysFrame, PAGE_SIZE};
+use xenith_types::{Page, PageRange, PageTableLevel, PhysAddr, PhysFrame, VirtAddr, PAGE_SIZE};
 
 use super::page_table::{
     p1_index, p2_index, p3_index, p4_index, PageTable, PageTableEntry, PageTableFlags,
@@ -162,6 +162,20 @@ pub enum UnmapError {
     /// from a 2 MiB / 1 GiB mapping is not supported; the caller must unmap the
     /// whole large page.
     HugeConflict,
+}
+
+/// Why a cache-policy update for an existing mapping failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicyError {
+    /// The supplied byte range is empty, overflows, or has mismatched virtual
+    /// and physical page offsets.
+    InvalidRange,
+    /// At least one page in the requested range is not mapped.
+    NotMapped,
+    /// The existing mapping does not point at the expected physical frame.
+    PhysicalMismatch,
+    /// A huge mapping needed splitting but no page-table frame was available.
+    OutOfMemory,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +419,96 @@ impl Mapper {
         Ok(current_frame)
     }
 
+    /// Select PAT entry 4 (write-combining) for an existing contiguous range.
+    ///
+    /// The range is first validated in full. Any covering 1 GiB or 2 MiB
+    /// mappings are split while preserving their physical mapping and access
+    /// flags; only the 4 KiB leaves that overlap the requested bytes receive
+    /// the WC selector. A failed validation may leave harmless smaller page
+    /// tables behind, but never a partial cache-policy change.
+    ///
+    /// This is intended for the boot framebuffer and must run during
+    /// single-CPU memory initialization, before AP startup or concurrent page
+    /// table mutation. The caller must have programmed PAT entry 4 as WC on
+    /// the current processor before calling it.
+    pub fn set_write_combining_range(
+        &self,
+        virtual_start: VirtAddr,
+        physical_start: PhysAddr,
+        length: usize,
+        alloc: &dyn FrameAllocator,
+    ) -> Result<usize, CachePolicyError> {
+        let length = u64::try_from(length).map_err(|_| CachePolicyError::InvalidRange)?;
+        if length == 0 {
+            return Err(CachePolicyError::InvalidRange);
+        }
+
+        let page_offset = physical_start.as_u64() & (PAGE_SIZE - 1);
+        if virtual_start.as_u64() & (PAGE_SIZE - 1) != page_offset {
+            return Err(CachePolicyError::InvalidRange);
+        }
+        let covered = page_offset
+            .checked_add(length)
+            .ok_or(CachePolicyError::InvalidRange)?;
+        let page_count = covered
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(CachePolicyError::InvalidRange)?
+            / PAGE_SIZE;
+        let virtual_base_raw = virtual_start
+            .as_u64()
+            .checked_sub(page_offset)
+            .ok_or(CachePolicyError::InvalidRange)?;
+        let virtual_base = VirtAddr::new(virtual_base_raw).ok_or(CachePolicyError::InvalidRange)?;
+        let physical_base = physical_start.as_u64() - page_offset;
+
+        // Preflight every page and split covering huge mappings first. Cache
+        // flags are not changed in this pass, so any later error cannot leave
+        // the framebuffer half-WC and half-WB.
+        for index in 0..page_count {
+            let page = Page::containing_addr(
+                VirtAddr::new(
+                    virtual_base
+                        .as_u64()
+                        .checked_add(index * PAGE_SIZE)
+                        .ok_or(CachePolicyError::InvalidRange)?,
+                )
+                .ok_or(CachePolicyError::InvalidRange)?,
+            );
+            let leaf = self.walk_to_leaf_splitting(page, alloc)?;
+            let expected = physical_base
+                .checked_add(index * PAGE_SIZE)
+                .ok_or(CachePolicyError::InvalidRange)?;
+            if leaf.frame().map(|frame| frame.start_address().as_u64()) != Some(expected) {
+                return Err(CachePolicyError::PhysicalMismatch);
+            }
+        }
+
+        // Early console/splash writes happened through the loader's WB
+        // mapping. Flush dirty cache lines before changing the memory type;
+        // a TLB invalidation alone cannot make mixed WB/WC aliases coherent.
+        // This API is restricted to single-CPU boot, so one WBINVD covers all
+        // processors that could have touched the framebuffer so far.
+        // SAFETY: full preflight succeeded, APs are not started yet, and no
+        // concurrent code can access the framebuffer during this transition.
+        unsafe { crate::arch::x86_64::wbinvd() };
+
+        // The full range is now known-good and backed by 4 KiB leaves.
+        for index in 0..page_count {
+            let address = VirtAddr::new(virtual_base.as_u64() + index * PAGE_SIZE)
+                .ok_or(CachePolicyError::InvalidRange)?;
+            let leaf = self
+                .walk_to_leaf_mut(Page::containing_addr(address))
+                .ok_or(CachePolicyError::NotMapped)?;
+            leaf.set_flags(write_combining_leaf_flags(leaf.flags()));
+        }
+
+        // The HHDM leaves are global. The SMP helper toggles CR4.PGE on the
+        // local CPU before AP startup and becomes a real cross-CPU shootdown
+        // if this API is reused after SMP is online.
+        crate::arch::x86_64::smp::shootdown_kernel_all();
+        Ok(page_count as usize)
+    }
+
     // -- unmapping ---------------------------------------------------------
 
     /// Unmap a single page, clearing its leaf PTE and invalidating the TLB.
@@ -590,6 +694,49 @@ impl Mapper {
         Some(p1.entry_mut(p1_index(page.start_address())))
     }
 
+    /// Walk to a 4 KiB leaf, splitting a covering huge page when necessary.
+    #[allow(clippy::mut_from_ref)]
+    fn walk_to_leaf_splitting(
+        &self,
+        page: Page,
+        alloc: &dyn FrameAllocator,
+    ) -> Result<&mut PageTableEntry, CachePolicyError> {
+        // SAFETY: this is called only during the single-BSP page-table setup
+        // phase (or under the same external address-space lock as `map`).
+        let p4 = unsafe { self.p4_mut() };
+        let p4e = *p4.entry(p4_index(page.start_address()));
+        if !p4e.is_present() || p4e.is_huge() {
+            return Err(CachePolicyError::NotMapped);
+        }
+        // SAFETY: the present PML4 entry names a PDPT and mutation is exclusive.
+        let p3 = unsafe { frame_as_table_mut(p4e.frame().ok_or(CachePolicyError::NotMapped)?) };
+        let p3i = p3_index(page.start_address());
+        if !p3.entry(p3i).is_present() {
+            return Err(CachePolicyError::NotMapped);
+        }
+        if p3.entry(p3i).is_huge() {
+            split_one_gib_entry(p3, p3i, alloc)?;
+        }
+        let p3e = *p3.entry(p3i);
+        // SAFETY: a present non-huge PDPT entry names a PD.
+        let p2 = unsafe { frame_as_table_mut(p3e.frame().ok_or(CachePolicyError::NotMapped)?) };
+        let p2i = p2_index(page.start_address());
+        if !p2.entry(p2i).is_present() {
+            return Err(CachePolicyError::NotMapped);
+        }
+        if p2.entry(p2i).is_huge() {
+            split_two_mib_entry(p2, p2i, alloc)?;
+        }
+        let p2e = *p2.entry(p2i);
+        // SAFETY: a present non-huge PD entry names a PT.
+        let p1 = unsafe { frame_as_table_mut(p2e.frame().ok_or(CachePolicyError::NotMapped)?) };
+        let leaf = p1.entry_mut(p1_index(page.start_address()));
+        if !leaf.is_present() {
+            return Err(CachePolicyError::NotMapped);
+        }
+        Ok(leaf)
+    }
+
     /// Walk the table read-only and resolve `page` to its frame and flags,
     /// handling huge pages at levels 2 and 3.
     ///
@@ -659,6 +806,90 @@ impl Mapper {
         // SAFETY: see `p4_mut`; the cast is sound for the same layout reasons.
         unsafe { &*(va.as_u64() as *const PageTable) }
     }
+}
+
+fn write_combining_leaf_flags(mut flags: PageTableFlags) -> PageTableFlags {
+    // PAT=1, PCD=0, PWT=0 selects entry 4. Bit 7 is `PAT_4K` at this level,
+    // not a huge-page marker.
+    flags.remove(PageTableFlags::CACHE_DISABLE | PageTableFlags::WRITE_THROUGH);
+    flags.insert(PageTableFlags::PAT_4K | PageTableFlags::NO_EXECUTE);
+    flags
+}
+
+fn split_one_gib_entry(
+    parent: &mut PageTable,
+    index: xenith_types::PageTableIndex,
+    alloc: &dyn FrameAllocator,
+) -> Result<(), CachePolicyError> {
+    let old = *parent.entry(index);
+    if !old.is_present() || !old.is_huge() {
+        return Err(CachePolicyError::NotMapped);
+    }
+    // Bit 12 is the PAT bit for a huge leaf. Xenith's boot direct map is WB;
+    // refusing an unexpected non-WB 1 GiB mapping avoids silently changing
+    // the type of the other 511 child regions while splitting it.
+    if old.bits() & (1 << 12) != 0 {
+        return Err(CachePolicyError::InvalidRange);
+    }
+    let frame = alloc.allocate().ok_or(CachePolicyError::OutOfMemory)?;
+    // SAFETY: the allocator returned this page-table frame exclusively.
+    unsafe { zero_frame(&frame) };
+    // SAFETY: the fresh zeroed frame is exclusively owned until linked below.
+    let child = unsafe { frame_as_table_mut(frame) };
+    let base = old.addr().as_u64() & !((1_u64 << 30) - 1);
+    let mut child_flags = old.flags();
+    child_flags.insert(PageTableFlags::HUGE);
+    for (slot, entry) in child.entries_mut().iter_mut().enumerate() {
+        let physical = base + (slot as u64) * (1 << 21);
+        entry.set_frame(
+            PhysFrame::containing_addr(PhysAddr::new_truncate(physical)),
+            child_flags,
+        );
+    }
+    let intermediate = if old.is_user() {
+        INTERMEDIATE_USER
+    } else {
+        INTERMEDIATE_KERNEL
+    };
+    parent.entry_mut(index).set_frame(frame, intermediate);
+    Ok(())
+}
+
+fn split_two_mib_entry(
+    parent: &mut PageTable,
+    index: xenith_types::PageTableIndex,
+    alloc: &dyn FrameAllocator,
+) -> Result<(), CachePolicyError> {
+    let old = *parent.entry(index);
+    if !old.is_present() || !old.is_huge() {
+        return Err(CachePolicyError::NotMapped);
+    }
+    let frame = alloc.allocate().ok_or(CachePolicyError::OutOfMemory)?;
+    // SAFETY: the allocator returned this page-table frame exclusively.
+    unsafe { zero_frame(&frame) };
+    // SAFETY: the fresh zeroed frame is exclusively owned until linked below.
+    let child = unsafe { frame_as_table_mut(frame) };
+    let base = old.addr().as_u64() & !((1_u64 << 21) - 1);
+    let huge_pat = old.bits() & (1 << 12) != 0;
+    let mut child_flags = old.flags();
+    child_flags.remove(PageTableFlags::HUGE);
+    if huge_pat {
+        child_flags.insert(PageTableFlags::PAT_4K);
+    }
+    for (slot, entry) in child.entries_mut().iter_mut().enumerate() {
+        let physical = base + (slot as u64) * PAGE_SIZE;
+        entry.set_frame(
+            PhysFrame::containing_addr(PhysAddr::new_truncate(physical)),
+            child_flags,
+        );
+    }
+    let intermediate = if old.is_user() {
+        INTERMEDIATE_USER
+    } else {
+        INTERMEDIATE_KERNEL
+    };
+    parent.entry_mut(index).set_frame(frame, intermediate);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -821,6 +1052,25 @@ mod tests {
         assert!(INTERMEDIATE_USER.contains(PageTableFlags::PRESENT));
         assert!(INTERMEDIATE_USER.contains(PageTableFlags::WRITABLE));
         assert!(INTERMEDIATE_USER.contains(PageTableFlags::USER));
+    }
+
+    #[test]
+    fn framebuffer_wc_selects_pat_entry_four_and_preserves_access() {
+        let original = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::GLOBAL
+            | PageTableFlags::CACHE_DISABLE
+            | PageTableFlags::WRITE_THROUGH;
+        let updated = write_combining_leaf_flags(original);
+        assert!(updated.contains(
+            PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::GLOBAL
+                | PageTableFlags::PAT_4K
+                | PageTableFlags::NO_EXECUTE
+        ));
+        assert!(!updated.contains(PageTableFlags::CACHE_DISABLE));
+        assert!(!updated.contains(PageTableFlags::WRITE_THROUGH));
     }
 
     #[test]

@@ -72,6 +72,18 @@ pub struct Framebuffer {
     pub height: u16,
     /// Bits per pixel.
     pub bpp: u16,
+    /// Least-significant bit of the red channel.
+    pub red_shift: u8,
+    /// Number of bits in the red channel.
+    pub red_size: u8,
+    /// Least-significant bit of the green channel.
+    pub green_shift: u8,
+    /// Number of bits in the green channel.
+    pub green_size: u8,
+    /// Least-significant bit of the blue channel.
+    pub blue_shift: u8,
+    /// Number of bits in the blue channel.
+    pub blue_size: u8,
     /// Total byte size of the visible buffer (`pitch * height`).
     pub size: usize,
 }
@@ -362,6 +374,12 @@ impl Iterator for FramebufferIter {
             width: fb.width,
             height: fb.height,
             bpp: fb.bpp,
+            red_shift: fb.red_shift,
+            red_size: fb.red_size,
+            green_shift: fb.green_shift,
+            green_size: fb.green_size,
+            blue_shift: fb.blue_shift,
+            blue_size: fb.blue_size,
             size: (fb.pitch as usize) * (fb.height as usize),
         })
     }
@@ -394,4 +412,41 @@ fn cstr_to_str(ptr: *const core::ffi::c_char) -> &'static str {
     // for `'static`. We read it read-only.
     let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
     core::str::from_utf8(bytes).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FramebufferIter;
+
+    #[test]
+    fn framebuffer_iterator_preserves_native_channel_layout() {
+        let raw = limine::Framebuffer {
+            address: 0x1000 as *mut u8,
+            width: 320,
+            height: 200,
+            pitch: 1280,
+            bpp: 32,
+            red_shift: 0,
+            red_size: 10,
+            green_shift: 10,
+            green_size: 10,
+            blue_shift: 20,
+            blue_size: 10,
+        };
+        let slots = [&raw as *const limine::Framebuffer];
+        let mut iter = FramebufferIter {
+            ptr: slots.as_ptr(),
+            count: 1,
+            index: 0,
+        };
+
+        let framebuffer = iter.next().expect("one framebuffer");
+        assert_eq!(framebuffer.red_shift, 0);
+        assert_eq!(framebuffer.red_size, 10);
+        assert_eq!(framebuffer.green_shift, 10);
+        assert_eq!(framebuffer.green_size, 10);
+        assert_eq!(framebuffer.blue_shift, 20);
+        assert_eq!(framebuffer.blue_size, 10);
+        assert_eq!(framebuffer.size, 1280 * 200);
+    }
 }

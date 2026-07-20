@@ -126,6 +126,10 @@ pub enum SyscallNumber {
     Sigprocmask = 51,
     GetRandom = 52,
     Sigaltstack = 53,
+    UiAcquire = 54,
+    UiPresent = 55,
+    UiReadEvents = 56,
+    UiRelease = 57,
 }
 
 /// `read` — read up to `count` bytes from `fd` into `buf`.
@@ -206,13 +210,17 @@ pub const SYS_SIGACTION: u64 = SyscallNumber::Sigaction as u64;
 pub const SYS_SIGPROCMASK: u64 = SyscallNumber::Sigprocmask as u64;
 pub const SYS_GETRANDOM: u64 = SyscallNumber::GetRandom as u64;
 pub const SYS_SIGALTSTACK: u64 = SyscallNumber::Sigaltstack as u64;
+pub const SYS_UI_ACQUIRE: u64 = SyscallNumber::UiAcquire as u64;
+pub const SYS_UI_PRESENT: u64 = SyscallNumber::UiPresent as u64;
+pub const SYS_UI_READ_EVENTS: u64 = SyscallNumber::UiReadEvents as u64;
+pub const SYS_UI_RELEASE: u64 = SyscallNumber::UiRelease as u64;
 
 /// The number of slots in the [`SYSCALLS`] table.
 ///
 /// This is one past the highest assigned syscall number so that every assigned
 /// number is a valid in-bounds index. Growing the table means bumping this and
 /// extending the array initialiser in lockstep.
-pub const NUM_SYSCALLS: usize = 54;
+pub const NUM_SYSCALLS: usize = 58;
 
 // ---------------------------------------------------------------------------
 // The table
@@ -229,60 +237,64 @@ pub const NUM_SYSCALLS: usize = 54;
 /// `'static` and needs no allocator. Handlers are defined in
 /// [`super::handlers`] and referenced here by name.
 pub static SYSCALLS: [Option<SyscallFn>; NUM_SYSCALLS] = [
-    Some(super::handlers::sys_read),          // 0  read
-    Some(super::handlers::sys_write),         // 1  write
-    Some(super::handlers::sys_open),          // 2  open
-    Some(super::handlers::sys_close),         // 3  close
-    Some(super::handlers::sys_exit),          // 4  exit
-    Some(super::handlers::sys_brk),           // 5  brk
-    Some(super::handlers::sys_mmap),          // 6  mmap
-    Some(super::handlers::sys_munmap),        // 7  munmap
-    Some(super::handlers::sys_getpid),        // 8  getpid
-    Some(super::handlers::sys_getppid),       // 9  getppid
-    Some(super::handlers::sys_yield),         // 10 yield
-    Some(super::handlers::sys_nanosleep),     // 11 nanosleep
-    Some(super::handlers::sys_fork),          // 12 fork
-    Some(super::handlers::sys_exec),          // 13 exec
-    Some(super::handlers::sys_waitpid),       // 14 waitpid
-    Some(super::handlers::sys_uname),         // 15 uname
-    Some(super::handlers::sys_ioctl),         // 16 ioctl
-    Some(super::handlers::sys_lseek),         // 17 lseek
-    Some(super::handlers::sys_stat),          // 18 stat
-    Some(super::handlers::sys_dup),           // 19 dup
-    Some(super::handlers::sys_dup2),          // 20 dup2
-    Some(super::handlers::sys_pipe),          // 21 pipe
-    Some(super::handlers::sys_chdir),         // 22 chdir
-    Some(super::handlers::sys_getcwd),        // 23 getcwd
-    Some(super::handlers::sys_mkdir),         // 24 mkdir
-    Some(super::handlers::sys_unlink),        // 25 unlink
-    Some(super::handlers::sys_read_dir),      // 26 read_dir
-    Some(super::handlers::sys_clock_gettime), // 27 clock_gettime
-    Some(super::handlers::sys_spawn),         // 28 spawn
-    Some(super::handlers::sys_socket),        // 29 socket
-    Some(super::handlers::sys_bind),          // 30 bind
-    Some(super::handlers::sys_listen),        // 31 listen
-    Some(super::handlers::sys_accept),        // 32 accept
-    Some(super::handlers::sys_connect),       // 33 connect
-    Some(super::handlers::sys_send),          // 34 send
-    Some(super::handlers::sys_recv),          // 35 recv
-    Some(super::handlers::sys_net_info),      // 36 net_info
-    Some(super::handlers::sys_kill),          // 37 kill
-    Some(super::handlers::sys_mount_ramfs),   // 38 mount_ramfs
-    Some(super::handlers::sys_unmount),       // 39 unmount
-    Some(super::handlers::sys_symlink),       // 40 symlink
-    Some(super::handlers::sys_chmod),         // 41 chmod
-    Some(super::handlers::sys_chown),         // 42 chown
-    Some(super::handlers::sys_utimens),       // 43 utimens
-    Some(super::handlers::sys_rmdir),         // 44 rmdir
-    Some(super::handlers::sys_setpgid),       // 45 setpgid
-    Some(super::handlers::sys_getpgrp),       // 46 getpgrp
-    Some(super::handlers::sys_setsid),        // 47 setsid
-    Some(super::handlers::sys_open_pty),      // 48 openpty
-    Some(super::handlers::sys_sigreturn),     // 49 sigreturn (live-frame entry special-case)
-    Some(super::handlers::sys_sigaction),     // 50 sigaction
-    Some(super::handlers::sys_sigprocmask),   // 51 sigprocmask
-    Some(crate::devices::rng::sys_getrandom), // 52 getrandom
-    Some(super::handlers::sys_sigaltstack),   // 53 sigaltstack
+    Some(super::handlers::sys_read),           // 0  read
+    Some(super::handlers::sys_write),          // 1  write
+    Some(super::handlers::sys_open),           // 2  open
+    Some(super::handlers::sys_close),          // 3  close
+    Some(super::handlers::sys_exit),           // 4  exit
+    Some(super::handlers::sys_brk),            // 5  brk
+    Some(super::handlers::sys_mmap),           // 6  mmap
+    Some(super::handlers::sys_munmap),         // 7  munmap
+    Some(super::handlers::sys_getpid),         // 8  getpid
+    Some(super::handlers::sys_getppid),        // 9  getppid
+    Some(super::handlers::sys_yield),          // 10 yield
+    Some(super::handlers::sys_nanosleep),      // 11 nanosleep
+    Some(super::handlers::sys_fork),           // 12 fork
+    Some(super::handlers::sys_exec),           // 13 exec
+    Some(super::handlers::sys_waitpid),        // 14 waitpid
+    Some(super::handlers::sys_uname),          // 15 uname
+    Some(super::handlers::sys_ioctl),          // 16 ioctl
+    Some(super::handlers::sys_lseek),          // 17 lseek
+    Some(super::handlers::sys_stat),           // 18 stat
+    Some(super::handlers::sys_dup),            // 19 dup
+    Some(super::handlers::sys_dup2),           // 20 dup2
+    Some(super::handlers::sys_pipe),           // 21 pipe
+    Some(super::handlers::sys_chdir),          // 22 chdir
+    Some(super::handlers::sys_getcwd),         // 23 getcwd
+    Some(super::handlers::sys_mkdir),          // 24 mkdir
+    Some(super::handlers::sys_unlink),         // 25 unlink
+    Some(super::handlers::sys_read_dir),       // 26 read_dir
+    Some(super::handlers::sys_clock_gettime),  // 27 clock_gettime
+    Some(super::handlers::sys_spawn),          // 28 spawn
+    Some(super::handlers::sys_socket),         // 29 socket
+    Some(super::handlers::sys_bind),           // 30 bind
+    Some(super::handlers::sys_listen),         // 31 listen
+    Some(super::handlers::sys_accept),         // 32 accept
+    Some(super::handlers::sys_connect),        // 33 connect
+    Some(super::handlers::sys_send),           // 34 send
+    Some(super::handlers::sys_recv),           // 35 recv
+    Some(super::handlers::sys_net_info),       // 36 net_info
+    Some(super::handlers::sys_kill),           // 37 kill
+    Some(super::handlers::sys_mount_ramfs),    // 38 mount_ramfs
+    Some(super::handlers::sys_unmount),        // 39 unmount
+    Some(super::handlers::sys_symlink),        // 40 symlink
+    Some(super::handlers::sys_chmod),          // 41 chmod
+    Some(super::handlers::sys_chown),          // 42 chown
+    Some(super::handlers::sys_utimens),        // 43 utimens
+    Some(super::handlers::sys_rmdir),          // 44 rmdir
+    Some(super::handlers::sys_setpgid),        // 45 setpgid
+    Some(super::handlers::sys_getpgrp),        // 46 getpgrp
+    Some(super::handlers::sys_setsid),         // 47 setsid
+    Some(super::handlers::sys_open_pty),       // 48 openpty
+    Some(super::handlers::sys_sigreturn),      // 49 sigreturn (live-frame entry special-case)
+    Some(super::handlers::sys_sigaction),      // 50 sigaction
+    Some(super::handlers::sys_sigprocmask),    // 51 sigprocmask
+    Some(crate::devices::rng::sys_getrandom),  // 52 getrandom
+    Some(super::handlers::sys_sigaltstack),    // 53 sigaltstack
+    Some(super::handlers::sys_ui_acquire),     // 54 ui_acquire
+    Some(super::handlers::sys_ui_present),     // 55 ui_present
+    Some(super::handlers::sys_ui_read_events), // 56 ui_read_events
+    Some(super::handlers::sys_ui_release),     // 57 ui_release
 ];
 
 /// Look up the handler for syscall number `num`.
@@ -364,6 +376,10 @@ pub fn name_for(num: u64) -> &'static str {
         SYS_SIGPROCMASK => "sigprocmask",
         SYS_GETRANDOM => "getrandom",
         SYS_SIGALTSTACK => "sigaltstack",
+        SYS_UI_ACQUIRE => "ui_acquire",
+        SYS_UI_PRESENT => "ui_present",
+        SYS_UI_READ_EVENTS => "ui_read_events",
+        SYS_UI_RELEASE => "ui_release",
         _ => "unknown",
     }
 }
@@ -375,7 +391,7 @@ pub fn name_for(num: u64) -> &'static str {
 // compiler.
 const _TABLE_SIZE_ASSERT: () = {
     const fn max_assigned() -> usize {
-        let n = SYS_SIGALTSTACK as usize;
+        let n = SYS_UI_RELEASE as usize;
         // The table must be at least `n + 1` long so index `n` is in bounds.
         n + 1
     }
@@ -395,7 +411,7 @@ mod tests {
 
     #[test]
     fn extended_coreutils_syscalls_are_dense_and_named() {
-        assert_eq!(NUM_SYSCALLS, SYS_SIGALTSTACK as usize + 1);
+        assert_eq!(NUM_SYSCALLS, SYS_UI_RELEASE as usize + 1);
         for (number, name) in [
             (SYS_KILL, "kill"),
             (SYS_MOUNT_RAMFS, "mount_ramfs"),
@@ -414,6 +430,10 @@ mod tests {
             (SYS_SIGPROCMASK, "sigprocmask"),
             (SYS_GETRANDOM, "getrandom"),
             (SYS_SIGALTSTACK, "sigaltstack"),
+            (SYS_UI_ACQUIRE, "ui_acquire"),
+            (SYS_UI_PRESENT, "ui_present"),
+            (SYS_UI_READ_EVENTS, "ui_read_events"),
+            (SYS_UI_RELEASE, "ui_release"),
         ] {
             assert!(lookup(number).is_some());
             assert_eq!(name_for(number), name);

@@ -4,7 +4,7 @@ use core::arch::asm;
 
 use xenith_abi::{
     DirectoryEntry, NetInterfaceInfo, OpenFlags, SigAction, SigAltStack, SigSet, SockAddrV4, Stat,
-    SyscallNumber, Timespec, UtsName,
+    SyscallNumber, Timespec, UiDisplayInfo, UiInputEvent, UiRect, UtsName, UI_MAX_EVENTS_PER_READ,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -658,4 +658,54 @@ pub fn rmdir(path: &[u8]) -> Result<()> {
         0,
     ])
     .map(|_| ())
+}
+
+pub fn ui_acquire(display: &mut UiDisplayInfo) -> Result<()> {
+    call(SyscallNumber::UiAcquire, [
+        core::ptr::from_mut(display) as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])
+    .map(|_| ())
+}
+
+pub fn ui_present(pixels: &[u8], source_stride: usize, damage: &[UiRect]) -> Result<()> {
+    let (damage_pointer, damage_count) = if damage.is_empty() {
+        (0, 0)
+    } else {
+        (damage.as_ptr() as usize, damage.len())
+    };
+
+    call(SyscallNumber::UiPresent, [
+        pixels.as_ptr() as usize,
+        pixels.len(),
+        source_stride,
+        damage_pointer,
+        damage_count,
+        0,
+    ])
+    .map(|_| ())
+}
+
+pub fn ui_read_events(events: &mut [UiInputEvent], timeout_ns: u64) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let capacity = events.len().min(UI_MAX_EVENTS_PER_READ);
+
+    call(SyscallNumber::UiReadEvents, [
+        events.as_mut_ptr() as usize,
+        capacity,
+        timeout_ns as usize,
+        0,
+        0,
+        0,
+    ])
+}
+
+pub fn ui_release() -> Result<()> {
+    call(SyscallNumber::UiRelease, [0, 0, 0, 0, 0, 0]).map(|_| ())
 }

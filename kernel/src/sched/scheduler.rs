@@ -14,9 +14,10 @@
 //!   layout; it wraps each `Task` in a [`TaskNode`] (defined here) that adds
 //!   the run-queue link storage and the asm-matching saved context.
 //! * [`super::preempt`] — the preemption counter, the `need_resched` flag, and
-//!   the timer-tick entry point. [`preempt::on_timer_tick`] calls back into
-//!   [`tick`] and [`schedule_next`] here; this module never reads the LAPIC
-//!   timer itself, so the hardware dependency stays isolated in `preempt`.
+//!   the timer-tick entry point. The BSP calls back into [`tick`] once per
+//!   global tick while every CPU keeps its own preemption counters; all CPUs
+//!   may call [`schedule_next`]. This module never reads the LAPIC timer
+//!   itself, so the hardware dependency stays isolated in `preempt`.
 //!
 //! # The run queue
 //!
@@ -31,8 +32,8 @@
 //! # The priority bump (aging)
 //!
 //! To prevent a steady stream of newly-ready tasks from starving an older
-//! runnable task, [`tick`] walks the run queue and bumps `wait_ticks` for
-//! every queued task. When a task has waited longer than
+//! runnable task, the BSP-owned [`tick`] walks every online run queue and
+//! bumps `wait_ticks` for every queued task. When a task has waited longer than
 //! [`AGING_THRESHOLD_TICKS`], its `priority` value is decremented by one
 //! (lower number = higher priority, saturating at zero) and it is promoted to
 //! the head of the queue via [`RunQueue::promote_front`], so it is the next
@@ -62,12 +63,10 @@
 //! re-applies the snapshot on the resuming side. The switch itself runs with
 //! interrupts off and no lock held.
 //!
-//! [`tick`] and [`schedule_next`] are reachable from the timer interrupt
-//! handler, which runs with `EFLAGS.IF` already clear (the IDT gate is an
-//! interrupt gate); [`save_flags_and_cli`] is a no-op `cli` in that case and
-//! the snapshot records IF=0, so the resuming task's `restore_flags` keeps
-//! interrupts off until the IRQ stub's `iretq` restores the interrupted
-//! context's RFLAGS.
+//! [`tick`] and [`schedule_next`] are reachable from timer interrupt handlers,
+//! which run with `EFLAGS.IF` already clear (the IDT gate is an interrupt
+//! gate). Only CPU 0 runs the shared [`tick`] pass, avoiding one global-lock
+//! acquisition per AP per tick; local slice accounting remains per-CPU.
 //!
 //! Per-CPU state that does *not* need cross-CPU consistency — the current
 //! task pointer and first-dispatch bootstrap context — lives in fixed arrays
@@ -120,6 +119,43 @@ pub const AGING_THRESHOLD_TICKS: u64 = 20;
 /// coarse enough that context-switch overhead is negligible. The value is
 /// published here so [`super::init`] and the LAPIC timer arming agree.
 pub const SCHED_TICK_HZ: u64 = 100;
+
+/// Logical CPU that owns wall-clock scheduler accounting.
+///
+/// CPU 0 already exclusively advances the LAPIC monotonic accumulator. Xenith
+/// does not offline the BSP, so using the same interrupt for sleep expiry and
+/// run-queue aging keeps those operations at exactly [`SCHED_TICK_HZ`] instead
+/// of multiplying global-lock acquisitions by the number of online CPUs.
+const GLOBAL_TICK_CPU: usize = 0;
+
+/// Whether `cpu` owns the shared scheduler tick.
+///
+/// Kept as a pure policy function so SMP scaling can be verified by host tests
+/// without executing privileged timer or per-CPU instructions.
+#[inline]
+pub(crate) const fn owns_global_tick(cpu: usize) -> bool {
+    cpu == GLOBAL_TICK_CPU
+}
+
+/// Include the permanently-online BSP in a topology snapshot.
+///
+/// During early bring-up the SMP online mask is published immediately after
+/// the scheduler timer is armed. Treating CPU 0 as online unconditionally
+/// makes the policy robust across that short interrupts-disabled interval.
+#[inline]
+const fn scheduler_online_mask(observed: u64) -> u64 {
+    observed | (1u64 << GLOBAL_TICK_CPU)
+}
+
+/// Keep a woken task on its last CPU when possible, otherwise use the BSP.
+#[inline]
+const fn wake_target_cpu(last_cpu: usize, online: u64) -> usize {
+    if last_cpu < MAX_CPUS && online & (1u64 << last_cpu) != 0 {
+        last_cpu
+    } else {
+        GLOBAL_TICK_CPU
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TaskNode — the scheduler's per-task wrapper
@@ -719,36 +755,35 @@ impl SleepQueue {
         // borrow through the `NonNull` is sound.
         let n = unsafe { node.as_mut() };
         n.wait_ticks = 0;
-        // Record the deadline on the node itself so `wake_expired` can read it
+        // Record the deadline on the node itself so `drain_expired` can read it
         // without a side table.
         n.wake_deadline = Some(deadline);
         self.entries.push(node);
     }
 
-    /// Remove and return every task whose wake deadline has elapsed.
+    /// Remove every task whose wake deadline has elapsed without allocating.
     ///
-    /// Returns the woken nodes in the order they were inserted. The caller
-    /// (the scheduler) re-enqueues them onto the run queue.
-    pub fn wake_expired(&mut self, now: Instant) -> KVec<NonNull<TaskNode>> {
-        let mut woken: KVec<NonNull<TaskNode>> = KVec::new();
+    /// Each removed pointer is passed immediately to `wake`. This avoids a
+    /// temporary vector (and potentially growing the heap) in timer IRQ
+    /// context while retaining a single O(n) scan.
+    fn drain_expired<F>(&mut self, now: Instant, mut wake: F)
+    where
+        F: FnMut(NonNull<TaskNode>),
+    {
         let mut i = 0;
         while i < self.entries.len() {
             let node = self.entries[i];
             // SAFETY: `node` is live; we hold the scheduler lock.
             let dl = unsafe { node.as_ref() }.wake_deadline;
-            match dl {
-                Some(deadline) if deadline <= now => {
-                    // Wake this one: clear its deadline and move it to the
-                    // woken list. Swap-remove from the sleep queue so the
-                    // scan stays O(n).
-                    unsafe { (*node.as_ptr()).wake_deadline = None };
-                    self.entries.swap_remove(i);
-                    woken.push(node);
-                },
-                _ => i += 1,
+            if dl.is_some_and(|deadline| deadline <= now) {
+                // SAFETY: the node remains live in `all_tasks`; clearing the
+                // deadline is part of moving it to a run queue.
+                unsafe { (*node.as_ptr()).wake_deadline = None };
+                wake(self.entries.swap_remove(i));
+            } else {
+                i += 1;
             }
         }
-        woken
     }
 
     /// Remove one sleeping task by id without allocating.
@@ -797,6 +832,94 @@ impl fmt::Debug for SleepQueue {
 }
 
 // ---------------------------------------------------------------------------
+// BlockedQueue — allocation-free event waits
+// ---------------------------------------------------------------------------
+
+/// Tasks parked on an explicit event, optionally with a timeout.
+///
+/// Unlike [`SleepQueue`], this queue is intrusive: parking a task only links
+/// its existing [`TaskNode`] and therefore cannot allocate. That property is
+/// required by IRQ-driven waits, whose producer must also be able to unlink a
+/// known waiter without allocating. A task is linked here only while its state
+/// is [`TaskState::Blocked`].
+struct BlockedQueue {
+    queue: crate::util::IntrusiveLinkedList<TaskNode>,
+}
+
+impl BlockedQueue {
+    const fn new() -> Self {
+        Self {
+            queue: crate::util::IntrusiveLinkedList::new(),
+        }
+    }
+
+    fn add(&mut self, mut node: NonNull<TaskNode>, deadline: Option<Instant>) {
+        // SAFETY: the scheduler lock is held, `node` is the current task and
+        // therefore unlinked, and no other CPU may mutate its metadata.
+        let node_ref = unsafe { node.as_mut() };
+        node_ref.wait_ticks = 0;
+        node_ref.wake_deadline = deadline;
+        self.queue.push_back(node);
+    }
+
+    /// Remove a waiter by id. The scan and unlink are allocation-free.
+    fn take_task(&mut self, id: TaskId) -> Option<NonNull<TaskNode>> {
+        let mut current = self.queue.head();
+        while let Some(node) = current {
+            // Read the next link before removal invalidates this node's list
+            // membership. The scheduler lock keeps the list stable.
+            let (task_id, next) = {
+                // SAFETY: every linked node remains owned by `all_tasks`.
+                let node_ref = unsafe { node.as_ref() };
+                (node_ref.task.id, node_ref.links.next)
+            };
+            if task_id == id {
+                // SAFETY: `node` is a member of this queue and the scheduler
+                // lock gives us exclusive access to its links.
+                unsafe { self.queue.remove(node) };
+                // SAFETY: the node remains live and is now unlinked.
+                unsafe { (*node.as_ptr()).wake_deadline = None };
+                return Some(node);
+            }
+            current = next;
+        }
+        None
+    }
+
+    /// Remove one expired timed waiter, if any, without allocating.
+    fn take_expired(&mut self, now: Instant) -> Option<NonNull<TaskNode>> {
+        let mut current = self.queue.head();
+        while let Some(node) = current {
+            let (expired, next) = {
+                // SAFETY: every linked node remains owned by `all_tasks`.
+                let node_ref = unsafe { node.as_ref() };
+                (
+                    node_ref
+                        .wake_deadline
+                        .is_some_and(|deadline| deadline <= now),
+                    node_ref.links.next,
+                )
+            };
+            if expired {
+                // SAFETY: `node` is linked in this queue under our exclusive
+                // scheduler-lock ownership.
+                unsafe { self.queue.remove(node) };
+                // SAFETY: the node remains live and is now unlinked.
+                unsafe { (*node.as_ptr()).wake_deadline = None };
+                return Some(node);
+            }
+            current = next;
+        }
+        None
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SchedulerInner — the lock-protected shared state
 // ---------------------------------------------------------------------------
 
@@ -813,6 +936,9 @@ pub struct SchedulerInner {
     run_queues: [RunQueue; MAX_CPUS],
     /// Tasks waiting on a wake deadline.
     sleep_queue: SleepQueue,
+    /// Tasks waiting for an explicit event, optionally with a timeout. This
+    /// queue is intrusive so park/wake and timer expiry never allocate.
+    blocked_queue: BlockedQueue,
     /// Master ownership list of every spawned `TaskNode`. A `TaskNode` is
     /// alive (and its raw pointers are valid) for exactly as long as its
     /// `Kbox` is in this vector. Reaping moves the `Kbox` out and drops it,
@@ -847,6 +973,7 @@ impl SchedulerInner {
         Self {
             run_queues: [const { RunQueue::new() }; MAX_CPUS],
             sleep_queue: SleepQueue::new(),
+            blocked_queue: BlockedQueue::new(),
             all_tasks: KVec::new(),
             idle_tasks: [None; MAX_CPUS],
             initialised: false,
@@ -874,6 +1001,7 @@ impl fmt::Debug for SchedulerInner {
             .field("initialised", &self.initialised)
             .field("total_tasks", &self.all_tasks.len())
             .field("sleeping", &self.sleep_queue.len())
+            .field("blocked", &self.blocked_queue.len())
             .finish()
     }
 }
@@ -911,6 +1039,14 @@ static SCHED_INITIALISED: AtomicBool = AtomicBool::new(false);
 /// Rotating tie-breaker for equally loaded online run queues.
 static NEXT_PLACEMENT_CPU: AtomicU64 = AtomicU64::new(0);
 
+/// Coalesced explicit-event wake request. Task id zero means no request.
+///
+/// Xenith currently has one exclusive UI input seat, hence at most one task
+/// can be parked on the IRQ-driven event path. The atomic bridges a hard IRQ
+/// that cannot take the scheduler lock: every scheduler guard drains it after
+/// releasing the lock, while an uncontended producer drains it directly.
+static PENDING_BLOCKED_WAKE: AtomicU64 = AtomicU64::new(0);
+
 /// The boot CPU's kernel page-table root, captured before the first task runs.
 ///
 /// Kernel tasks do not own an [`AddressSpace`](crate::mm::AddressSpace), so a
@@ -946,8 +1082,48 @@ pub fn is_initialised() -> bool {
 /// state established by the caller is preserved across the critical section.
 /// The guard must be dropped **before** a context switch.
 #[inline]
-fn lock() -> crate::sync::SpinLockGuard<'static, SchedulerInner> {
-    SCHEDULER.lock()
+fn lock() -> SchedulerLockGuard {
+    SchedulerLockGuard {
+        guard: Some(SCHEDULER.lock()),
+    }
+}
+
+fn try_lock() -> Option<SchedulerLockGuard> {
+    Some(SchedulerLockGuard {
+        guard: Some(SCHEDULER.try_lock()?),
+    })
+}
+
+/// Scheduler guard with an unlock-then-drain hand-off for deferred IRQ wakes.
+///
+/// Releasing the raw spinlock before checking `PENDING_BLOCKED_WAKE` is
+/// deliberate. A producer that races after unlock either acquires the raw lock
+/// itself or observes the next owner; it can never fall between the final
+/// pending check and a still-held lock.
+struct SchedulerLockGuard {
+    guard: Option<crate::sync::SpinLockGuard<'static, SchedulerInner>>,
+}
+
+impl core::ops::Deref for SchedulerLockGuard {
+    type Target = SchedulerInner;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_deref().expect("scheduler guard consumed")
+    }
+}
+
+impl core::ops::DerefMut for SchedulerLockGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_deref_mut().expect("scheduler guard consumed")
+    }
+}
+
+impl Drop for SchedulerLockGuard {
+    fn drop(&mut self) {
+        // Release first. See the type-level comment for the race proof.
+        drop(self.guard.take());
+        drain_pending_blocked_wakes();
+    }
 }
 
 /// Wake one known sleeping worker from hard-IRQ context without blocking.
@@ -960,7 +1136,7 @@ fn lock() -> crate::sync::SpinLockGuard<'static, SchedulerInner> {
 /// onto this CPU's run queue.
 #[must_use]
 pub fn wake_sleeping_task_from_irq(id: TaskId) -> IrqWakeResult {
-    let Some(mut inner) = SCHEDULER.try_lock() else {
+    let Some(mut inner) = try_lock() else {
         return IrqWakeResult::Contended;
     };
     let Some(node) = inner.sleep_queue.take_task(id) else {
@@ -977,6 +1153,93 @@ pub fn wake_sleeping_task_from_irq(id: TaskId) -> IrqWakeResult {
     drop(inner);
     preempt::set_need_resched();
     IrqWakeResult::Woken
+}
+
+/// Request a wake for a task parked by [`block_current_until_releasing`].
+///
+/// This is safe in a hard IRQ even when another CPU owns the scheduler lock:
+/// it publishes the task id atomically and makes one non-blocking drain
+/// attempt. Every scheduler guard performs an unlock-then-drain hand-off, so a
+/// contended request is consumed by the owner as it releases the lock and can
+/// never be lost. The request slot coalesces duplicate wakes for Xenith's one
+/// exclusive UI waiter. No path allocates or spins behind a remote lock.
+pub fn wake_blocked_task(id: TaskId) {
+    if id.as_u64() == 0 {
+        return;
+    }
+    let previous = PENDING_BLOCKED_WAKE.swap(id.as_u64(), Ordering::AcqRel);
+    debug_assert!(
+        previous == 0 || previous == id.as_u64(),
+        "multiple explicit event waiters exceed the coalesced wake slot"
+    );
+
+    let flags = save_flags_and_cli();
+    drain_pending_blocked_wakes();
+    // SAFETY: `flags` was captured on this CPU at entry.
+    unsafe { restore_flags(flags) };
+}
+
+/// Drain the coalesced event-wake slot with one non-blocking scheduler-lock
+/// acquisition per observed request.
+///
+/// Callers keep local interrupts disabled. On lock contention the current
+/// scheduler owner is responsible for draining after unlock; see
+/// [`SchedulerLockGuard`].
+fn drain_pending_blocked_wakes() {
+    loop {
+        if PENDING_BLOCKED_WAKE.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(mut inner) = SCHEDULER.try_lock() else {
+            return;
+        };
+        let requested = PENDING_BLOCKED_WAKE.swap(0, Ordering::AcqRel);
+        let target_cpu = if requested == 0 {
+            None
+        } else {
+            inner
+                .blocked_queue
+                .take_task(TaskId(requested))
+                .map(|node| {
+                    // Return the task to the CPU it last ran on. This
+                    // preserves cache locality and enables a prompt IPI.
+                    let target_cpu = unsafe { node.as_ref() }.task.cpu as usize;
+                    // SAFETY: the node was just unlinked from the blocked
+                    // queue, remains owned by `all_tasks`, and this raw guard
+                    // gives exclusive scheduler metadata access.
+                    unsafe { (*node.as_ptr()).task.state = TaskState::Ready };
+                    inner.run_queues[target_cpu].enqueue(node);
+                    target_cpu
+                })
+        };
+        // Release before requesting reschedule: the target CPU's IPI handler
+        // may enter the scheduler immediately.
+        drop(inner);
+        if let Some(target_cpu) = target_cpu {
+            request_prompt_reschedule(target_cpu);
+        }
+        // A producer can publish while the raw guard is held. Loop after
+        // unlock so that race is consumed here rather than deferred to a tick.
+    }
+}
+
+/// Arrange a scheduling point promptly after an event wake.
+///
+/// A remote target receives the scheduler's normal reschedule IPI. For the
+/// local CPU we also queue that IPI to self: if this runs inside a device IRQ,
+/// it remains pending until the device EOI and `iretq`; in task context it is
+/// delivered as soon as interrupts are enabled. This removes the otherwise
+/// unavoidable wait for the next 100 Hz timer tick.
+fn request_prompt_reschedule(target_cpu: usize) {
+    if target_cpu == current_cpu() {
+        preempt::set_need_resched();
+        crate::arch::x86_64::interrupts::apic::send_ipi(
+            crate::arch::x86_64::interrupts::apic::current_id(),
+            crate::arch::x86_64::smp::RESCHEDULE_VECTOR,
+        );
+    } else {
+        crate::arch::x86_64::smp::request_reschedule(target_cpu);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1528,59 +1791,190 @@ pub fn sleep_until(deadline: Instant) {
     }
 }
 
+/// Park the current task on an explicit event while atomically releasing an
+/// IRQ-safe producer lock.
+///
+/// The caller must hold the lock that protects both its readiness predicate
+/// and waiter registration. This function links the current task into the
+/// allocation-free blocked queue *before* releasing that lock, closing the
+/// classic lost-wake window: a producer cannot observe the registration until
+/// the scheduler can successfully wake the blocked task. The guard is then
+/// unlocked without restoring IF, and its original RFLAGS are restored only
+/// when this task resumes from the context switch.
+///
+/// `deadline == None` is an untimed wait. A finite deadline is processed by
+/// [`tick`] without allocating. Producers wake the task with
+/// [`wake_blocked_task`].
+///
+/// # Panics
+///
+/// Panics if there is no current task.
+pub fn block_current_until_releasing<T: ?Sized>(
+    deadline: Option<Instant>,
+    producer_guard: crate::sync::SpinLockIRQGuard<'_, T>,
+) {
+    let cur = current_node().expect("sched::block_current with no current task");
+    // SAFETY: `cur` is the live current node while the producer guard pins
+    // execution to this CPU with interrupts disabled.
+    let task_id = unsafe { cur.as_ref() }.task.id;
+
+    // Keep the producer lock and IF=0 while publishing the blocked state.
+    let next = {
+        let mut inner = lock();
+        // SAFETY: `cur` is current and unlinked; the scheduler lock excludes
+        // every other metadata mutation while it moves to `blocked_queue`.
+        unsafe { (*cur.as_ptr()).task.state = TaskState::Blocked };
+        inner.blocked_queue.add(cur, deadline);
+        // SAFETY: this CPU exclusively owns its current slot with IF clear.
+        unsafe { set_current_node(None) };
+
+        let next = pick_next(&mut inner);
+        if next.is_none() {
+            // Pre-init/misconfigured fallback: undo the park while the
+            // producer lock still prevents a concurrent wake.
+            let restored = inner
+                .blocked_queue
+                .take_task(task_id)
+                .expect("newly blocked task disappeared");
+            debug_assert_eq!(restored, cur);
+            // SAFETY: `cur` is unlinked again and exclusively owned here.
+            unsafe {
+                (*cur.as_ptr()).task.state = TaskState::Running;
+                set_current_node(Some(cur));
+            }
+        } else if let Some(next) = next {
+            // Publish the selected task before the switch, matching
+            // `sleep_until` and the normal dispatch path.
+            // SAFETY: `next` was removed from a run queue under the lock and
+            // remains live in `all_tasks`.
+            unsafe {
+                let task = core::ptr::addr_of_mut!((*next.as_ptr()).task);
+                (*task).state = TaskState::Running;
+                (*task).cpu = current_cpu() as u32;
+                (*task).stats.context_switches = (*task).stats.context_switches.saturating_add(1);
+                set_current_node(Some(next));
+            }
+        }
+        next
+    };
+
+    // SAFETY: the scheduler immediately consumes the guard's same-CPU RFLAGS
+    // and either restores them below or passes them to `do_switch`, whose
+    // resuming side restores them. IF remains clear across the hand-off.
+    let flags = unsafe { producer_guard.unlock_without_restoring_interrupts() };
+    let Some(next) = next else {
+        preempt::clear_need_resched();
+        // SAFETY: `flags` came from this CPU's producer guard above.
+        unsafe { restore_flags(flags) };
+        return;
+    };
+
+    preempt::on_context_switch_in();
+    do_switch(Some(cur), next, flags);
+}
+
 // ---------------------------------------------------------------------------
 // tick — the scheduler's per-tick accounting
 // ---------------------------------------------------------------------------
 
-/// Advance scheduler state by one timer tick.
+/// Advance global scheduler state by one timer tick.
 ///
-/// Called from [`preempt::on_timer_tick`] once per LAPIC timer interrupt. The
-/// work is pure accounting — no context switch happens here; the switch is
-/// driven by [`preempt::should_preempt`] calling [`schedule_next`] after
-/// [`on_timer_tick`] returns. Specifically this:
+/// Called only from CPU 0's [`preempt::on_timer_tick`]. Every CPU still runs
+/// its independent slice accounting on its own LAPIC interrupt, but sleep
+/// expiry and aging share one BSP-owned pass. Consequently an N-CPU machine
+/// takes the global scheduler lock once per 10 ms, not N times.
 ///
-/// 1. Reads the monotonic clock and wakes any sleepers whose deadline has
-///    elapsed, re-enqueuing them as `Ready` on the current CPU's run queue.
-/// 2. Walks the current CPU's run queue and bumps `wait_ticks` for every ready
-///    task; tasks that cross [`AGING_THRESHOLD_TICKS`] get a priority bump
-///    (their `priority` value decreases by one, saturating at zero) and are
-///    re-inserted so the sorted order reflects the improvement.
+/// 1. Wakes expired sleepers onto the CPU where each task last ran.
+/// 2. Expires timed explicit-event waits onto their last CPUs.
+/// 3. Ages every online CPU's run queue exactly once.
+/// 4. After releasing the lock, requests a prompt reschedule on every CPU that
+///    received an expired waiter.
 ///
-/// Both steps run under the scheduler lock so the run-queue walk sees a stable
-/// snapshot. The function does no context switch, so the lock is held for the
-/// whole call and released on return.
+/// The task moves and aging run under the scheduler lock. Reschedule IPIs are
+/// sent only after releasing it, so a target CPU may enter the scheduler
+/// immediately without spinning behind the producer.
 ///
 /// # Interrupt context
 ///
-/// `tick` is reached only from [`preempt::on_timer_tick`], which runs in
-/// hard-IRQ context with `EFLAGS.IF` clear (the IDT gate is an interrupt
-/// gate). It therefore calls [`lock`] directly without saving `RFLAGS` —
-/// interrupts are already off. Calling `tick` from process context would
-/// require the caller to disable interrupts first.
+/// `tick` is reached only from CPU 0's timer interrupt with `EFLAGS.IF` clear.
+/// Calling it from process context or another CPU violates its contract.
 pub fn tick() {
+    debug_assert!(
+        owns_global_tick(current_cpu()),
+        "global scheduler tick must run on the BSP"
+    );
     let now = Instant::now();
-    let mut inner = lock();
-    // 1. Wake expired sleepers. `wake_expired` returns the woken nodes; we
-    //    re-enqueue each one on the current CPU's run queue. A woken task
-    //    whose deadline was in the past is still woken here — `wake_expired`
-    //    compares `deadline <= now`.
-    let woken = inner.sleep_queue.wake_expired(now);
-    if !woken.is_empty() {
-        let cpu = current_cpu();
-        for node in woken {
-            // SAFETY: the node is live (in `all_tasks`) and was on the sleep
-            // queue, which `wake_expired` already removed it from. We hold the
-            // lock, so no other CPU touches it.
-            unsafe { (*node.as_ptr()).task.state = TaskState::Ready };
-            inner.run_queues[cpu].enqueue(node);
+    let online = scheduler_online_mask(crate::arch::x86_64::smp::online_mask());
+    let mut reschedule_mask = 0u64;
+
+    {
+        let mut inner = lock();
+
+        // 1. Keep expired sleepers on the CPU where they last ran. A woken
+        // task whose deadline was already in the past is still moved here:
+        // `drain_expired` compares `deadline <= now`. Split the disjoint field
+        // borrows so the allocation-free drain can enqueue each node during
+        // the same O(n) pass.
+        let inner_ref: &mut SchedulerInner = &mut inner;
+        let sleep_queue = &mut inner_ref.sleep_queue;
+        let run_queues = &mut inner_ref.run_queues;
+        sleep_queue.drain_expired(now, |node| {
+            // SAFETY: the node remains live in `all_tasks` while scheduler
+            // metadata is protected by the lock.
+            let last_cpu = unsafe { node.as_ref() }.task.cpu as usize;
+            let target_cpu = wake_target_cpu(last_cpu, online);
+            // SAFETY: the node is live (in `all_tasks`) and was removed from
+            // the sleep queue by `drain_expired`. We hold the lock, so no
+            // other CPU touches it.
+            unsafe {
+                (*node.as_ptr()).task.state = TaskState::Ready;
+                (*node.as_ptr()).task.cpu = target_cpu as u32;
+            }
+            run_queues[target_cpu].enqueue(node);
+            reschedule_mask |= 1u64 << target_cpu;
+        });
+
+        // 2. Expire explicit event waits in place. The blocked queue is
+        // intrusive, so neither this IRQ path nor the producer wake allocates.
+        while let Some(node) = inner.blocked_queue.take_expired(now) {
+            // SAFETY: the node remains live in `all_tasks` while scheduler
+            // metadata is protected by the lock.
+            let last_cpu = unsafe { node.as_ref() }.task.cpu as usize;
+            let target_cpu = wake_target_cpu(last_cpu, online);
+            // SAFETY: `node` was just unlinked from `blocked_queue`, remains
+            // owned by `all_tasks`, and the scheduler lock is exclusive.
+            unsafe {
+                (*node.as_ptr()).task.state = TaskState::Ready;
+                (*node.as_ptr()).task.cpu = target_cpu as u32;
+            }
+            inner.run_queues[target_cpu].enqueue(node);
+            reschedule_mask |= 1u64 << target_cpu;
+        }
+
+        // 3. Age every online queue in the one global pass. This preserves the
+        // original 100 Hz aging rate while removing one lock acquisition per
+        // AP tick. Offline slots remain untouched.
+        for cpu in 0..MAX_CPUS {
+            if online & (1u64 << cpu) != 0 {
+                inner.run_queues[cpu].tick_aging();
+            }
         }
     }
-    // 2. Aging: bump `wait_ticks` for every ready task and promote starved
-    //    ones to the front of the queue (the priority bump). The walk and
-    //    promotion are encapsulated in `RunQueue::tick_aging` so the intrusive
-    //    list's borrow rules stay local to the queue implementation.
-    let cpu = current_cpu();
-    inner.run_queues[cpu].tick_aging();
+
+    // 4. Do not send IPIs under the scheduler lock. Coalesce multiple expired
+    // waiters for the same CPU into one request.
+    for cpu in 0..MAX_CPUS {
+        if reschedule_mask & (1u64 << cpu) != 0 {
+            if owns_global_tick(cpu) {
+                // `preempt::on_timer_tick` tests this flag immediately after
+                // `tick` returns. A self-IPI would only create a redundant
+                // second scheduling point after the timer frame unwinds.
+                preempt::set_need_resched();
+            } else {
+                crate::arch::x86_64::smp::request_reschedule(cpu);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,6 +2375,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exactly_one_cpu_owns_global_tick_accounting() {
+        assert!(owns_global_tick(0));
+        assert_eq!(
+            (0..MAX_CPUS).filter(|cpu| owns_global_tick(*cpu)).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scheduler_topology_always_contains_bsp() {
+        assert_eq!(scheduler_online_mask(0), 1);
+        assert_eq!(scheduler_online_mask(0b1010), 0b1011);
+    }
+
+    #[test]
+    fn expired_wait_preserves_online_cpu_locality() {
+        let online = scheduler_online_mask(0b1011);
+        assert_eq!(wake_target_cpu(0, online), 0);
+        assert_eq!(wake_target_cpu(1, online), 1);
+        assert_eq!(wake_target_cpu(3, online), 3);
+    }
+
+    #[test]
+    fn expired_wait_falls_back_to_bsp_for_offline_cpu() {
+        let online = scheduler_online_mask(0b0011);
+        assert_eq!(wake_target_cpu(3, online), GLOBAL_TICK_CPU);
+        assert_eq!(wake_target_cpu(MAX_CPUS, online), GLOBAL_TICK_CPU);
+    }
+
+    #[test]
     fn run_queue_starts_empty() {
         let mut rq = RunQueue::new();
         assert!(rq.is_empty());
@@ -1995,11 +2419,18 @@ mod tests {
     }
 
     #[test]
+    fn allocation_free_blocked_queue_starts_empty() {
+        let queue = BlockedQueue::new();
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
     fn scheduler_inner_constructs_empty() {
         let inner = SchedulerInner::new();
         assert!(!inner.initialised);
         assert!(inner.all_tasks.is_empty());
         assert_eq!(inner.sleep_queue.len(), 0);
+        assert_eq!(inner.blocked_queue.len(), 0);
         assert!(inner.idle_tasks.iter().all(|s| s.is_none()));
     }
 
@@ -2020,6 +2451,7 @@ mod tests {
         assert!(!should_requeue_for_dispatch(true, TaskState::Running));
         assert!(!should_requeue_for_dispatch(false, TaskState::Ready));
         assert!(!should_requeue_for_dispatch(false, TaskState::Sleeping));
+        assert!(!should_requeue_for_dispatch(false, TaskState::Blocked));
         assert!(!should_requeue_for_dispatch(false, TaskState::Zombie));
     }
 

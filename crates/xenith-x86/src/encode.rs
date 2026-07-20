@@ -82,6 +82,10 @@ impl Encoder<'_> {
                 self.byte(0x0F)?;
                 self.byte(0xA2)
             },
+            Mnemonic::Wbinvd => {
+                self.byte(0x0F)?;
+                self.byte(0x09)
+            },
             Mnemonic::Rdmsr => {
                 self.byte(0x0F)?;
                 self.byte(0x32)
@@ -550,5 +554,14 @@ mod tests {
         let decoded = crate::decode(&output[..length]).unwrap();
         assert_eq!(decoded.mnemonic, Mnemonic::Bswap);
         assert_eq!(decoded.operands, instruction.operands);
+    }
+
+    #[test]
+    fn wbinvd_round_trips() {
+        let instruction = Instruction::new(Mnemonic::Wbinvd);
+        let mut output = [0u8; 2];
+        let length = encode(&instruction, &mut output).unwrap();
+        assert_eq!(&output[..length], &[0x0F, 0x09]);
+        assert_eq!(crate::decode(&output).unwrap().mnemonic, Mnemonic::Wbinvd);
     }
 }

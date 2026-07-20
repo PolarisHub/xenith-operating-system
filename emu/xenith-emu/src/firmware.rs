@@ -38,9 +38,9 @@ const PAGE_PD3: u64 = 0x6000;
 const PAGE_PDPT_HIGH: u64 = 0x7000;
 const STACK_TOP: u64 = 0x0004_f000;
 const KERNEL_ENTRY_STACK: u64 = STACK_TOP - 8;
-const KERNEL_STAGING_ADDRESS: u64 = 0x0200_0000;
-const KERNEL_STAGING_CAPACITY: u64 = 32 * 1024 * 1024;
-const INITRD_LOAD_ADDRESS: u64 = 0x0600_0000;
+const KERNEL_STAGING_ADDRESS: u64 = 0x0100_0000;
+const KERNEL_STAGING_CAPACITY: u64 = 16 * 1024 * 1024;
+const INITRD_LOAD_ADDRESS: u64 = 0x0200_0000;
 const INITRD_CAPACITY: u64 = 64 * 1024 * 1024;
 // Keep the semantic handoff in loader-reserved memory, clear of stage2's
 // 0x50000 E820 array and its retired 0x70000 INT 13h bounce buffer.

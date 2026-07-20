@@ -1,6 +1,7 @@
 //! Stateful ANSI/VT100 terminal parser with a framebuffer renderer.
 
 use crate::devices::fb_font::{GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::devices::framebuffer;
 use crate::devices::gfx::{Color as GfxColor, Framebuffer, Rect};
 use crate::mm::KVec;
 
@@ -107,6 +108,9 @@ impl TerminalRenderer for FramebufferRenderer {
     }
 
     fn draw_cell(&mut self, column: usize, row: usize, cell: Cell) {
+        if framebuffer::userspace_suspended() {
+            return;
+        }
         let mut foreground = self.resolve(
             cell.foreground,
             true,
@@ -135,7 +139,7 @@ impl TerminalRenderer for FramebufferRenderer {
     }
 
     fn set_cursor(&mut self, column: usize, row: usize, visible: bool) {
-        if !visible {
+        if !visible || framebuffer::userspace_suspended() {
             return;
         }
         let x = (column * GLYPH_WIDTH) as i32;
@@ -344,6 +348,17 @@ impl<R: TerminalRenderer> Terminal<R> {
         self.alternate_cells.fill(Cell::default());
         self.clear_rows(0, self.rows - 1);
         self.renderer.set_cursor(0, 0, true);
+    }
+
+    /// Repaint the complete saved terminal model and its current cursor.
+    ///
+    /// Display ownership uses this after a userspace scanout session ends.
+    /// Writes received while rendering was suspended still updated `cells`,
+    /// so one bounded redraw restores the exact current terminal contents.
+    pub fn redraw_all(&mut self) {
+        self.redraw_rows(0, self.rows - 1);
+        self.renderer
+            .set_cursor(self.cursor.column, self.cursor.row, self.cursor_visible);
     }
 
     #[must_use]
@@ -920,6 +935,25 @@ mod tests {
         assert_eq!(cursors.load(Ordering::Relaxed), 0);
 
         terminal.reset();
+        assert_eq!(draws.load(Ordering::Relaxed), 8);
+        assert_eq!(cursors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn redraw_all_repaints_saved_cells_and_cursor() {
+        let draws = Arc::new(AtomicUsize::new(0));
+        let cursors = Arc::new(AtomicUsize::new(0));
+        let renderer = CountingRenderer {
+            draws: Arc::clone(&draws),
+            cursors: Arc::clone(&cursors),
+        };
+        let mut terminal = Terminal::new_preserving(renderer).expect("valid test geometry");
+        terminal.write(b"A");
+        draws.store(0, Ordering::Relaxed);
+        cursors.store(0, Ordering::Relaxed);
+
+        terminal.redraw_all();
+
         assert_eq!(draws.load(Ordering::Relaxed), 8);
         assert_eq!(cursors.load(Ordering::Relaxed), 1);
     }

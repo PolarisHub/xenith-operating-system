@@ -59,11 +59,12 @@ execution with no semantic fallback.
 Both repository firmware runners are purpose-built validation environments for
 Xenith's packaged loaders. They do not execute arbitrary external BIOS/UEFI
 firmware, option ROMs, or a complete chipset reset model. Separately, VMware
-Workstation 17.6.3 legacy BIOS cold boots of the current El Torito ISO reached
-the framebuffer terminal and userspace shell with 1, 3, 4, 8, 16, and 24
-vCPUs on 2026-07-19. QEMU/SeaBIOS passed every integer CPU count from 1 through
-64 for that ISO and passed the raw image at 64 CPUs. These are external virtual
-implementations, not physical-hardware or all-firmware proof.
+Workstation 17.6.3 legacy BIOS cold boots of the preceding externally tested El
+Torito ISO reached the framebuffer terminal and userspace shell with 1, 3, 4,
+8, 16, and 24 vCPUs on 2026-07-19. QEMU/SeaBIOS passed every integer CPU count
+from 1 through 64 for that ISO and passed its raw image at 64 CPUs. The current
+artifact hashes and exact external-proof boundary are recorded in
+[STATUS](STATUS.md); these are not physical-hardware or all-firmware proof.
 
 ## CPU startup
 

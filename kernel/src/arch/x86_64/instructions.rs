@@ -95,6 +95,27 @@ pub unsafe fn sti() {
     }
 }
 
+/// Return whether maskable interrupts are enabled on the current CPU.
+///
+/// Reading RFLAGS is non-privileged and has no side effects, so callers may
+/// use this to defer long work that would otherwise run inside an exception
+/// or interrupt-disabled critical section.
+#[inline]
+#[must_use]
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: the balanced push/pop only snapshots RFLAGS into a general
+    // register. It changes neither flags nor memory visible to Rust.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {flags}",
+            flags = out(reg) flags,
+        );
+    }
+    flags & (1 << 9) != 0
+}
+
 /// An RAII guard that restores the caller's complete RFLAGS image on drop.
 ///
 /// Create one with [`InterruptGuard::disable`] before a short critical
@@ -406,6 +427,43 @@ pub unsafe fn invlpg(addr: u64) {
             addr = in(reg) addr,
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// Write back every modified cache line and invalidate the processor caches.
+///
+/// Xenith uses this once during single-CPU boot immediately before changing
+/// the framebuffer's page-table memory type from write-back to
+/// write-combining. This prevents dirty lines produced by the early splash or
+/// console from surviving across the cache-policy transition.
+///
+/// # Safety
+///
+/// The caller must execute at CPL 0, must serialize this instruction with any
+/// accesses to mappings whose cache policy is changing, and must ensure other
+/// processors cannot concurrently access those mappings.
+#[inline]
+pub unsafe fn wbinvd() {
+    // SAFETY: the caller supplies the privilege and cache-policy transition
+    // invariants. WBINVD uses no stack or general-purpose registers and
+    // preserves RFLAGS, but it has global memory/cache effects, so `nomem` is
+    // deliberately omitted to keep this a compiler memory barrier.
+    unsafe {
+        asm!("wbinvd", options(nostack, preserves_flags));
+    }
+}
+
+/// Order every earlier store before any later store.
+///
+/// This also drains write-combining buffers, which gives framebuffer present
+/// calls a real completion boundary after their final damaged rectangle.
+#[inline]
+pub fn sfence() {
+    // SAFETY: SFENCE is available on every x86_64 processor, takes no
+    // operands, and preserves RFLAGS. `nomem` is intentionally omitted so
+    // the compiler cannot move framebuffer stores across the fence.
+    unsafe {
+        asm!("sfence", options(nostack, preserves_flags));
     }
 }
 

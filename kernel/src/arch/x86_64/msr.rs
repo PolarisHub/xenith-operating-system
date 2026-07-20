@@ -103,6 +103,13 @@ impl Msr {
 /// Valid on every x86_64 part with a local APIC, which is all of them.
 pub const IA32_LAPIC_BASE: Msr = Msr::new(0x1B);
 
+/// IA32_PAT (`0x277`) — Page Attribute Table memory-type selectors.
+///
+/// Each byte describes one of the eight PTE-selected memory types. Xenith
+/// reserves entry 4 for write-combining framebuffer mappings on CPUs that
+/// advertise PAT through CPUID.01H:EDX[16].
+pub const IA32_PAT: Msr = Msr::new(0x277);
+
 /// IA32_EFER (`0xC0000080`) — Extended Feature Enable Register.
 ///
 /// Gates long mode (LME, bit 8), active long mode (LMA, bit 10, read-only),

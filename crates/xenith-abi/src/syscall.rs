@@ -62,6 +62,14 @@ pub enum SyscallNumber {
     GetRandom = 52,
     /// Install, disable, or query the calling thread's alternate signal stack.
     Sigaltstack = 53,
+    /// Acquire exclusive userspace access to the boot framebuffer.
+    UiAcquire = 54,
+    /// Copy a userspace pixel buffer into the acquired framebuffer.
+    UiPresent = 55,
+    /// Read keyboard and pointer events from the desktop input queue.
+    UiReadEvents = 56,
+    /// Release userspace access to the framebuffer and desktop input queue.
+    UiRelease = 57,
 }
 
 /// `spawn` argument 5: inherit the caller's process group.
@@ -70,6 +78,89 @@ pub const SPAWN_GROUP_INHERIT: u64 = 0;
 /// `spawn` argument 5: create a process group led by the new child.
 /// Any other nonzero value requests an existing process group by id.
 pub const SPAWN_GROUP_NEW: u64 = u64::MAX;
+
+/// Version of the userspace display and input wire ABI.
+pub const UI_ABI_VERSION: u32 = 1;
+
+/// The display uses the native framebuffer pixel layout described by [`UiDisplayInfo`].
+pub const UI_DISPLAY_NATIVE_PIXEL_FORMAT: u32 = 1;
+
+pub const UI_EVENT_KEY: u16 = 1;
+pub const UI_EVENT_POINTER: u16 = 2;
+
+pub const UI_EVENT_FLAG_PRESSED: u16 = 1 << 0;
+pub const UI_EVENT_FLAG_REPEAT: u16 = 1 << 1;
+pub const UI_EVENT_FLAG_OVERFLOW: u16 = 1 << 15;
+
+pub const UI_MODIFIER_LEFT_SHIFT: u16 = 1 << 0;
+pub const UI_MODIFIER_RIGHT_SHIFT: u16 = 1 << 1;
+pub const UI_MODIFIER_LEFT_CTRL: u16 = 1 << 2;
+pub const UI_MODIFIER_RIGHT_CTRL: u16 = 1 << 3;
+pub const UI_MODIFIER_LEFT_ALT: u16 = 1 << 4;
+pub const UI_MODIFIER_RIGHT_ALT: u16 = 1 << 5;
+pub const UI_MODIFIER_LEFT_SUPER: u16 = 1 << 6;
+pub const UI_MODIFIER_RIGHT_SUPER: u16 = 1 << 7;
+pub const UI_MODIFIER_CAPS_LOCK: u16 = 1 << 8;
+pub const UI_MODIFIER_NUM_LOCK: u16 = 1 << 9;
+pub const UI_MODIFIER_SCROLL_LOCK: u16 = 1 << 10;
+
+pub const UI_POINTER_BUTTON_LEFT: u16 = 1 << 0;
+pub const UI_POINTER_BUTTON_RIGHT: u16 = 1 << 1;
+pub const UI_POINTER_BUTTON_MIDDLE: u16 = 1 << 2;
+pub const UI_POINTER_BUTTON_BACK: u16 = 1 << 4;
+pub const UI_POINTER_BUTTON_FORWARD: u16 = 1 << 5;
+
+pub const UI_MAX_DAMAGE_RECTS: usize = 64;
+pub const UI_MAX_EVENTS_PER_READ: usize = 32;
+pub const UI_TIMEOUT_INFINITE: u64 = u64::MAX;
+
+/// Display geometry and native framebuffer channel layout returned by `ui_acquire`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct UiDisplayInfo {
+    pub version: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub bits_per_pixel: u16,
+    pub red_shift: u8,
+    pub red_size: u8,
+    pub green_shift: u8,
+    pub green_size: u8,
+    pub blue_shift: u8,
+    pub blue_size: u8,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// A damaged display region, measured in pixels from the top-left corner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct UiRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One keyboard or pointer event returned by `ui_read_events`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct UiInputEvent {
+    pub sequence: u64,
+    pub timestamp_ns: u64,
+    pub kind: u16,
+    pub flags: u16,
+    pub modifiers: u16,
+    pub buttons: u16,
+    pub code: u32,
+    pub value1: i32,
+    pub value2: i32,
+    pub value3: i32,
+    /// Must be zero. Explicitly occupies the tail so raw wire copies never
+    /// include implicit, potentially uninitialized structure padding.
+    pub reserved: [u32; 2],
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
@@ -553,7 +644,87 @@ mod tests {
         assert_eq!(SyscallNumber::Sigprocmask as u64, 51);
         assert_eq!(SyscallNumber::GetRandom as u64, 52);
         assert_eq!(SyscallNumber::Sigaltstack as u64, 53);
+        assert_eq!(SyscallNumber::UiAcquire as u64, 54);
+        assert_eq!(SyscallNumber::UiPresent as u64, 55);
+        assert_eq!(SyscallNumber::UiReadEvents as u64, 56);
+        assert_eq!(SyscallNumber::UiRelease as u64, 57);
         assert_eq!(WNOHANG | WUNTRACED | WCONTINUED, 11);
+    }
+
+    #[test]
+    fn ui_wire_types_have_stable_layouts() {
+        assert_eq!(core::mem::size_of::<UiDisplayInfo>(), 32);
+        assert_eq!(core::mem::align_of::<UiDisplayInfo>(), 4);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, version), 0);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, width), 4);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, height), 8);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, stride), 12);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, bits_per_pixel), 16);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, red_shift), 18);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, red_size), 19);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, green_shift), 20);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, green_size), 21);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, blue_shift), 22);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, blue_size), 23);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, flags), 24);
+        assert_eq!(core::mem::offset_of!(UiDisplayInfo, reserved), 28);
+
+        assert_eq!(core::mem::size_of::<UiRect>(), 16);
+        assert_eq!(core::mem::align_of::<UiRect>(), 4);
+        assert_eq!(core::mem::offset_of!(UiRect, x), 0);
+        assert_eq!(core::mem::offset_of!(UiRect, y), 4);
+        assert_eq!(core::mem::offset_of!(UiRect, width), 8);
+        assert_eq!(core::mem::offset_of!(UiRect, height), 12);
+
+        assert_eq!(core::mem::size_of::<UiInputEvent>(), 48);
+        assert_eq!(core::mem::align_of::<UiInputEvent>(), 8);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, sequence), 0);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, timestamp_ns), 8);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, kind), 16);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, flags), 18);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, modifiers), 20);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, buttons), 22);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, code), 24);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, value1), 28);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, value2), 32);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, value3), 36);
+        assert_eq!(core::mem::offset_of!(UiInputEvent, reserved), 40);
+        assert_eq!(
+            core::mem::offset_of!(UiInputEvent, reserved) + core::mem::size_of::<[u32; 2]>(),
+            core::mem::size_of::<UiInputEvent>()
+        );
+    }
+
+    #[test]
+    fn ui_constants_match_device_event_bits() {
+        assert_eq!(UI_ABI_VERSION, 1);
+        assert_eq!(UI_DISPLAY_NATIVE_PIXEL_FORMAT, 1);
+        assert_eq!(UI_EVENT_KEY, 1);
+        assert_eq!(UI_EVENT_POINTER, 2);
+        assert_eq!(UI_EVENT_FLAG_PRESSED, 1);
+        assert_eq!(UI_EVENT_FLAG_REPEAT, 2);
+        assert_eq!(UI_EVENT_FLAG_OVERFLOW, 0x8000);
+
+        assert_eq!(UI_MODIFIER_LEFT_SHIFT, 1 << 0);
+        assert_eq!(UI_MODIFIER_RIGHT_SHIFT, 1 << 1);
+        assert_eq!(UI_MODIFIER_LEFT_CTRL, 1 << 2);
+        assert_eq!(UI_MODIFIER_RIGHT_CTRL, 1 << 3);
+        assert_eq!(UI_MODIFIER_LEFT_ALT, 1 << 4);
+        assert_eq!(UI_MODIFIER_RIGHT_ALT, 1 << 5);
+        assert_eq!(UI_MODIFIER_LEFT_SUPER, 1 << 6);
+        assert_eq!(UI_MODIFIER_RIGHT_SUPER, 1 << 7);
+        assert_eq!(UI_MODIFIER_CAPS_LOCK, 1 << 8);
+        assert_eq!(UI_MODIFIER_NUM_LOCK, 1 << 9);
+        assert_eq!(UI_MODIFIER_SCROLL_LOCK, 1 << 10);
+
+        assert_eq!(UI_POINTER_BUTTON_LEFT, 1);
+        assert_eq!(UI_POINTER_BUTTON_RIGHT, 2);
+        assert_eq!(UI_POINTER_BUTTON_MIDDLE, 4);
+        assert_eq!(UI_POINTER_BUTTON_BACK, 16);
+        assert_eq!(UI_POINTER_BUTTON_FORWARD, 32);
+        assert_eq!(UI_MAX_DAMAGE_RECTS, 64);
+        assert_eq!(UI_MAX_EVENTS_PER_READ, 32);
+        assert_eq!(UI_TIMEOUT_INFINITE, u64::MAX);
     }
 
     #[test]

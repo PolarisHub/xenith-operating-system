@@ -24,6 +24,12 @@ pub struct Framebuffer {
     pub height: u16,
     pub pitch: u16,
     pub bpp: u16,
+    pub red_shift: u8,
+    pub red_size: u8,
+    pub green_shift: u8,
+    pub green_size: u8,
+    pub blue_shift: u8,
+    pub blue_size: u8,
 }
 
 #[derive(Clone, Copy, Debug)]

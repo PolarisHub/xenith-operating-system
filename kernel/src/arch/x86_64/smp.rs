@@ -2,9 +2,10 @@
 //!
 //! CPUs are discovered through the ACPI MADT and assigned compact logical
 //! ids in `0..MAX_CPUS` (`0` is the BSP). Every AP receives permanent
-//! per-CPU, GDT/TSS, bootstrap-stack, and critical-IST storage. One reserved
-//! low-memory trampoline page is repopulated serially for each AP before the
-//! BSP sends the architectural INIT-SIPI-SIPI sequence.
+//! per-CPU, GDT/TSS, bootstrap-stack, and critical-IST storage. Stack frames
+//! are allocated only for discovered APs. One reserved low-memory trampoline
+//! page is repopulated serially for each AP before the BSP sends the
+//! architectural INIT-SIPI-SIPI sequence.
 
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{
@@ -44,14 +45,12 @@ const BIOS_BOUNCE_TRAMPOLINE_PHYS: u64 = 0x0007_0000;
 const BIOS_BOOT_TOKEN: &str = "xenith.boot=bios";
 const PAGE_SIZE: usize = 4096;
 const AP_BOOT_STACK_SIZE: usize = 32 * 1024;
+const AP_STACK_BYTES: usize = AP_BOOT_STACK_SIZE + tss::IST_STACK_SIZE;
+const AP_STACK_FRAMES: usize = AP_STACK_BYTES / PAGE_SIZE;
 const AP_START_TIMEOUT_MS: u64 = 250;
 const CR3_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
-#[repr(C, align(16))]
-struct ApBootStack([u8; AP_BOOT_STACK_SIZE]);
-
-#[repr(C, align(16))]
-struct ApIstStack([u8; tss::IST_STACK_SIZE]);
+const _: () = assert!(AP_STACK_BYTES.is_multiple_of(PAGE_SIZE));
 
 // CPU zero uses the BSP-owned statics in percpu/gdt/tss. Slots 1.. are
 // prepared by the BSP before their corresponding INIT IPI is emitted.
@@ -59,10 +58,10 @@ static mut AP_PERCPU_AREAS: [PerCpuArea; MAX_CPUS] =
     [const { PerCpuArea::new_zeroed(0) }; MAX_CPUS];
 static mut AP_GDTS: [GlobalDescriptorTable; MAX_CPUS] =
     [const { GlobalDescriptorTable::new(0) }; MAX_CPUS];
-static mut AP_BOOT_STACKS: [ApBootStack; MAX_CPUS] =
-    [const { ApBootStack([0; AP_BOOT_STACK_SIZE]) }; MAX_CPUS];
-static mut AP_IST_STACKS: [ApIstStack; MAX_CPUS] =
-    [const { ApIstStack([0; tss::IST_STACK_SIZE]) }; MAX_CPUS];
+// Stack memory is allocated only for APs actually discovered. The physical
+// runs remain checked out permanently: the boot stack can still be named by
+// a delayed SIPI, and the IST stack remains installed in that CPU's TSS.
+static AP_BOOT_STACK_TOPS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 static CPU_APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(INVALID_APIC_ID) }; MAX_CPUS];
 static PRESENT_CPUS: AtomicU64 = AtomicU64::new(0);
@@ -204,26 +203,10 @@ fn ap_gdt(cpu: usize) -> *mut GlobalDescriptorTable {
     }
 }
 
-#[inline]
-fn ap_boot_stack_top(cpu: usize) -> u64 {
-    unsafe {
-        addr_of_mut!(AP_BOOT_STACKS)
-            .cast::<ApBootStack>()
-            .add(cpu)
-            .cast::<u8>()
-            .add(AP_BOOT_STACK_SIZE) as u64
-    }
-}
-
-#[inline]
-fn ap_ist_stack_top(cpu: usize) -> u64 {
-    unsafe {
-        addr_of_mut!(AP_IST_STACKS)
-            .cast::<ApIstStack>()
-            .add(cpu)
-            .cast::<u8>()
-            .add(tss::IST_STACK_SIZE) as u64
-    }
+fn stack_tops(base: u64) -> Option<(u64, u64)> {
+    let boot = base.checked_add(AP_BOOT_STACK_SIZE as u64)?;
+    let ist = boot.checked_add(tss::IST_STACK_SIZE as u64)?;
+    Some((boot, ist))
 }
 
 /// Mask of logical CPUs that completed all CPU-local initialisation.
@@ -271,20 +254,36 @@ fn cpu_for_apic_id(apic_id: u32) -> Option<usize> {
     })
 }
 
-fn prepare_ap_storage(cpu: usize) {
+fn prepare_ap_storage(cpu: usize) -> bool {
     debug_assert!((1..MAX_CPUS).contains(&cpu));
+    // The backing frames need not be below 4 GiB: real mode touches only the
+    // SIPI page and CR3. The trampoline loads this HHDM virtual stack address
+    // after it has entered 64-bit paging, where the direct map is active.
+    let Some(first) = crate::mm::physical::allocate_range(AP_STACK_FRAMES) else {
+        return false;
+    };
+    let base = crate::mm::phys_to_virt(first.start_address()).as_u64();
+    let Some((boot_stack_top, ist_stack_top)) = stack_tops(base) else {
+        // A canonical HHDM base cannot overflow by this small amount. Keep the
+        // run reserved if the boot contract was violated rather than making
+        // it available while a partially prepared AP could reference it.
+        return false;
+    };
+
+    // SAFETY: `allocate_range` returned this contiguous run exclusively, the
+    // HHDM maps it writable, and no address is published until zeroing ends.
+    unsafe { core::ptr::write_bytes(base as *mut u8, 0, AP_STACK_BYTES) };
+    AP_BOOT_STACK_TOPS[cpu].store(boot_stack_top, Ordering::Release);
+
     let area = ap_area(cpu);
     // SAFETY: this CPU has not been started yet, so the BSP exclusively owns
-    // its permanent slots. All pointers reference mapped kernel statics.
+    // its permanent slots. Both stack runs remain allocator-owned forever.
     unsafe {
         area.write(PerCpuArea::new_zeroed(cpu as u32));
         ap_gdt(cpu).write(GlobalDescriptorTable::new(0));
-        tss::build_tss_with_ist(
-            &mut (*area).tss,
-            ap_boot_stack_top(cpu),
-            ap_ist_stack_top(cpu),
-        );
+        tss::build_tss_with_ist(&mut (*area).tss, boot_stack_top, ist_stack_top);
     }
+    true
 }
 
 fn trampoline_symbol_range() -> (usize, usize) {
@@ -334,8 +333,12 @@ fn build_trampoline(cpu: usize, apic_id: u32, cr3: u64, frame: PhysFrame) -> Opt
             return None;
         }
 
+        let stack_top = AP_BOOT_STACK_TOPS[cpu].load(Ordering::Acquire);
+        if stack_top == 0 {
+            return None;
+        }
         patch_value(page, off!(ap_trampoline_cr3), cr3 as u32);
-        patch_value(page, off!(ap_trampoline_stack), ap_boot_stack_top(cpu));
+        patch_value(page, off!(ap_trampoline_stack), stack_top);
         patch_value(
             page,
             off!(ap_trampoline_entry),
@@ -414,10 +417,16 @@ pub fn init(boot_info: BootInfo) {
         }
 
         let cpu = next_cpu;
+        if !prepare_ap_storage(cpu) {
+            ::log::warn!(
+                "xenith.smp: no memory for CPU {} bootstrap/IST stacks; remaining APs ignored",
+                cpu
+            );
+            break;
+        }
         next_cpu += 1;
         CPU_APIC_IDS[cpu].store(entry.apic_id, Ordering::Release);
         PRESENT_CPUS.fetch_or(1u64 << cpu, Ordering::AcqRel);
-        prepare_ap_storage(cpu);
 
         let page = match trampoline_page {
             Some(page) => page,
@@ -812,5 +821,16 @@ mod tests {
             StartupDisposition::ReuseTrampoline
         );
         assert_eq!(startup_disposition(false), StartupDisposition::Stop);
+    }
+
+    #[test]
+    fn runtime_ap_stack_layout_is_contiguous_and_aligned() {
+        let base = 0xffff_8000_1234_5000;
+        let (boot, ist) = stack_tops(base).unwrap();
+        assert_eq!(boot - base, AP_BOOT_STACK_SIZE as u64);
+        assert_eq!(ist - boot, tss::IST_STACK_SIZE as u64);
+        assert_eq!(ist - base, (AP_STACK_FRAMES * PAGE_SIZE) as u64);
+        assert!(boot.is_multiple_of(16));
+        assert!(ist.is_multiple_of(16));
     }
 }

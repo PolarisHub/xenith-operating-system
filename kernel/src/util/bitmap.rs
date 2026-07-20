@@ -266,6 +266,44 @@ impl<'a> Bitmap<'a> {
         self.find_first_zero()
     }
 
+    /// Return the first zero bit in the half-open interval `start..end`.
+    ///
+    /// Whole allocated words are skipped with one comparison. The boundary
+    /// words are masked so bits outside the requested interval are treated as
+    /// allocated and can never be returned. Invalid or empty intervals return
+    /// `None` rather than widening the search.
+    #[inline]
+    pub fn find_zero_in(&self, start: usize, end: usize) -> Option<usize> {
+        if start >= end || start >= self.len {
+            return None;
+        }
+        let end = end.min(self.len);
+        let first_word = start / BITS_PER_WORD;
+        let last_word = (end - 1) / BITS_PER_WORD;
+
+        for word_index in first_word..=last_word {
+            let word_start = word_index * BITS_PER_WORD;
+            let lower = start.saturating_sub(word_start).min(BITS_PER_WORD);
+            let upper = end.saturating_sub(word_start).min(BITS_PER_WORD);
+
+            let below_mask = if lower == 0 { 0 } else { (1u64 << lower) - 1 };
+            let above_mask = if upper == BITS_PER_WORD {
+                0
+            } else {
+                !((1u64 << upper) - 1)
+            };
+            let masked = self.words[word_index] | below_mask | above_mask;
+            if masked != u64::MAX {
+                let bit = masked.trailing_ones() as usize;
+                let index = word_start + bit;
+                if index < end {
+                    return Some(index);
+                }
+            }
+        }
+        None
+    }
+
     /// Find the first run of `count` consecutive zero bits, set them all, and
     /// return the starting index. Returns `None` if no such run exists.
     ///
@@ -737,5 +775,20 @@ mod tests {
         bm.free_range(2, 1);
         assert_eq!(bm.allocate_range(1), Some(1));
         assert_eq!(bm.allocate_range(1), Some(2));
+    }
+
+    #[test]
+    fn bounded_zero_search_masks_edges_and_partial_words() {
+        let mut storage = [u64::MAX; 3];
+        let mut bm = Bitmap::with_len(&mut storage, 130);
+        bm.clear(5);
+        bm.clear(64);
+        bm.clear(129);
+
+        assert_eq!(bm.find_zero_in(6, 129), Some(64));
+        assert_eq!(bm.find_zero_in(65, 130), Some(129));
+        assert_eq!(bm.find_zero_in(0, 5), None);
+        assert_eq!(bm.find_zero_in(130, usize::MAX), None);
+        assert_eq!(bm.find_zero_in(10, 10), None);
     }
 }

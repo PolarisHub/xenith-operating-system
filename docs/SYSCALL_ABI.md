@@ -13,6 +13,17 @@ from 16 KiB through 8 MiB, report `SS_ONSTACK` from the interrupted stack
 pointer, cannot be changed while active, survive `fork`, and are disabled by
 `exec`.
 
+Numbers 54 through 57 provide the exclusive userspace display/input session:
+`ui_acquire`, `ui_present`, `ui_read_events`, and `ui_release`. One process owns
+the boot framebuffer and ordered PS/2 input seat at a time. Presentation copies
+validated damaged rows from a complete private userspace backbuffer; at most 64
+damage rectangles and 32 events per read are accepted. The fixed 32-byte
+`UiDisplayInfo`, 16-byte `UiRect`, and 48-byte `UiInputEvent` wire records and
+the native 32-bpp RGB-mask contract are documented in
+[DESKTOP_FOUNDATION](DESKTOP_FOUNDATION.md). Event delivery is transactional:
+records leave the kernel queue only after the complete requested batch has
+been copied successfully, and ownership epochs reject cross-session input.
+
 Caught-signal frames contain the complete integer/control context, stable
 `siginfo`, and the exact enabled x87/SSE/YMM state. The kernel owns the xstate
 location and validates its size, feature mask, MXCSR, XSAVE header, selectors,

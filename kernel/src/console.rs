@@ -286,6 +286,19 @@ fn try_framebuffer(bi: &xenith_boot::BootInfo, preserve_splash: bool) -> bool {
     if fb.bpp != 32 {
         return false;
     }
+    if fb.phys_addr.as_u64() & 3 != 0 || fb.pitch & 3 != 0 {
+        return false;
+    }
+    let Some(format) = crate::devices::gfx::PixelFormat::new(
+        fb.red_shift,
+        fb.red_size,
+        fb.green_shift,
+        fb.green_size,
+        fb.blue_shift,
+        fb.blue_size,
+    ) else {
+        return false;
+    };
     let preserve_splash = preserve_splash && fb.width >= 640 && fb.height >= 480;
     let vaddr = bi.phys_to_virt(fb.phys_addr);
     // SAFETY: `FramebufferConsole::init_in_place` writes the geometry fields
@@ -297,6 +310,7 @@ fn try_framebuffer(bi: &xenith_boot::BootInfo, preserve_splash: bool) -> bool {
             fb.pitch,
             fb.width,
             fb.height,
+            format,
             preserve_splash,
         );
         set_console(framebuffer::static_ref());

@@ -586,6 +586,7 @@ impl<'a> Decoder<'a> {
             0x05 => Ok(Instruction::new(Mnemonic::Syscall)),
             0x06 => Ok(Instruction::new(Mnemonic::Clts)),
             0x07 => Ok(Instruction::new(Mnemonic::Sysret)),
+            0x09 => Ok(Instruction::new(Mnemonic::Wbinvd)),
             0x31 => Ok(Instruction::new(Mnemonic::Rdtsc)),
             0x32 => Ok(Instruction::new(Mnemonic::Rdmsr)),
             0x30 => Ok(Instruction::new(Mnemonic::Wrmsr)),
@@ -944,6 +945,7 @@ mod tests {
     #[test]
     fn decodes_legacy_fpu_state_instructions_and_clts() {
         assert_eq!(decode(&[0x0f, 0x06]).unwrap().mnemonic, Mnemonic::Clts);
+        assert_eq!(decode(&[0x0f, 0x09]).unwrap().mnemonic, Mnemonic::Wbinvd);
         assert_eq!(decode(&[0xdb, 0xe3]).unwrap().mnemonic, Mnemonic::Fninit);
 
         let save = decode(&[0x0f, 0xae, 0x07]).unwrap();

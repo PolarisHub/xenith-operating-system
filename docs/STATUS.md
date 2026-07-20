@@ -10,6 +10,12 @@ a boot result, and an internal firmware model is not a physical-machine result.
   heap, refcounted copy-on-write `fork`, transactional `exec`, per-CPU
   scheduling, syscall entry, checked user-copy fixups, ELF processes, and
   x87/SSE/XSAVE task state.
+- The initial heap scales from 8 to 32 MiB instead of reserving 32 MiB on every
+  machine. The frame bitmap uses word-scanned next-fit allocation and excludes
+  the published heap claim; delayed bootloader-memory reclamation protects all
+  live boot structures before returning safe frames. AP boot/IST stacks are
+  allocated only for discovered processors instead of reserving 64 stacks in
+  `.bss`.
 - Signals include standard coalescing, a preallocated 128-entry realtime queue,
   `sigaction`, `sigprocmask`, `sigaltstack`, `sigreturn`, `SA_SIGINFO`,
   `SA_ONSTACK`, bounded `SA_RESTART`, and validated integer plus xstate frames.
@@ -36,12 +42,15 @@ a boot result, and an internal firmware model is not a physical-machine result.
   startup so a late AP cannot consume another CPU's state. APs install
   CPU-local descriptor/per-CPU/FPU/scheduler state, and reschedule plus
   TLB-shootdown IPIs coordinate per-CPU run queues. Both x2APIC and legacy
-  xAPIC register backends are implemented.
+  xAPIC register backends are implemented. CPU 0 owns the single 100 Hz shared
+  expiry/aging pass while every CPU retains independent 50 ms time slices.
 - `xenith-build all` owns bootloader, kernel, userspace, initramfs, raw-image,
   and hybrid ISO construction without invoking QEMU, xorriso, Limine deploy,
   NASM, a system C compiler/linker, or GDB. The ISO contains a BIOS
   hard-disk-emulation image and a FAT16 EFI System Partition with exact
   `BOOTX64.EFI`, kernel, and initramfs payload verification.
+  Multicall initramfs names are CPIO symlinks to one coreutils payload rather
+  than duplicate executable bodies.
 - BIOS stage2 keeps payload I/O behind the firmware boot-drive contract: it
   reads the kernel and initramfs through bounded EDD packets or a geometry-
   validated, single-sector CHS fallback into conventional memory, copies each
@@ -68,6 +77,16 @@ a boot result, and an internal firmware model is not a physical-machine result.
   redirection, quoting, background jobs, sessions/process groups, and terminal
   job control. The shipped `/bin/c-demo` is compiled through
   `xenith-cc` -> `xenith-asm` -> `xenith-ld`.
+- The pre-desktop boundary now exposes one process-owned framebuffer/input
+  session through syscalls 54-57 and matching `libuser` wrappers. Presentation
+  uses a private userspace backbuffer plus validated damage copies; keyboard
+  and pointer events share one bounded ordered queue with transactional reads,
+  overflow reporting, routing epochs, signal-aware waits, and automatic
+  release on successful exec, exit, or fatal process teardown. The kernel
+  terminal retains its model while suspended and is fully restored on release.
+  Event waits use a lost-wake-safe scheduler handoff with no 10 ms polling, and
+  PAT-capable CPUs map scanout write-combining with cache-safe WBINVD/SFENCE
+  ordering.
 - The kernel accepts native `XenithBootInfo` from Xenith's BIOS/UEFI loaders and
   the optional local Limine-compatible input. Xenith records are validated and
   normalized into one internal boot aggregate before subsystem initialization;
@@ -81,25 +100,29 @@ the current build.
 
 | Gate | What a passing run proves | Fresh post-change result |
 | --- | --- | --- |
-| `kernel_reaches_userspace_shell` | Direct kernel/initramfs load reaches ring-3 init and `xenith$` | PASS (2026-07-19) |
-| `shell_executes_builtins_and_coreutils_via_ps2` | PS/2 input drives the shell, coreutils, filesystem mutations, VM/RNG, and the ring-3 signal smoke | PASS (2026-07-19) |
-| `input_script_proves_shell_pipeline_and_redirection` | Multi-stage pipelines and `<`, `>`, `>>` work through real descriptors and syscalls | PASS (2026-07-19) |
-| `xenith_built_c_utility_executes_in_ring3` | C source compiled by Xenith's compiler/assembler/linker executes at CPL3 | PASS (2026-07-19) |
-| `manifest_image_reaches_userspace_shell` | The packaged manifest, checksums, kernel, initramfs, and attached ATA image reach the shell | PASS (2026-07-19) |
-| `bios_firmware_image_reaches_userspace_shell` | Exact packaged BIOS stage streams execute through their long-mode call boundary, then the explicit semantic stage2 body reaches the shell | PASS (2026-07-19) |
-| `bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell` | The ISO's validated x86 catalog entry executes the packaged BIOS stages, preserves the native reserved-low-memory handoff, exercises the `0x70000` AP-trampoline fallback, brings an odd three-CPU topology online, and reaches the shell | PASS (2026-07-19) |
-| `uefi_iso_executes_packaged_pe_and_reaches_userspace_shell` | The platform-`0xEF` entry, FAT16 payloads, actual `BOOTX64.EFI`, strict services, `ExitBootServices`, and native handoff reach the shell with `semantic_loader_fallback=false` | PASS (2026-07-19) |
-| `two_processor_kernel_brings_ap_online_and_reaches_shell` | The deterministic interpreter observes guest INIT-SIPI-SIPI, brings CPU 1 online, and reaches userspace | PASS (2026-07-19) |
-| `three_processor_kernel_brings_every_ap_online_and_reaches_shell` | The deterministic interpreter observes serialized startup of both APs, brings all three CPUs online, and reaches userspace | PASS (2026-07-19) |
-| `built_kernel_supports_bidirectional_dwarf_line_lookup` | The packaged kernel's symbols and line tables resolve address-to-source and source-to-address | PASS (2026-07-19) |
-| `gdb_rsp_tcp_bridge_controls_a_live_emulator` | The bounded GDB RSP bridge controls registers, memory, breakpoints, continue, and single-step on a live interpreter | PASS (2026-07-19) |
-| `whp_boots_built_kernel_to_userspace_shell` | A real WHP virtual processor executes the direct kernel handoff to the shell | PASS (2026-07-19) |
-| `whp_brings_second_processor_online_and_reaches_userspace_shell` | Two real WHP VPs execute and the guest brings its AP online before reaching the shell | PASS (2026-07-19) |
+| `kernel_reaches_userspace_shell` | Direct kernel/initramfs load reaches ring-3 init and `xenith$` | PASS (2026-07-20) |
+| `shell_executes_builtins_and_coreutils_via_ps2` | PS/2 input drives the shell, coreutils, filesystem mutations, VM/RNG, and the ring-3 signal smoke | PASS (2026-07-20) |
+| `ring3_ui_smoke_restores_framebuffer_terminal` | Ring 3 acquires scanout, presents full and damaged frames, polls input, releases/unmaps, and the kernel terminal resumes drawing | PASS (2026-07-20) |
+| `input_script_proves_shell_pipeline_and_redirection` | Multi-stage pipelines and `<`, `>`, `>>` work through real descriptors and syscalls | PASS (2026-07-20) |
+| `xenith_built_c_utility_executes_in_ring3` | C source compiled by Xenith's compiler/assembler/linker executes at CPL3 | PASS (2026-07-20) |
+| `manifest_image_reaches_userspace_shell` | The packaged manifest, checksums, kernel, initramfs, and attached ATA image reach the shell | PASS (2026-07-20) |
+| `bios_firmware_image_reaches_userspace_shell` | Exact packaged BIOS stage streams execute through their long-mode call boundary, then the explicit semantic stage2 body reaches the shell | PASS (2026-07-20) |
+| `bios_firmware_image_reaches_shell_with_64_mib` | The compact BIOS payload layout and 8 MiB adaptive heap reach the shell with 64 MiB RAM | PASS (2026-07-20) |
+| `bios_iso_catalog_entry_executes_packaged_stages_then_semantic_shell` | The ISO's validated x86 catalog entry executes the packaged BIOS stages, preserves the native reserved-low-memory handoff, exercises the `0x70000` AP-trampoline fallback, brings an odd three-CPU topology online, and reaches the shell | PASS (2026-07-20) |
+| `uefi_iso_executes_packaged_pe_and_reaches_userspace_shell` | The platform-`0xEF` entry, FAT16 payloads, actual `BOOTX64.EFI`, strict services, `ExitBootServices`, and native handoff reach the shell with `semantic_loader_fallback=false` | PASS (2026-07-20) |
+| `two_processor_kernel_brings_ap_online_and_reaches_shell` | The deterministic interpreter observes guest INIT-SIPI-SIPI, brings CPU 1 online, and reaches userspace | PASS (2026-07-20) |
+| `three_processor_kernel_brings_every_ap_online_and_reaches_shell` | The deterministic interpreter observes serialized startup of both APs, brings all three CPUs online, and reaches userspace | PASS (2026-07-20) |
+| `built_kernel_supports_bidirectional_dwarf_line_lookup` | The packaged kernel's symbols and line tables resolve address-to-source and source-to-address | PASS (2026-07-20) |
+| `gdb_rsp_tcp_bridge_controls_a_live_emulator` | The bounded GDB RSP bridge controls registers, memory, breakpoints, continue, and single-step on a live interpreter | PASS (2026-07-20) |
+| `whp_boots_built_kernel_to_userspace_shell` | A real WHP virtual processor executes the direct kernel handoff to the shell | PASS (2026-07-20) |
+| `whp_brings_second_processor_online_and_reaches_userspace_shell` | Two real WHP VPs execute and the guest brings its AP online before reaching the shell | PASS (2026-07-20) |
 
-## Validation snapshot - 2026-07-19
+## Validation snapshot - 2026-07-20
 
 - Complete workspace check and the selected native workspace test suite: PASS.
-- Kernel host suite: 459 passed, 0 failed.
+- Kernel host suite: 497 passed, 0 failed.
+- Shared ABI suite: 6 passed, 0 failed; x86 decode/encode suite: 19 passed, 0
+  failed; emulator library suite: 63 passed, 0 failed.
 - Strict native, custom-target kernel/userspace, and standalone bootloader
   Clippy with warnings denied: PASS.
 - Standalone bootloader checks/tests and root plus bootloader formatting: PASS.
@@ -107,26 +130,28 @@ the current build.
   `BOOTX64.EFI`, userspace ELFs, initramfs, raw image, hybrid ISO, and artifact
   inventory through the repository-owned toolchain.
 - Every runtime gate in the table above: PASS against the refreshed artifacts.
+- Fresh footprint: 125,452-byte initramfs and 94,856-byte kernel `.bss`.
 
-External VMware Workstation 17.6.3 legacy-BIOS cold boots also passed on
-2026-07-19 against the exact current ISO with 512 MiB RAM and 1, 3, 4, 8, 16,
-and 24 vCPUs. The respective cores-per-socket settings were 1, 1, 2, 4, 8,
-and 12; 24 was the host's logical-CPU limit. Every configuration reported the
-requested online/discovered count, reached `xenith$`, and had no guest failure,
-CPU-disabled, AP-timeout, panic, or triple-fault marker.
+The repository-owned gates above ran against these refreshed artifacts:
 
-QEMU 11.0.50 with SeaBIOS 1.17 cold-booted the exact current ISO at every
-integer CPU count from 1 through 64. All 64 runs reported the exact requested
-online/discovered count and reached `xenith$`. The current raw image also
-passed at 64 CPUs, and a 6-CPU topology with 2 sockets by 3 cores passed with
-non-contiguous APIC IDs. The tested hashes were:
-
-- `xenith.iso`: `0949DB89FEF66AAA2A83A96858A5D97F12D5561C76ADD0580352954C9ACC110F`
-- `xenith.img`: `074298C35B258A57D483D769C5F638D2620FBE505A968A0700BD3E629289FE20`
-- `kernel.elf`: `1A1727FE75D9D7D8BA3D6B7C89903BC6D9AF1802663E33FA93021DA3FA9868BD`
+- `xenith.iso`: `69C2605074FF1855A4DA06F1B420EA92D1E714ED63E31D36843725E6154023C2`
+- `xenith.img`: `A1F67CCA06CA75CC99AAB5BB05CEE10D8F4006598ADD8FEE796CB834FBED31CE`
+- `kernel.elf`: `193129C0CD3F937D31CB6828AC8E0C4C7DF3F4641E50149F63EE32CF2DDBDF92`
+- `initramfs.cpio`: `71E3F7176221B6F0C0B189AA04D32C92CD2C447A1C40A748DCEF238C785DF85E`
 - `stage1.bin`: `A46C1CDD3774064FEFAE8EB5379245900D773A4425FF16B8AA428A39328607C0`
-- `stage2.bin`: `ED6B02B71122043DF7C645DC1B676FFA4B2A7A20C0DF7C788D9AC34EC9B9C4CD`
-- `BOOTX64.EFI`: `18330D4CB053F5A6CE616C94F870F1AB14D3CEC6ECD49B3E03209FA5CE31D9AF`
+- `stage2.bin`: `A8AAEE751846A29C88D067D33EE9AB94DC2CC09DA3037C5491ED029B1A3CBDB7`
+- `BOOTX64.EFI`: `24ED26304B2184E63722BD62DD04BF3E5B7A7C6C676EBD53AB8C96B7F7FBD55D`
+
+External VMware Workstation 17.6.3 legacy-BIOS cold boots passed earlier on
+2026-07-19 with 512 MiB RAM and 1, 3, 4, 8, 16, and 24 vCPUs. QEMU 11.0.50
+with SeaBIOS 1.17 also passed every integer CPU count from 1 through 64, a
+64-CPU raw-image boot, and a 2-socket by 3-core topology with non-contiguous
+APIC IDs. Those external runs used the preceding ISO
+`0949DB89FEF66AAA2A83A96858A5D97F12D5561C76ADD0580352954C9ACC110F`
+and raw image
+`074298C35B258A57D483D769C5F638D2620FBE505A968A0700BD3E629289FE20`;
+they were not rerun after the desktop-foundation rebuild and are historical
+evidence, not proof of the refreshed hashes above.
 
 Native unit/integration tests also exercise the debugger protocol and GDB RSP
 bridge, CPL-aware walks and interrupt entry, ATA/PCI/HPET/RTL8139 devices,
@@ -136,12 +161,17 @@ ordering.
 
 ## Remaining boundaries
 
-- VMware Workstation legacy BIOS and QEMU/SeaBIOS now prove the current raw disk
-  and BIOS El Torito entry, including firmware EDD/CHS payload preloading and
-  VBE linear-framebuffer handoff. This does not establish physical-PC
-  compatibility or coverage across arbitrary firmware; physical
-  AHCI/NVMe/USB boot, NICs, display/input, ACPI quirks, and cache-flush behavior
-  remain hardware-validation work.
+- Repository-owned emulator gates prove the refreshed raw disk plus BIOS and
+  UEFI ISO entries. VMware Workstation and QEMU/SeaBIOS externally proved the
+  immediately preceding SMP artifact, not the refreshed desktop-foundation
+  hashes. Neither result establishes physical-PC compatibility or coverage
+  across arbitrary firmware; physical AHCI/NVMe/USB boot, NICs, display/input,
+  ACPI quirks, and cache-flush behavior remain hardware-validation work.
+- The display/input session is deliberately a single-process software-copy
+  foundation, not a desktop. There is no compositor, window protocol, shared
+  client surface, acceleration, page flipping, or default application yet.
+  Syscalls 54-57 pass a ring-3 lifecycle smoke, but multi-client compositor
+  behavior, SMP input timing stress, and real-device validation remain.
 - The supported configured CPU range is 1 through 64, including the BSP. CPU
   masks and several per-CPU stores are fixed around `MAX_CPUS=64`; supporting
   more than 64 requires dynamically sized CPU sets and per-CPU storage rather

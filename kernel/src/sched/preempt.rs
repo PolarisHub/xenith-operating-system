@@ -22,8 +22,8 @@
 //!    context switch, because once [`scheduler::schedule_next`] switches
 //!    away we do not return to this handler frame for an unbounded time and
 //!    a pending EOI would starve the whole CPU of interrupts;
-//! 3. hands the tick to the scheduler ([`scheduler::tick`]) for its own
-//!    accounting — run-queue ageing, woken-task promotion, stats;
+//! 3. on CPU 0 only, hands the global tick to the scheduler
+//!    ([`scheduler::tick`]) for sleep expiry and all-run-queue ageing;
 //! 4. does the local time-slice bookkeeping — bumps this CPU's tick counter
 //!    and raises `need_resched` when the current slice expires, so the
 //!    preemption decision is owned here even if the scheduler does not set
@@ -75,8 +75,8 @@
 //!
 //! This module calls two functions in [`crate::sched::scheduler`]:
 //!
-//! * `scheduler::tick()` — called once per LAPIC timer tick to update
-//!   scheduler state. Must be safe to call from the timer IRQ context
+//! * `scheduler::tick()` — called from CPU 0 once per global tick to update
+//!   shared scheduler state. Must be safe to call from timer IRQ context
 //!   (interrupts off, no scheduler locks held by the caller).
 //! * `scheduler::schedule_next()` — selects the next runnable task and
 //!   performs the context switch. May be called from IRQ context (the timer
@@ -445,7 +445,8 @@ pub fn on_context_switch_in() {
 ///    switches away we do not return to this frame for an unbounded time,
 ///    and an un-acked LAPIC would block same-and-lower-priority interrupts
 ///    on this CPU until we come back.
-/// 3. [`scheduler::tick`] gets the tick for scheduler accounting.
+/// 3. On CPU 0, [`scheduler::tick`] performs the one global queue-accounting
+///    pass. AP ticks deliberately skip the shared scheduler lock.
 /// 4. Local slice bookkeeping bumps the per-CPU counters and raises
 ///    `need_resched` when the slice expires.
 /// 5. [`should_preempt`] gates the actual switch: only if preemption is
@@ -456,12 +457,14 @@ pub fn on_context_switch_in() {
 /// can switch tasks, and it is the single point where the timer path
 /// crosses into the scheduler.
 pub fn on_timer_tick() {
+    let cpu = current_cpu();
+
     // 1. Monotonic accumulator. Cheap (a single relaxed fetch_add) and
     //    must precede EOI so the clocksource's double-read sees the tick.
     // The LAPIC clocksource accumulator represents wall time, not aggregate
     // CPU time. Only the BSP advances it; every CPU still performs scheduler
     // accounting below from its own local timer interrupt.
-    if current_cpu() == 0 {
+    if crate::sched::scheduler::owns_global_tick(cpu) {
         lapic_timer::on_tick();
     }
 
@@ -470,10 +473,12 @@ pub fn on_timer_tick() {
     //    switch because we do not return to this frame after one.
     lapic_timer::send_eoi();
 
-    // 3. Scheduler accounting. The scheduler may set `need_resched` here
-    //    (e.g. a higher-priority task woke); our local slice check below
-    //    may also set it. Both paths are fine — the flag is idempotent.
-    scheduler_tick();
+    // 3. Shared scheduler accounting runs once, on the BSP. Every AP avoids
+    // the global scheduler lock here and proceeds directly to its independent
+    // slice counters below.
+    if crate::sched::scheduler::owns_global_tick(cpu) {
+        scheduler_tick();
+    }
 
     // 4. Local time-slice accounting. Bump the per-CPU tick counters and
     //    flag a reschedule when the current slice has elapsed. This makes
@@ -608,12 +613,12 @@ pub fn init_for_ap(slice_ticks: u32) {
 // Scheduler glue — the two call sites that tie this module to the scheduler
 // ---------------------------------------------------------------------------
 
-/// Hand a timer tick to the scheduler.
+/// Hand the BSP's global timer tick to the scheduler.
 ///
 /// This is the single point at which the LAPIC tick feeds
 /// [`crate::sched::scheduler::tick`]; repoint it if the scheduler exposes
-/// its tick entry under a different path. Must be safe to call from the
-/// timer IRQ context.
+/// its tick entry under a different path. The caller has already established
+/// that this is CPU 0 and is running in timer IRQ context.
 #[inline]
 fn scheduler_tick() {
     crate::sched::scheduler::tick();

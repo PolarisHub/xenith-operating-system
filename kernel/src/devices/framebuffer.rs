@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console::{Color, Console};
 use crate::devices::fb_font::{self, GLYPH_HEIGHT, GLYPH_WIDTH};
-use crate::devices::gfx::Framebuffer as GfxFramebuffer;
+use crate::devices::gfx::{Framebuffer as GfxFramebuffer, PixelFormat};
 use crate::devices::term::{FramebufferRenderer, Terminal};
 
 // --- Geometry --------------------------------------------------------------
@@ -38,6 +38,7 @@ const CHAR_H: usize = GLYPH_HEIGHT;
 ///
 /// All fields are set before any `&'static` reference escapes, so they are
 /// read-only for the lifetime of the console and need no synchronisation.
+#[derive(Clone, Copy)]
 struct FramebufferGeom {
     /// Base of the pixel buffer, already translated through the HHDM.
     buffer: *mut u8,
@@ -47,6 +48,8 @@ struct FramebufferGeom {
     width: u16,
     /// Visible height in pixels.
     height: u16,
+    /// Native channel layout of each 32-bit scanout pixel.
+    format: PixelFormat,
     /// Text columns that fit in `width`.
     cols: usize,
     /// Text rows that fit in `height`.
@@ -74,13 +77,38 @@ pub struct FramebufferConsole {
     splash_active: AtomicBool,
 }
 
-// SAFETY: `FramebufferConsole` is only ever mutated in two ways: (1) the
-// geometry fields are written once, single-threaded, by `init_in_place`
-// before any reference escapes; (2) `state` is a `spin::Mutex` that
-// serialises all cursor/colour changes. Pixel stores go through the raw
-// buffer pointer but are gated by the same lock, so no two writers race on
-// the same pixel. After init the struct is effectively shared-read with
-// interior mutability through the mutex, which is the `Send + Sync` contract.
+/// Borrowed hardware scanout descriptor handed to the userspace display layer.
+///
+/// The raw pointer is valid for the kernel lifetime, but callers may write it
+/// only while [`userspace_suspended`] is true after a successful
+/// [`suspend_for_userspace`] call. [`resume_from_userspace`] ends that lease.
+#[derive(Clone, Copy)]
+pub(crate) struct Scanout {
+    pub(crate) buffer: *mut u8,
+    pub(crate) pitch: usize,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) format: PixelFormat,
+}
+
+// SAFETY: the descriptor is only a movable capability. Actual access remains
+// governed by the synchronized suspend/resume ownership protocol.
+unsafe impl Send for Scanout {}
+
+/// True while the framebuffer terminal has yielded scanout ownership.
+static RENDERING_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// A release from exception context cannot safely repaint every terminal
+/// cell with interrupts disabled. Console writers complete this redraw before
+/// applying an update and retry once after dropping the terminal lock, closing
+/// the handoff window where an interrupted writer already made its final check.
+static REDRAW_PENDING: AtomicBool = AtomicBool::new(false);
+
+// SAFETY: geometry is initialized once before publication. Every kernel VRAM
+// write holds `terminal`, while `state` separately serializes cursor and color
+// state. A successful userspace suspension is established while `terminal` is
+// held and makes the renderer a no-op until resume reacquires the same lock,
+// so the scanout has exactly one active writer under the documented lease.
 unsafe impl Send for FramebufferConsole {}
 unsafe impl Sync for FramebufferConsole {}
 
@@ -97,6 +125,7 @@ impl FramebufferConsole {
                 pitch: 0,
                 width: 0,
                 height: 0,
+                format: PixelFormat::XRGB8888,
                 cols: 0,
                 rows: 0,
             },
@@ -131,6 +160,7 @@ pub unsafe fn init_in_place(
     pitch: u16,
     width: u16,
     height: u16,
+    format: PixelFormat,
     preserve_splash: bool,
 ) {
     let pitch = pitch as usize;
@@ -148,10 +178,13 @@ pub unsafe fn init_in_place(
             pitch,
             width,
             height,
+            format,
             cols,
             rows,
         };
         (*g).splash_active.store(preserve_splash, Ordering::Release);
+        RENDERING_SUSPENDED.store(false, Ordering::Release);
+        REDRAW_PENDING.store(false, Ordering::Release);
     }
 
     // Keep the UEFI artwork intact until the first real console write. Other
@@ -195,7 +228,13 @@ pub fn upgrade_terminal() -> bool {
         return false;
     }
     let mut terminal_slot = console.terminal.lock();
-    let surface = GfxFramebuffer::new(geom.buffer, geom.pitch, geom.width, geom.height);
+    let surface = GfxFramebuffer::with_format(
+        geom.buffer,
+        geom.pitch,
+        geom.width,
+        geom.height,
+        geom.format,
+    );
     let renderer = FramebufferRenderer::new(surface);
     let preserving = console.splash_active.load(Ordering::Acquire);
     let terminal = if preserving {
@@ -224,11 +263,74 @@ pub fn splash_active() -> bool {
     console.splash_active.load(Ordering::Acquire)
 }
 
+/// Yield the framebuffer scanout to the userspace display/session layer.
+///
+/// Taking the terminal lock establishes a clean ownership boundary with every
+/// console writer. The stateful terminal remains live and continues updating
+/// its cell model, but its renderer becomes a no-op until
+/// [`resume_from_userspace`] is called. A second acquisition, the VGA path, or
+/// acquisition before the stateful terminal exists returns `None`.
+pub(crate) fn suspend_for_userspace() -> Option<Scanout> {
+    // SAFETY: the singleton is either initialized or still has null geometry;
+    // the latter is rejected below.
+    let console = unsafe { &*core::ptr::addr_of!(FB_CONSOLE) };
+    let terminal = console.terminal.lock();
+    let geom = console.geom;
+    if geom.buffer.is_null()
+        || geom.cols == 0
+        || geom.rows == 0
+        || terminal.is_none()
+        || RENDERING_SUSPENDED.swap(true, Ordering::AcqRel)
+    {
+        return None;
+    }
+    REDRAW_PENDING.store(false, Ordering::Release);
+    console.splash_active.store(false, Ordering::Release);
+    Some(Scanout {
+        buffer: geom.buffer,
+        pitch: geom.pitch,
+        width: geom.width,
+        height: geom.height,
+        format: geom.format,
+    })
+}
+
+/// Return userspace-owned scanout to the framebuffer terminal and repaint it.
+pub(crate) fn resume_from_userspace() {
+    // SAFETY: see [`suspend_for_userspace`].
+    let console = unsafe { &*core::ptr::addr_of!(FB_CONSOLE) };
+    if !RENDERING_SUSPENDED.load(Ordering::Acquire) {
+        return;
+    }
+    // Publish pending before making rendering live. A concurrent console
+    // writer can then never paint a partial update over the userspace image
+    // without first restoring the complete terminal model.
+    REDRAW_PENDING.store(true, Ordering::Release);
+    if !RENDERING_SUSPENDED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if !crate::arch::x86_64::interrupts_enabled() {
+        // Never block an exception path behind a terminal writer that may be
+        // preempted on this CPU. If uncontended, restore immediately. If a
+        // writer owns the lock, its mandatory post-unlock retry completes the
+        // redraw; any intervening writer inherits the same obligation.
+        console.service_pending_redraw();
+        return;
+    }
+    let mut terminal = console.terminal.lock();
+    console.finish_pending_redraw(&mut terminal);
+}
+
+/// Whether userspace currently owns the hardware scanout.
+#[must_use]
+pub(crate) fn userspace_suspended() -> bool {
+    RENDERING_SUSPENDED.load(Ordering::Acquire)
+}
+
 /// Update the progress indicator painted by the UEFI loader.
 ///
-/// Only grayscale pixels are used here, so the update is correct for both
-/// RGBX and BGRX 32-bpp layouts even though the compatibility boot record no
-/// longer carries the original GOP channel masks.
+/// The logical grayscale shades are packed through the scanout's validated
+/// native channel layout before being written.
 pub fn splash_progress(percent: u8) {
     // SAFETY: `console::init` has populated the singleton before init stages
     // call this function.
@@ -245,10 +347,24 @@ pub fn splash_progress(percent: u8) {
     let x = (usize::from(geom.width) - 640) / 2 + 58;
     let y = (usize::from(geom.height) - 480) / 2 + 378;
     let filled = 218 * usize::from(percent.min(100)) / 100;
-    fill_rect(geom, x, y, 220, 10, 0x009a_9a9a);
-    fill_rect(geom, x + 1, y + 1, 218, 8, 0x001a_1a1a);
+    fill_rect(geom, x, y, 220, 10, geom.format.pack_rgb(0x9a, 0x9a, 0x9a));
+    fill_rect(
+        geom,
+        x + 1,
+        y + 1,
+        218,
+        8,
+        geom.format.pack_rgb(0x1a, 0x1a, 0x1a),
+    );
     if filled != 0 {
-        fill_rect(geom, x + 1, y + 1, filled, 8, 0x00ee_eeee);
+        fill_rect(
+            geom,
+            x + 1,
+            y + 1,
+            filled,
+            8,
+            geom.format.pack_rgb(0xee, 0xee, 0xee),
+        );
     }
 }
 
@@ -277,7 +393,7 @@ impl FramebufferConsole {
             return;
         }
         let bg = self.state.lock().bg;
-        let bg_rgb = bg_rgb_of(bg);
+        let bg_rgb = rgb_of(geom.format, bg);
         for y in 0..usize::from(geom.height) {
             for x in 0..usize::from(geom.width) {
                 // SAFETY: bounded by the framebuffer's visible geometry.
@@ -335,10 +451,8 @@ impl FramebufferConsole {
         if x0 + CHAR_W > geom.width as usize || y0 + CHAR_H > geom.height as usize {
             return;
         }
-        let (fr, fg_, fb) = fg.rgb();
-        let fg_rgb = u32::from(fr) << 16 | u32::from(fg_) << 8 | u32::from(fb);
-        let (br, bg_, bb) = bg.rgb();
-        let bg_rgb = u32::from(br) << 16 | u32::from(bg_) << 8 | u32::from(bb);
+        let fg_rgb = rgb_of(geom.format, fg);
+        let bg_rgb = rgb_of(geom.format, bg);
         let glyph = fb_font::glyph(byte);
         for (gy, bits) in glyph.into_iter().enumerate() {
             for gx in 0..CHAR_W {
@@ -371,7 +485,7 @@ impl FramebufferConsole {
                 ptr::copy(src, dst, row_bytes);
             }
         }
-        clear_row_pixels(geom, geom.rows - 1, bg_rgb_of(bg));
+        clear_row_pixels(geom, geom.rows - 1, rgb_of(geom.format, bg));
     }
 }
 
@@ -417,38 +531,97 @@ fn clear_row_pixels(geom: &FramebufferGeom, row: usize, rgb: u32) {
 
 impl Console for FramebufferConsole {
     fn write_str(&self, text: &str) {
-        let mut terminal = self.terminal.lock();
-        if let Some(active) = terminal.as_mut() {
-            if self.splash_active.swap(false, Ordering::AcqRel) {
-                active.reset();
+        {
+            let mut terminal = self.terminal.lock();
+            self.finish_pending_redraw(&mut terminal);
+            if let Some(active) = terminal.as_mut() {
+                if self.splash_active.swap(false, Ordering::AcqRel) {
+                    active.reset();
+                }
+                active.write(text.as_bytes());
+            } else if !self.splash_active.load(Ordering::Acquire) {
+                for character in text.chars() {
+                    self.write_char_early(character);
+                }
             }
-            active.write(text.as_bytes());
-            return;
+            self.finish_pending_redraw(&mut terminal);
         }
-        if self.splash_active.load(Ordering::Acquire) {
-            return;
-        }
-        drop(terminal);
-        for character in text.chars() {
-            self.write_char(character);
-        }
+        self.service_pending_redraw();
     }
 
     fn write_char(&self, ch: char) {
         let byte = if ch.is_ascii() { ch as u8 } else { b'?' };
-        let mut terminal = self.terminal.lock();
-        if let Some(active) = terminal.as_mut() {
-            if self.splash_active.swap(false, Ordering::AcqRel) {
-                active.reset();
+        {
+            let mut terminal = self.terminal.lock();
+            self.finish_pending_redraw(&mut terminal);
+            if let Some(active) = terminal.as_mut() {
+                if self.splash_active.swap(false, Ordering::AcqRel) {
+                    active.reset();
+                }
+                active.write(core::slice::from_ref(&byte));
+            } else if !self.splash_active.load(Ordering::Acquire) {
+                self.write_char_early(ch);
             }
-            active.write(core::slice::from_ref(&byte));
-            return;
+            self.finish_pending_redraw(&mut terminal);
         }
-        if self.splash_active.load(Ordering::Acquire) {
-            return;
-        }
-        drop(terminal);
+        self.service_pending_redraw();
+    }
 
+    fn clear(&self) {
+        {
+            let mut terminal = self.terminal.lock();
+            self.finish_pending_redraw(&mut terminal);
+            if !self.splash_active.load(Ordering::Acquire) {
+                if let Some(active) = terminal.as_mut() {
+                    active.reset();
+                } else {
+                    self.clear_early_surface();
+                }
+            }
+            self.finish_pending_redraw(&mut terminal);
+        }
+        self.service_pending_redraw();
+    }
+
+    fn set_color(&self, fg: Color, bg: Color) {
+        let mut st = self.state.lock();
+        st.fg = fg;
+        st.bg = bg;
+    }
+}
+
+impl FramebufferConsole {
+    /// Try to service a deferred redraw without waiting for the terminal lock.
+    ///
+    /// Every normal console writer invokes this after releasing its guard.
+    /// Therefore, if an interrupt-disabled release loses the initial try-lock
+    /// race, the current lock owner (or a writer that overtakes it) performs a
+    /// guaranteed retry after unlocking.
+    fn service_pending_redraw(&self) {
+        if !REDRAW_PENDING.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(mut terminal) = self.terminal.try_lock() {
+            self.finish_pending_redraw(&mut terminal);
+        }
+    }
+
+    /// Complete a deferred full redraw while the caller owns `terminal`.
+    fn finish_pending_redraw(&self, terminal: &mut Option<Terminal<FramebufferRenderer>>) {
+        if !REDRAW_PENDING.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(active) = terminal.as_mut() {
+            active.redraw_all();
+        } else {
+            self.clear_early_surface();
+        }
+    }
+
+    /// Render one character through the allocation-free path.
+    ///
+    /// The caller holds `terminal`, which serializes every early VRAM write.
+    fn write_char_early(&self, ch: char) {
         let geom = &self.geom;
         // A degenerate (uninitialised) console would have cols == 0; bail out
         // rather than dividing by zero or writing to a null buffer.
@@ -464,28 +637,26 @@ impl Console for FramebufferConsole {
                 // Clear the cursor block at the current cell (it sits on the
                 // empty next-write position), then advance to the next row.
                 let bg = st.bg;
-                Self::fill_cell(geom, st.col, st.row, bg_rgb_of(bg));
+                Self::fill_cell(geom, st.col, st.row, rgb_of(geom.format, bg));
                 st.col = 0;
                 st.row += 1;
                 if st.row >= geom.rows {
                     st.row = geom.rows - 1;
                     let bg = st.bg;
-                    drop(st);
                     Self::scroll_up(geom, bg);
-                    st = self.state.lock();
                 }
                 draw_cursor(geom, &st);
             },
             '\r' => {
                 let bg = st.bg;
-                Self::fill_cell(geom, st.col, st.row, bg_rgb_of(bg));
+                Self::fill_cell(geom, st.col, st.row, rgb_of(geom.format, bg));
                 st.col = 0;
                 draw_cursor(geom, &st);
             },
             '\t' => {
                 // Advance to the next 8-column tab stop.
                 let bg = st.bg;
-                Self::fill_cell(geom, st.col, st.row, bg_rgb_of(bg));
+                Self::fill_cell(geom, st.col, st.row, rgb_of(geom.format, bg));
                 let next = (st.col + 8) & !7;
                 st.col = if next >= geom.cols {
                     geom.cols - 1
@@ -504,46 +675,26 @@ impl Console for FramebufferConsole {
                     if st.row >= geom.rows {
                         st.row = geom.rows - 1;
                         let bg = st.bg;
-                        drop(st);
                         Self::scroll_up(geom, bg);
-                        st = self.state.lock();
                     }
                 }
                 draw_cursor(geom, &st);
             },
         }
     }
-
-    fn clear(&self) {
-        let mut terminal = self.terminal.lock();
-        if self.splash_active.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(active) = terminal.as_mut() {
-            active.reset();
-            return;
-        }
-        self.clear_early_surface();
-    }
-
-    fn set_color(&self, fg: Color, bg: Color) {
-        let mut st = self.state.lock();
-        st.fg = fg;
-        st.bg = bg;
-    }
 }
 
-/// Pack a [`Color`] into a 32 bpp RGB value (`0xRRGGBB`).
+/// Pack a logical console colour into the scanout's native channel layout.
 #[inline]
-fn bg_rgb_of(c: Color) -> u32 {
+fn rgb_of(format: PixelFormat, c: Color) -> u32 {
     let (r, g, b) = c.rgb();
-    u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    format.pack_rgb(r, g, b)
 }
 
 /// Draw the steady block cursor at the current position in the foreground
 /// colour. The cell under the cursor is the next write position, so it is
 /// empty (background) and the block does not hide any typed character.
 fn draw_cursor(geom: &FramebufferGeom, st: &FbState) {
-    let fg_rgb = bg_rgb_of(st.fg);
+    let fg_rgb = rgb_of(geom.format, st.fg);
     FramebufferConsole::fill_cell(geom, st.col, st.row, fg_rgb);
 }

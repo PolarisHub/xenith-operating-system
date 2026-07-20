@@ -48,17 +48,19 @@ single-sector CHS reads, using a conventional-memory bounce buffer and explicit
 protected-mode copy windows for the high staging addresses. It optionally selects
 a 32-bpp VBE framebuffer, obtains E820, installs protected and long mode, and
 builds identity and HHDM mappings for the first 4 GiB plus the conventional Xenith
-kernel mapping at `0xffffffff80000000`. It loads a validated x86_64 `ET_EXEC`
-kernel below 32 MiB, places an initrd of at most 64 MiB at 96 MiB, locates the
-RSDP, carves loader/kernel/module reservations into the memory map, and jumps to
-the ELF entry.
+kernel mapping at `0xffffffff80000000`. It stages up to 16 MiB of kernel data at
+16 MiB, loads validated x86_64 `ET_EXEC` segments below 16 MiB, and places an
+initrd of at most 64 MiB at 32 MiB. It then locates the RSDP, carves
+loader/kernel/module reservations into the memory map, and jumps to the ELF
+entry.
 
 The firmware-read path retains the BIOS-provided drive number and supports the
 hard-disk-emulated El Torito image as well as a raw BIOS disk. Legacy
 primary-master ATA PIO is retained only as a drive-`0x80` fallback if firmware
-preloading fails. The current raw and ISO paths have external VMware legacy-BIOS
-and QEMU/SeaBIOS runtime proof; physical hardware and arbitrary firmware remain
-separate validation boundaries.
+preloading fails. Repository firmware gates cover the current raw and ISO
+paths; external VMware legacy-BIOS and QEMU/SeaBIOS proof currently belongs to
+the preceding artifact hashes recorded in `docs/STATUS.md`. Physical hardware
+and arbitrary firmware remain separate validation boundaries.
 
 The BIOS handoff sets the exact `xenith.boot=bios` command-line token and marks
 the first MiB reserved. Once all synchronous INT 13h payload reads are done,
