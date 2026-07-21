@@ -291,6 +291,8 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
         "-p",
         "xenith-desktop",
         "-p",
+        "xenith-explorer",
+        "-p",
         "xenith-winhost",
         "-p",
         "xenith-sh",
@@ -317,6 +319,7 @@ pub fn build_userspace(layout: &Layout) -> Result<Vec<(String, PathBuf)>, BuildE
     let rust_programs = [
         ("init", "init"),
         ("bin/xenith-desktop", "xenith-desktop"),
+        ("bin/xenith-explorer", "xenith-explorer"),
         ("bin/xenith-window-smoke", "xenith-window-smoke"),
         ("bin/xenith-winhost", "xenith-winhost"),
         ("bin/sh", "xenith-sh"),
@@ -621,6 +624,9 @@ const INITRAMFS_MULTICALL_ALIASES: &[(&str, &str, &str)] = &[
     ("bin/telnet", "bin/xenith-net", "xenith-net"),
 ];
 
+const WIN64_FIXTURE_NATIVE_PATH: &str = "tests/win64-console.exe";
+const WIN64_FIXTURE_WINDOWS_RELATIVE_PATH: &str = "c/Users/Xenith/Downloads/win64-console.exe";
+
 fn build_initramfs(programs: &[(String, Vec<u8>)]) -> Result<Vec<u8>, BuildError> {
     let mut archive = Vec::new();
     let mut inode = 1u32;
@@ -628,8 +634,45 @@ fn build_initramfs(programs: &[(String, Vec<u8>)]) -> Result<Vec<u8>, BuildError
     inode += 1;
     append_newc(&mut archive, inode, "bin", 0o040755, &[]);
     inode += 1;
+
+    let windows_archive_root = xenith_winhost_core::WINDOWS_INITRAMFS_ROOT;
+    if windows_archive_root.is_empty()
+        || windows_archive_root.contains('/')
+        || xenith_winhost_core::WINDOWS_NATIVE_ROOT.strip_prefix('/') != Some(windows_archive_root)
+    {
+        return Err(BuildError::Usage(
+            "Windows archive/native roots must identify the same single component".to_owned(),
+        ));
+    }
+    append_newc(&mut archive, inode, windows_archive_root, 0o040755, &[]);
+    inode += 1;
+    for directory in xenith_winhost_core::WINDOWS_NAMESPACE_DIRECTORIES {
+        append_newc(
+            &mut archive,
+            inode,
+            &format!("{windows_archive_root}/{directory}"),
+            0o040755,
+            &[],
+        );
+        inode += 1;
+    }
+
     for (name, image) in programs {
         append_newc(&mut archive, inode, name, 0o100755, image);
+        inode += 1;
+    }
+
+    if let Some((_, fixture)) = programs
+        .iter()
+        .find(|(name, _)| name == WIN64_FIXTURE_NATIVE_PATH)
+    {
+        append_newc(
+            &mut archive,
+            inode,
+            &format!("{windows_archive_root}/{WIN64_FIXTURE_WINDOWS_RELATIVE_PATH}"),
+            0o100755,
+            fixture,
+        );
         inode += 1;
     }
 
@@ -848,6 +891,27 @@ mod tests {
     }
 
     #[test]
+    fn explorer_is_packaged_as_a_dedicated_executable() {
+        let programs = vec![
+            ("bin/xenith-desktop".to_owned(), vec![0x44; 64]),
+            ("bin/xenith-explorer".to_owned(), vec![0x46; 56]),
+            ("bin/coreutils".to_owned(), vec![0x11; 32]),
+            ("bin/editor".to_owned(), vec![0x22; 32]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 32]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+        let (_, mode, data) = entries
+            .iter()
+            .find(|(name, _, _)| *name == "bin/xenith-explorer")
+            .copied()
+            .unwrap();
+
+        assert_eq!(mode & 0o170000, 0o100000);
+        assert_eq!(data, &[0x46; 56]);
+    }
+
+    #[test]
     fn opt_in_window_smoke_is_packaged_as_a_separate_executable() {
         let programs = vec![
             ("bin/xenith-desktop".to_owned(), vec![0x44; 64]),
@@ -866,6 +930,70 @@ mod tests {
 
         assert_eq!(mode & 0o170000, 0o100000);
         assert_eq!(data, &[0x55; 48]);
+    }
+
+    #[test]
+    fn windows_namespace_tree_is_packaged_as_directories() {
+        let programs = vec![
+            ("bin/coreutils".to_owned(), vec![0x11; 32]),
+            ("bin/editor".to_owned(), vec![0x22; 32]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 32]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+        let archive_root = xenith_winhost_core::WINDOWS_INITRAMFS_ROOT;
+
+        let (_, mode, data) = entries
+            .iter()
+            .find(|(name, _, _)| *name == archive_root)
+            .copied()
+            .unwrap();
+        assert_eq!(mode, 0o040755);
+        assert!(data.is_empty());
+
+        for directory in xenith_winhost_core::WINDOWS_NAMESPACE_DIRECTORIES {
+            let archive_path = format!("{archive_root}/{directory}");
+            let entry = entries
+                .iter()
+                .find(|(name, _, _)| *name == archive_path)
+                .copied();
+            assert!(entry.is_some(), "missing Windows directory {archive_path}");
+            let (_, mode, data) = entry.unwrap();
+            assert_eq!(mode, 0o040755, "wrong mode for {archive_path}");
+            assert!(data.is_empty(), "{archive_path} contains unexpected data");
+        }
+    }
+
+    #[test]
+    fn windows_namespace_omits_fake_wow64_and_legacy_aliases() {
+        let programs = vec![
+            ("bin/coreutils".to_owned(), vec![0x11; 32]),
+            ("bin/editor".to_owned(), vec![0x22; 32]),
+            ("bin/xenith-net".to_owned(), vec![0x33; 32]),
+        ];
+        let archive = build_initramfs(&programs).unwrap();
+        let entries = newc_entries(&archive);
+
+        for (name, _, _) in entries {
+            assert!(
+                !name
+                    .split('/')
+                    .any(|component| component.eq_ignore_ascii_case("SysWOW64")),
+                "unsupported WoW64 directory was packaged: {name}"
+            );
+            assert!(
+                !name
+                    .split('/')
+                    .any(|component| component.eq_ignore_ascii_case("Sysnative")),
+                "unsupported Sysnative alias was packaged: {name}"
+            );
+            assert!(
+                !name
+                    .split('/')
+                    .any(|component| component.eq_ignore_ascii_case("Documents and Settings")),
+                "unsupported legacy profile alias was packaged: {name}"
+            );
+        }
     }
 
     #[test]
@@ -893,11 +1021,23 @@ mod tests {
             .find(|(name, _, _)| *name == "tests/win64-console.exe")
             .copied()
             .unwrap();
+        let windows_fixture_path = format!(
+            "{}/{}",
+            xenith_winhost_core::WINDOWS_INITRAMFS_ROOT,
+            WIN64_FIXTURE_WINDOWS_RELATIVE_PATH
+        );
+        let (_, windows_fixture_mode, windows_fixture) = entries
+            .iter()
+            .find(|(name, _, _)| *name == windows_fixture_path)
+            .copied()
+            .unwrap();
 
         assert_eq!(host_mode & 0o170000, 0o100000);
         assert_eq!(host, &[0x7f, b'E', b'L', b'F']);
         assert_eq!(fixture_mode & 0o170000, 0o100000);
         assert_eq!(packaged_fixture, fixture);
+        assert_eq!(windows_fixture_mode & 0o170000, 0o100000);
+        assert_eq!(windows_fixture, packaged_fixture);
         assert_eq!(&packaged_fixture[..2], b"MZ");
     }
 

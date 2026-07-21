@@ -15,6 +15,7 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
+xenith-abi = { path = "../../crates/xenith-abi" }
 xenith-pe = { path = "../../crates/xenith-pe" }
 
 [lints]

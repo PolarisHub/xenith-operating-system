@@ -114,6 +114,57 @@ pub fn toggle_desktop_launcher(machine: &mut Machine) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Launch the graphical Files app through the shell-global Super+E shortcut.
+pub fn launch_file_explorer(machine: &mut Machine) -> Result<(), String> {
+    machine
+        .inject_keyboard_scancodes(&[0xe0, 0x5b, 0x12, 0x92, 0xe0, 0xdb])
+        .map_err(|error| error.to_string())
+}
+
+/// Focus the Files address bar and submit an absolute DOS path.
+pub fn explorer_submit_address(machine: &mut Machine, path: &str) -> Result<(), String> {
+    machine
+        .inject_keyboard_scancodes(&[0x1d, 0x26, 0xa6, 0x9d])
+        .map_err(|error| error.to_string())?;
+    run_input_drain_slice(machine)?;
+    for character in path.chars() {
+        let mut encoded = [0u8; 4];
+        machine
+            .inject_keyboard_ascii(character.encode_utf8(&mut encoded))
+            .map_err(|error| error.to_string())?;
+        run_input_drain_slice(machine)?;
+    }
+    machine
+        .inject_keyboard_scancodes(&[0x1c, 0x9c])
+        .map_err(|error| error.to_string())
+}
+
+fn run_input_drain_slice(machine: &mut Machine) -> Result<(), String> {
+    let summary = machine.run_for(PROGRESS_SLICE);
+    if matches!(summary.reason, ExitReason::InstructionLimit) {
+        Ok(())
+    } else {
+        Err(format!(
+            "guest stopped while draining graphical input: {:?}",
+            summary.reason
+        ))
+    }
+}
+
+/// Invoke the standard Ctrl+Shift+N New Folder shortcut in Files.
+pub fn explorer_create_folder(machine: &mut Machine) -> Result<(), String> {
+    machine
+        .inject_keyboard_scancodes(&[0x1d, 0x2a, 0x31, 0xb1, 0xaa, 0x9d])
+        .map_err(|error| error.to_string())
+}
+
+/// Confirm deletion of the selected Files item with two distinct key presses.
+pub fn explorer_confirm_delete(machine: &mut Machine) -> Result<(), String> {
+    machine
+        .inject_keyboard_scancodes(&[0xe0, 0x53, 0xe0, 0xd3, 0xe0, 0x53, 0xe0, 0xd3])
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

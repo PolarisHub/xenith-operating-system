@@ -217,6 +217,7 @@ dependencies = [
  "xenith-cc",
  "xenith-iso",
  "xenith-winhost",
+ "xenith-winhost-core",
 ]
 
 [[package]]
@@ -283,6 +284,16 @@ version = "0.1.0"
 dependencies = [
  "libuser",
  "xenith-abi",
+]
+
+[[package]]
+name = "xenith-explorer"
+version = "0.1.0"
+dependencies = [
+ "libuser",
+ "libwindow",
+ "xenith-abi",
+ "xenith-winhost-core",
 ]
 
 [[package]]
@@ -410,6 +421,7 @@ dependencies = [
 name = "xenith-winhost-core"
 version = "0.1.0"
 dependencies = [
+ "xenith-abi",
  "xenith-pe",
 ]
 

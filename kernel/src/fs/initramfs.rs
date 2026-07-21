@@ -58,6 +58,19 @@ pub struct CpioEntry<'a> {
     pub data: &'a [u8],
 }
 
+/// Counts of archive entries installed into each initramfs namespace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PopulationStats {
+    pub native_entries: usize,
+    pub windows_entries: usize,
+}
+
+impl PopulationStats {
+    pub const fn total(self) -> usize {
+        self.native_entries + self.windows_entries
+    }
+}
+
 impl CpioEntry<'_> {
     pub const fn file_type(&self) -> u32 {
         self.mode & 0o170000
@@ -237,15 +250,43 @@ fn safe_archive_path(name: &str) -> Result<&str, InitramfsError> {
     Ok(name)
 }
 
-pub fn populate(image: &[u8], ramfs: &RamFs) -> Result<usize, InitramfsError> {
-    let mut loaded = 0usize;
+fn populate_namespaces(
+    image: &[u8],
+    native: &RamFs,
+    windows: Option<&RamFs>,
+) -> Result<PopulationStats, InitramfsError> {
+    let mut stats = PopulationStats::default();
     for entry in CpioNewc::new(image) {
         let entry = entry?;
         let name = safe_archive_path(entry.name)?;
         if name == "." {
             continue;
         }
-        let path = alloc::format!("/{name}");
+
+        let (ramfs, relative_name, windows_entry) = match windows {
+            Some(windows) if name == xenith_abi::WINDOWS_INITRAMFS_ROOT => (windows, ".", true),
+            Some(windows)
+                if name
+                    .strip_prefix(xenith_abi::WINDOWS_INITRAMFS_ROOT)
+                    .is_some_and(|suffix| suffix.starts_with('/')) =>
+            {
+                let relative = name
+                    .strip_prefix(xenith_abi::WINDOWS_INITRAMFS_ROOT)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .ok_or(InitramfsError::InvalidName { offset: 0 })?;
+                if relative.is_empty() {
+                    return Err(InitramfsError::InvalidName { offset: 0 });
+                }
+                (windows, relative, true)
+            },
+            _ => (native, name, false),
+        };
+
+        let path = if relative_name == "." {
+            alloc::string::String::from("/")
+        } else {
+            alloc::format!("/{relative_name}")
+        };
         let node = match entry.file_type() {
             0o040000 => ramfs.mkdir_all(&path, entry.permissions())?,
             0o100000 | 0 => ramfs.write_file(&path, entry.data, entry.permissions())?,
@@ -266,15 +307,38 @@ pub fn populate(image: &[u8], ramfs: &RamFs) -> Result<usize, InitramfsError> {
             metadata.modified = u64::from(entry.modified);
             metadata.changed = u64::from(entry.modified);
         });
-        loaded = loaded.checked_add(1).ok_or(InitramfsError::SizeOverflow)?;
+        let count = if windows_entry {
+            &mut stats.windows_entries
+        } else {
+            &mut stats.native_entries
+        };
+        *count = count.checked_add(1).ok_or(InitramfsError::SizeOverflow)?;
     }
-    Ok(loaded)
+    Ok(stats)
 }
 
-pub fn load_from_boot(
+/// Populate one filesystem without applying namespace routing.
+pub fn populate(image: &[u8], ramfs: &RamFs) -> Result<usize, InitramfsError> {
+    Ok(populate_namespaces(image, ramfs, None)?.native_entries)
+}
+
+/// Populate native and Windows filesystems from one archive.
+///
+/// Entries named by [`xenith_abi::WINDOWS_INITRAMFS_ROOT`] or beginning with
+/// that component plus `/` are installed into
+/// `windows`, with that prefix removed. Every other entry is installed into
+/// `native`.
+pub fn populate_split(
+    image: &[u8],
+    native: &RamFs,
+    windows: &RamFs,
+) -> Result<PopulationStats, InitramfsError> {
+    populate_namespaces(image, native, Some(windows))
+}
+
+fn archive_from_boot(
     raw_boot_info: &'static limine::BootInfo,
-    ramfs: &RamFs,
-) -> Result<usize, InitramfsError> {
+) -> Result<&'static [u8], InitramfsError> {
     let boot_info = BootInfo::new(raw_boot_info);
     for module in boot_info.modules() {
         if module.len < NEWC_MAGIC.len() as u64 {
@@ -288,10 +352,25 @@ pub fn load_from_boot(
         // exactly that allocation.
         let image = unsafe { slice::from_raw_parts(address, len) };
         if image.starts_with(NEWC_MAGIC) || image.starts_with(CRC_MAGIC) {
-            return populate(image, ramfs);
+            return Ok(image);
         }
     }
     Err(InitramfsError::NoArchive)
+}
+
+pub fn load_from_boot(
+    raw_boot_info: &'static limine::BootInfo,
+    ramfs: &RamFs,
+) -> Result<usize, InitramfsError> {
+    populate(archive_from_boot(raw_boot_info)?, ramfs)
+}
+
+pub fn load_split_from_boot(
+    raw_boot_info: &'static limine::BootInfo,
+    native: &RamFs,
+    windows: &RamFs,
+) -> Result<PopulationStats, InitramfsError> {
+    populate_split(archive_from_boot(raw_boot_info)?, native, windows)
 }
 
 #[cfg(test)]
@@ -359,5 +438,54 @@ mod tests {
             3
         );
         assert_eq!(&bytes, b"ELF");
+    }
+
+    #[test]
+    fn routes_windows_entries_into_separate_case_insensitive_ramfs() {
+        let mut image = Vec::new();
+        append_entry(&mut image, "etc", 0o040755, &[]);
+        append_entry(&mut image, "etc/native.conf", 0o100644, b"native");
+        append_entry(&mut image, "win", 0o040755, &[]);
+        append_entry(&mut image, "win/C/Users/Xenith", 0o040755, &[]);
+        append_entry(
+            &mut image,
+            "win/C/Users/Xenith/Payload.TXT",
+            0o100644,
+            b"windows",
+        );
+        append_entry(
+            &mut image,
+            "win/C/Users/Xenith/payload-link",
+            0o120777,
+            b"Payload.TXT",
+        );
+        append_entry(&mut image, "TRAILER!!!", 0, &[]);
+
+        let native = RamFs::new();
+        let windows = RamFs::new_ascii_case_insensitive();
+        let stats = populate_split(&image, &native, &windows).unwrap();
+
+        assert_eq!(stats, PopulationStats {
+            native_entries: 2,
+            windows_entries: 4,
+        });
+        assert_eq!(stats.total(), 6);
+        assert_eq!(native.node("/win").err(), Some(FsError::NotFound));
+        assert!(native.node("/etc/native.conf").is_ok());
+
+        let mut bytes = [0u8; 7];
+        let file = windows
+            .node("/c/users/xENITH/payload.txt")
+            .expect("Windows path should use ASCII-insensitive lookup");
+        assert_eq!(file.read_at(0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"windows");
+        assert_eq!(
+            windows
+                .node("/C/Users/Xenith/payload-link")
+                .unwrap()
+                .read_link()
+                .unwrap(),
+            "Payload.TXT"
+        );
     }
 }

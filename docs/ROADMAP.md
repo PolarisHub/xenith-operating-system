@@ -1,9 +1,10 @@
 # Roadmap
 
-The app-free visual desktop, restricted descriptor launch, native thread
-substrate, and bounded eight-client compositor/input coordinator are complete.
-The packaged runtime still opens only one opt-in smoke connection. Independent
-correctness and application-platform work remains ordered by runtime impact.
+The visual desktop, on-demand Files application, restricted descriptor launch,
+native thread substrate, and bounded eight-client compositor/input coordinator
+are complete. Files and the protocol smoke currently use private desktop-owned
+connections. Independent correctness and application-platform work remains
+ordered by runtime impact.
 Completed work such as COW fork, `/dev/pts`, SSDT loading, NIC interrupt mode,
 XenithFS flush barriers, SMP bring-up, native framebuffer-format handling, the
 exclusive UI-session ABI, allocation-free photo-backed desktop, transactional
@@ -26,6 +27,9 @@ updates are not repeated as future work.
    Back restricted-spawn rollback and last-thread teardown with booted-guest
    fault injection before mapping these primitives onto Windows threads.
 4. Broaden Windows compatibility as an isolated userspace subsystem. Safely
+   persist the seeded `C:\` namespace on an explicitly identified XenithFS
+   system volume, add token-backed profiles and per-process cwd/environment,
+   and wire exact known-folder, temp-path, and guest file APIs. Then safely
    decode and contain guest x64 arguments/results before wiring the 12
    policy-only NT catalog entries beyond `NtClose`; add scheduler-backed waits,
    PEB/TEB materialization, TLS/SEH, and dynamic-module loading. Then implement

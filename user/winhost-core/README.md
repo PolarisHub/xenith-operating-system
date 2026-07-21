@@ -17,8 +17,35 @@ general Windows application compatibility.
 - A checked planning-only x64 PEB, TEB, process-parameter, environment, guard,
   and initial-stack layout. The planner does not map or populate memory and
   does not install a GS base.
-- Existing bounded NT-path, module/import, PE placement, relocation, and W^X
-  protection planning.
+- Existing bounded NT-object-path, module/import, PE placement, relocation,
+  and W^X protection planning.
+- A separate bounded Windows namespace policy: strict UTF-8 DOS-path
+  normalization and translation into `/win/c`, modern system/profile known
+  folders with explicit redirection, a shared directory-image manifest, and a
+  sorted UTF-16 environment-block builder for the packaged `Xenith` profile.
+
+## Windows namespace boundary
+
+The packaged namespace uses `C:\Windows`, `C:\Program Files`,
+`C:\ProgramData`, `C:\Users\Default`, `C:\Users\Public`, and
+`C:\Users\Xenith`, including Desktop, Documents, Downloads, Music, Pictures,
+Videos, and AppData subdirectories. The manifest is rooted natively at
+`/win/c`. It deliberately omits legacy `Documents and Settings` aliases and
+`SysWOW64`/`Sysnative` because Xenith does not yet implement reparse points or
+the WoW64 filesystem redirector.
+
+The DOS translator accepts a UTF-8 `str` because it currently serves native
+Xenith command paths. It does not accept raw UTF-16 and therefore makes no
+claim about malformed-surrogate validation for future Win32 `W` APIs; those
+entry points must validate UTF-16 before conversion. Only the seeded `C:`
+drive is mapped. UNC, device, verbatim, drive-relative, alternate-data-stream,
+reserved-device-name, and root-escaping inputs fail closed.
+
+Known-folder and environment output is policy data only. The environment
+builder emits a bounded, sorted, double-NUL-terminated UTF-16 block, but no
+current code installs it in guest process parameters or a PEB. Folder names do
+not imply NTFS ACLs, integrity labels, junctions, persistence, or full Unicode
+case folding.
 
 ## Internal service catalog
 
@@ -56,7 +83,9 @@ tests.
   bootstrap prefix retained by the planner; complete undocumented structure
   compatibility is not claimed.
 - Path matching folds Basic Latin letters to uppercase. Well-formed non-ASCII
-  UTF-16 remains ordinal until Xenith has an explicit compatible upcase table.
+  UTF-16 in the NT object-path normalizer remains ordinal until Xenith has an
+  explicit compatible upcase table. The DOS translator preserves component
+  case and relies on the mounted filesystem for lookup semantics.
 - API-set contracts and forwarded exports remain explicitly unsupported.
 - All production storage is inline in const-generic fixed arrays. Isolation is
   the caller's responsibility.

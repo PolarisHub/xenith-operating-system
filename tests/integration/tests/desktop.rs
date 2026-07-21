@@ -11,6 +11,7 @@ const INTERACTION_LIMIT: u64 = 80_000_000;
 const SMP_WINDOW_BOOT_LIMIT: u64 = 600_000_000;
 const SMP_WINDOW_FALLBACK_LIMIT: u64 = 100_000_000;
 const WINDOW_SMOKE_LIMIT: u64 = 500_000_000;
+const EXPLORER_LIMIT: u64 = 500_000_000;
 
 fn framebuffer_payload(ppm: &[u8]) -> Option<&[u8]> {
     let mut newlines = 0usize;
@@ -191,4 +192,88 @@ fn opt_in_window_client_completes_shared_buffer_protocol() {
     assert!((0..3).all(|processor| machine
         .cpu_state(processor)
         .is_some_and(|state| state.cycles != 0)));
+}
+
+#[test]
+#[ignore = "requires `xenith-build all`; explicit end-to-end Files app gate"]
+fn super_e_launches_a_visible_file_explorer_and_desktop_cleans_it_up() {
+    let mut machine = xenith_integration::load_built_kernel_with_framebuffer(
+        BOOT_LIMIT,
+        Some(FramebufferConfig {
+            width: 320,
+            height: 200,
+        }),
+    )
+    .unwrap();
+    xenith_integration::run_until_serial(&mut machine, "XENITH_DESKTOP_READY", 1, BOOT_LIMIT)
+        .unwrap();
+    let desktop = machine.framebuffer_ppm().unwrap().unwrap();
+
+    xenith_integration::launch_file_explorer(&mut machine).unwrap();
+    let ready = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_EXPLORER_READY",
+        1,
+        EXPLORER_LIMIT,
+    )
+    .unwrap();
+    assert!(ready.contains("XENITH_EXPLORER_SPAWN"));
+    assert!(!ready.contains("XENITH_EXPLORER_FAIL"));
+    assert!(!ready.contains("XENITH_DESKTOP_FAIL"));
+
+    let explorer = machine.framebuffer_ppm().unwrap().unwrap();
+    assert_ne!(
+        framebuffer_payload(&desktop).expect("desktop framebuffer is a binary PPM image"),
+        framebuffer_payload(&explorer).expect("explorer framebuffer is a binary PPM image"),
+        "Files emitted its ready marker without presenting a visible surface"
+    );
+
+    xenith_integration::explorer_submit_address(&mut machine, r"C:\Users\Xenith\AppData").unwrap();
+    let navigated = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_EXPLORER_DIRECTORY path=/win/c/Users/Xenith/AppData entries=",
+        1,
+        EXPLORER_LIMIT,
+    )
+    .unwrap();
+    assert!(!navigated.contains("XENITH_EXPLORER_DIRECTORY_FAIL"));
+
+    xenith_integration::explorer_create_folder(&mut machine).unwrap();
+    let created = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_EXPLORER_CREATED path=/win/c/Users/Xenith/AppData/New folder",
+        1,
+        EXPLORER_LIMIT,
+    )
+    .unwrap();
+    assert!(!created.contains("XENITH_EXPLORER_CREATE_FAIL"));
+
+    xenith_integration::explorer_confirm_delete(&mut machine).unwrap();
+    let deleted = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_EXPLORER_DELETED path=/win/c/Users/Xenith/AppData/New folder",
+        1,
+        EXPLORER_LIMIT,
+    )
+    .unwrap();
+    assert!(!deleted.contains("XENITH_EXPLORER_DELETE_FAIL"));
+
+    xenith_integration::request_desktop_exit(&mut machine).unwrap();
+    let explorer_exit = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_EXPLORER_CLEAN_EXIT",
+        1,
+        EXPLORER_LIMIT,
+    )
+    .unwrap();
+    assert!(!explorer_exit.contains("XENITH_EXPLORER_FAIL"));
+    let fallback = xenith_integration::run_until_serial(
+        &mut machine,
+        "XENITH_DESKTOP_FALLBACK",
+        1,
+        EXPLORER_LIMIT,
+    )
+    .unwrap();
+    assert!(fallback.contains("XENITH_DESKTOP_CLEAN_EXIT"));
+    assert!(!fallback.contains("XENITH_EXPLORER_FAIL"));
 }

@@ -28,6 +28,7 @@ use xenith_desktop::{
 };
 
 const SMOKE_WAIT_NS: u64 = 50_000_000;
+const CLIENT_SEND_TIMEOUT_NS: u64 = 50_000_000;
 const SMOKE_REAP_POLL_NS: i64 = 5_000_000;
 const SMOKE_REAP_ATTEMPTS: usize = 20;
 const REFRESH_INTERVAL_NS: u64 = 16_666_667;
@@ -39,12 +40,20 @@ const MAX_CHANNEL_BATCH: usize = 8;
 const MAX_EVENT_WAIT_ITEMS: usize = MAX_COMPOSITOR_CLIENTS + 1;
 const WINDOW_SMOKE_PATH: &[u8] = b"/bin/xenith-window-smoke";
 const WINDOW_SMOKE_ARGV0: &[u8] = b"/bin/xenith-window-smoke\0";
-const WINDOW_SMOKE_CHILD_CHANNEL_FD: i32 = 3;
+const EXPLORER_PATH: &[u8] = b"/bin/xenith-explorer";
+const EXPLORER_ARGV0: &[u8] = b"/bin/xenith-explorer\0";
+const WINDOW_CLIENT_CHANNEL_FD: i32 = 3;
 
 #[derive(Clone, Copy)]
 enum LoopExit {
     RecoveryChord,
     SmokeComplete,
+}
+
+#[derive(Clone, Copy)]
+enum WindowClientKind {
+    Smoke,
+    Explorer,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +205,8 @@ struct CompositorRuntime {
     connections: [ClientConnection; MAX_COMPOSITOR_CLIENTS],
     smoke_client: ClientHandle,
     smoke_pid: i64,
+    explorer_client: ClientHandle,
+    explorer_pid: i64,
     mappings: [MappingSlot; MAX_BUFFER_MAPPINGS],
     layers: [WindowLayer; MAX_SCENE_SURFACES],
 }
@@ -211,12 +222,14 @@ impl CompositorRuntime {
                 })?;
         Ok(Self {
             compositor,
-            // Normal desktop sessions are intentionally app-free and pay no
-            // channel queue allocation. The explicit smoke launch provisions
-            // its private pair immediately before spawning the client.
+            // Idle desktop sessions pay no channel-queue allocation. Files
+            // and the protocol smoke each provision a private pair only when
+            // explicitly launched.
             connections: [ClientConnection::EMPTY; MAX_COMPOSITOR_CLIENTS],
             smoke_client: ClientHandle::INVALID,
             smoke_pid: -1,
+            explorer_client: ClientHandle::INVALID,
+            explorer_pid: -1,
             mappings: [MappingSlot::EMPTY; MAX_BUFFER_MAPPINGS],
             layers: [WindowLayer::EMPTY; MAX_SCENE_SURFACES],
         })
@@ -229,6 +242,82 @@ impl CompositorRuntime {
                 errno: 0,
             });
         }
+        let pid = match self.launch_window_client(
+            WINDOW_SMOKE_PATH,
+            WINDOW_SMOKE_ARGV0,
+            "spawn-window-smoke-restricted",
+            WindowClientKind::Smoke,
+        ) {
+            Ok(pid) => pid,
+            Err(failure) => {
+                return Err(self
+                    .abort_window_client(WindowClientKind::Smoke)
+                    .unwrap_or(failure));
+            },
+        };
+        libuser::println!("XENITH_COMPOSITOR_SMOKE_SPAWN pid={}", pid);
+        Ok(())
+    }
+
+    fn launch_explorer(&mut self) -> Result<(), Failure> {
+        if self.connection(self.explorer_client).is_some() {
+            libuser::println!("XENITH_EXPLORER_ALREADY_OPEN");
+            return Ok(());
+        }
+        self.explorer_client = ClientHandle::INVALID;
+        if self.explorer_pid > 0 {
+            let mut status = 0;
+            match libuser::syscall::waitpid(self.explorer_pid, &mut status, xenith_abi::WNOHANG) {
+                Ok(reaped) if reaped == self.explorer_pid => self.explorer_pid = -1,
+                Ok(0) => {
+                    libuser::println!("XENITH_EXPLORER_ALREADY_OPEN");
+                    return Ok(());
+                },
+                Err(libuser::Error(errno)) if errno == Errno::Eintr as i32 => {
+                    libuser::println!("XENITH_EXPLORER_ALREADY_OPEN");
+                    return Ok(());
+                },
+                Err(libuser::Error(errno)) if errno == Errno::Echild as i32 => {
+                    self.explorer_pid = -1;
+                },
+                Ok(_) => {
+                    return Err(Failure {
+                        stage: "reap-explorer-result",
+                        errno: 0,
+                    });
+                },
+                Err(libuser::Error(errno)) => {
+                    return Err(Failure {
+                        stage: "reap-explorer",
+                        errno,
+                    });
+                },
+            }
+        }
+        let pid = match self.launch_window_client(
+            EXPLORER_PATH,
+            EXPLORER_ARGV0,
+            "spawn-explorer-restricted",
+            WindowClientKind::Explorer,
+        ) {
+            Ok(pid) => pid,
+            Err(failure) => {
+                return Err(self
+                    .abort_window_client(WindowClientKind::Explorer)
+                    .unwrap_or(failure));
+            },
+        };
+        libuser::println!("XENITH_EXPLORER_SPAWN pid={}", pid);
+        Ok(())
+    }
+
+    fn launch_window_client(
+        &mut self,
+        path: &[u8],
+        argv0: &[u8],
+        spawn_stage: &'static str,
+        kind: WindowClientKind,
+    ) -> Result<i64, Failure> {
         let pair = libuser::channel_create().map_err(|libuser::Error(errno)| Failure {
             stage: "channel-create",
             errno,
@@ -274,24 +363,18 @@ impl CompositorRuntime {
             server_fd: pair.endpoint0,
             peer_fd: pair.endpoint1,
         };
-        self.smoke_client = client;
         let mut child_channel = [0u8; 12];
-        if !write_decimal_fd(WINDOW_SMOKE_CHILD_CHANNEL_FD, &mut child_channel) {
+        if !write_decimal_fd(WINDOW_CLIENT_CHANNEL_FD, &mut child_channel) {
             *connection = ClientConnection::EMPTY;
-            self.smoke_client = ClientHandle::INVALID;
             let _ = self.compositor.disconnect(client);
             let _ = libuser::syscall::close(pair.endpoint0);
             let _ = libuser::syscall::close(pair.endpoint1);
             return Err(Failure {
-                stage: "smoke-argv",
+                stage: "window-client-argv",
                 errno: 0,
             });
         }
-        let argv = [
-            WINDOW_SMOKE_ARGV0.as_ptr(),
-            child_channel.as_ptr(),
-            core::ptr::null(),
-        ];
+        let argv = [argv0.as_ptr(), child_channel.as_ptr(), core::ptr::null()];
         let mut request = libuser::SpawnRestrictedRequest {
             file_action_count: 3,
             ..libuser::SpawnRestrictedRequest::default()
@@ -310,30 +393,34 @@ impl CompositorRuntime {
         };
         request.file_actions[2] = libuser::SpawnFileAction {
             source_fd: pair.endpoint1,
-            target_fd: WINDOW_SMOKE_CHILD_CHANNEL_FD,
+            target_fd: WINDOW_CLIENT_CHANNEL_FD,
             rights: libuser::IPC_TRANSFER_RIGHT_READ | libuser::IPC_TRANSFER_RIGHT_WRITE,
             flags: 0,
         };
-        let pid = match libuser::spawn_restricted(
-            WINDOW_SMOKE_PATH,
-            argv.as_ptr(),
-            core::ptr::null(),
-            &request,
-        ) {
+        let pid = match libuser::spawn_restricted(path, argv.as_ptr(), core::ptr::null(), &request)
+        {
             Ok(pid) => pid,
             Err(libuser::Error(errno)) => {
                 *connection = ClientConnection::EMPTY;
-                self.smoke_client = ClientHandle::INVALID;
                 let _ = self.compositor.disconnect(client);
                 let _ = libuser::syscall::close(pair.endpoint0);
                 let _ = libuser::syscall::close(pair.endpoint1);
                 return Err(Failure {
-                    stage: "spawn-window-smoke-restricted",
+                    stage: spawn_stage,
                     errno,
                 });
             },
         };
-        self.smoke_pid = pid;
+        match kind {
+            WindowClientKind::Smoke => {
+                self.smoke_client = client;
+                self.smoke_pid = pid;
+            },
+            WindowClientKind::Explorer => {
+                self.explorer_client = client;
+                self.explorer_pid = pid;
+            },
+        }
         libuser::syscall::close(pair.endpoint1).map_err(|libuser::Error(errno)| Failure {
             stage: "close-client-endpoint",
             errno,
@@ -344,8 +431,55 @@ impl CompositorRuntime {
                 errno: 0,
             })?
             .peer_fd = -1;
-        libuser::println!("XENITH_COMPOSITOR_SMOKE_SPAWN pid={}", pid);
-        Ok(())
+        Ok(pid)
+    }
+
+    fn abort_window_client(&mut self, kind: WindowClientKind) -> Option<Failure> {
+        let client = match kind {
+            WindowClientKind::Smoke => self.smoke_client,
+            WindowClientKind::Explorer => self.explorer_client,
+        };
+        let mut first = None;
+        if client.is_valid() {
+            if let Some(index) = self
+                .connections
+                .iter()
+                .position(|connection| connection.is_used() && connection.client == client)
+            {
+                let connection = self.connections[index];
+                self.connections[index] = ClientConnection::EMPTY;
+                for descriptor in [connection.server_fd, connection.peer_fd] {
+                    if descriptor < 0 {
+                        continue;
+                    }
+                    if let Err(libuser::Error(errno)) = libuser::syscall::close(descriptor) {
+                        if errno != Errno::Ebadf as i32 && first.is_none() {
+                            first = Some(Failure {
+                                stage: "abort-window-client-channel",
+                                errno,
+                            });
+                        }
+                    }
+                }
+            }
+            if self.compositor.disconnect(client).is_err() && first.is_none() {
+                first = Some(Failure {
+                    stage: "abort-window-client-compositor",
+                    errno: 0,
+                });
+            }
+        }
+        let reap = match kind {
+            WindowClientKind::Smoke => {
+                self.smoke_client = ClientHandle::INVALID;
+                Self::reap_child_bounded(&mut self.smoke_pid)
+            },
+            WindowClientKind::Explorer => {
+                self.explorer_client = ClientHandle::INVALID;
+                Self::reap_child_bounded(&mut self.explorer_pid)
+            },
+        };
+        first.or(reap)
     }
 
     fn smoke_pending(&self) -> bool {
@@ -647,7 +781,10 @@ impl CompositorRuntime {
                 errno: 0,
             }));
         }
-        match libuser::channel_send(server_fd, &message, 0) {
+        // A short bounded wait lets a runnable client drain its eight-slot
+        // queue during legitimate key/text/repaint bursts. A client that
+        // remains full for the complete deadline is still isolated below.
+        match libuser::channel_send(server_fd, &message, CLIENT_SEND_TIMEOUT_NS) {
             Ok(length) if length == encoded.len() => Ok(()),
             Ok(_) => Err(SendError::Fatal(Failure {
                 stage: "short-channel-send",
@@ -1018,6 +1155,14 @@ impl CompositorRuntime {
         if self.smoke_client == client {
             self.smoke_client = ClientHandle::INVALID;
         }
+        if self.explorer_client == client {
+            self.explorer_client = ClientHandle::INVALID;
+            if let Some(failure) = Self::reap_child_bounded(&mut self.explorer_pid) {
+                if first.is_none() {
+                    first = Some(failure);
+                }
+            }
+        }
         let render_failure = self.present_scene_damage(frame).err();
         libuser::println!("{}", marker);
         first.or(render_failure).map_or(Ok(()), Err)
@@ -1084,12 +1229,14 @@ impl CompositorRuntime {
             *connection = ClientConnection::EMPTY;
         }
         self.smoke_client = ClientHandle::INVALID;
-        let reap_failure = self.reap_smoke_bounded();
-        first.or(reap_failure)
+        self.explorer_client = ClientHandle::INVALID;
+        let smoke_reap = Self::reap_child_bounded(&mut self.smoke_pid);
+        let explorer_reap = Self::reap_child_bounded(&mut self.explorer_pid);
+        first.or(smoke_reap).or(explorer_reap)
     }
 
-    fn reap_smoke_bounded(&mut self) -> Option<Failure> {
-        let pid = self.smoke_pid;
+    fn reap_child_bounded(pid_slot: &mut i64) -> Option<Failure> {
+        let pid = *pid_slot;
         if pid <= 0 {
             return None;
         }
@@ -1097,24 +1244,24 @@ impl CompositorRuntime {
         for _ in 0..SMOKE_REAP_ATTEMPTS {
             match libuser::syscall::waitpid(pid, &mut status, xenith_abi::WNOHANG) {
                 Ok(reaped) if reaped == pid => {
-                    self.smoke_pid = -1;
+                    *pid_slot = -1;
                     return None;
                 },
                 Ok(0) => {},
                 Ok(_) => {
                     return Some(Failure {
-                        stage: "reap-smoke-result",
+                        stage: "reap-window-client-result",
                         errno: 0,
                     });
                 },
                 Err(libuser::Error(errno)) if errno == Errno::Eintr as i32 => continue,
                 Err(libuser::Error(errno)) if errno == Errno::Echild as i32 => {
-                    self.smoke_pid = -1;
+                    *pid_slot = -1;
                     return None;
                 },
                 Err(libuser::Error(errno)) => {
                     return Some(Failure {
-                        stage: "reap-smoke",
+                        stage: "reap-window-client",
                         errno,
                     });
                 },
@@ -1127,7 +1274,7 @@ impl CompositorRuntime {
                 Err(libuser::Error(errno)) if errno == Errno::Eintr as i32 => {},
                 Err(libuser::Error(errno)) => {
                     return Some(Failure {
-                        stage: "reap-smoke-sleep",
+                        stage: "reap-window-client-sleep",
                         errno,
                     });
                 },
@@ -1137,7 +1284,7 @@ impl CompositorRuntime {
         if let Err(libuser::Error(errno)) = libuser::syscall::kill(pid, SIGKILL) {
             if errno != Errno::Esrch as i32 {
                 return Some(Failure {
-                    stage: "terminate-smoke",
+                    stage: "terminate-window-client",
                     errno,
                 });
             }
@@ -1145,23 +1292,23 @@ impl CompositorRuntime {
         loop {
             match libuser::syscall::waitpid(pid, &mut status, 0) {
                 Ok(reaped) if reaped == pid => {
-                    self.smoke_pid = -1;
+                    *pid_slot = -1;
                     return None;
                 },
                 Err(libuser::Error(errno)) if errno == Errno::Eintr as i32 => {},
                 Err(libuser::Error(errno)) if errno == Errno::Echild as i32 => {
-                    self.smoke_pid = -1;
+                    *pid_slot = -1;
                     return None;
                 },
                 Ok(_) => {
                     return Some(Failure {
-                        stage: "reap-terminated-smoke-result",
+                        stage: "reap-terminated-window-client-result",
                         errno: 0,
                     });
                 },
                 Err(libuser::Error(errno)) => {
                     return Some(Failure {
-                        stage: "reap-terminated-smoke",
+                        stage: "reap-terminated-window-client",
                         errno,
                     });
                 },
@@ -1465,6 +1612,15 @@ fn run_event_loop(
                 let new_cursor = frame.state.cursor();
                 match action {
                     EventAction::Exit => return Ok(LoopExit::RecoveryChord),
+                    EventAction::LaunchExplorer => {
+                        if let Err(failure) = runtime.launch_explorer() {
+                            libuser::println!(
+                                "XENITH_EXPLORER_LAUNCH_FAIL stage={} errno={}",
+                                failure.stage,
+                                failure.errno
+                            );
+                        }
+                    },
                     EventAction::Continue => {
                         runtime.route_input_event(event, old_cursor, new_cursor, &mut frame)?;
                     },

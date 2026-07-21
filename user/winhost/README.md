@@ -4,6 +4,14 @@
 only the loader's bounded conformance subset; it is not a Windows sandbox or a
 general Windows application layer.
 
+The executable argument may be a native Xenith path or a validated
+drive-absolute `C:\...` path. Windows paths are translated to the dedicated
+case-insensitive `/win/c` namespace before the file is opened; drive-relative,
+UNC, device, verbatim, alternate-stream, reserved-device, and unconfigured
+drive forms fail closed. This routing applies only to the host's executable
+argument. Guest `CreateFile`/directory/known-folder/environment APIs are not
+wired yet.
+
 ## Guest imports wired now
 
 | Guest import | Runtime behavior |

@@ -11,24 +11,110 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::inode::{
     allocate_inode_id, cache_insert, DirEntry, FileType, Inode, InodeMetadata, InodeOps,
 };
-use super::path::{validate_name, Component, Path, PathBuf};
+use super::path::{validate_name, Component, Path, PathBuf, MAX_NAME};
 use super::vfs::{FileSystem, FsError, NodeRef, VfsNode};
 use crate::sync::SpinLock;
 
 enum RamNodeData {
     File(Vec<u8>),
-    Directory(BTreeMap<String, NodeRef>),
+    Directory(BTreeMap<String, RamDirectoryEntry>),
     Symlink(String),
+}
+
+#[derive(Clone, Copy)]
+enum NamePolicy {
+    CaseSensitive,
+    AsciiCaseInsensitive,
+}
+
+struct RamDirectoryEntry {
+    /// `None` means the map key already is the display spelling. The
+    /// case-insensitive policy stores the original spelling separately from
+    /// its canonical lowercase key.
+    display_name: Option<String>,
+    node: NodeRef,
+}
+
+struct FoldedLookupName {
+    bytes: [u8; MAX_NAME],
+    len: usize,
+}
+
+impl FoldedLookupName {
+    fn new(name: &str) -> Self {
+        debug_assert!(name.len() <= MAX_NAME);
+        let mut folded = Self {
+            bytes: [0; MAX_NAME],
+            len: name.len(),
+        };
+        for (output, input) in folded.bytes.iter_mut().zip(name.bytes()) {
+            *output = input.to_ascii_lowercase();
+        }
+        folded
+    }
+
+    fn as_str(&self) -> &str {
+        match core::str::from_utf8(&self.bytes[..self.len]) {
+            Ok(name) => name,
+            Err(_) => unreachable!("ASCII folding preserves valid UTF-8"),
+        }
+    }
+}
+
+impl NamePolicy {
+    fn lookup<'a>(
+        self,
+        entries: &'a BTreeMap<String, RamDirectoryEntry>,
+        requested: &str,
+    ) -> Option<&'a RamDirectoryEntry> {
+        match self {
+            Self::CaseSensitive => entries.get(requested),
+            Self::AsciiCaseInsensitive => {
+                let folded = FoldedLookupName::new(requested);
+                entries.get(folded.as_str())
+            },
+        }
+    }
+
+    fn insertion_key(self, name: &str) -> String {
+        match self {
+            Self::CaseSensitive => name.to_string(),
+            Self::AsciiCaseInsensitive => name.to_ascii_lowercase(),
+        }
+    }
+
+    fn display_name(self, name: &str) -> Option<String> {
+        match self {
+            Self::CaseSensitive => None,
+            Self::AsciiCaseInsensitive => Some(name.to_string()),
+        }
+    }
+
+    fn remove(
+        self,
+        entries: &mut BTreeMap<String, RamDirectoryEntry>,
+        requested: &str,
+    ) -> Option<RamDirectoryEntry> {
+        match self {
+            Self::CaseSensitive => entries.remove(requested),
+            Self::AsciiCaseInsensitive => {
+                let folded = FoldedLookupName::new(requested);
+                entries.remove(folded.as_str())
+            },
+        }
+    }
 }
 
 struct RamFsInner {
     bytes: AtomicU64,
+    name_policy: NamePolicy,
 }
 
 impl RamFsInner {
-    const fn new() -> Self {
+    const fn new(name_policy: NamePolicy) -> Self {
         Self {
             bytes: AtomicU64::new(0),
+            name_policy,
         }
     }
 }
@@ -36,6 +122,7 @@ impl RamFsInner {
 struct RamNode {
     inode: Inode,
     filesystem: Weak<RamFsInner>,
+    name_policy: NamePolicy,
     data: SpinLock<RamNodeData>,
 }
 
@@ -51,6 +138,7 @@ impl RamNode {
         let node: NodeRef = Arc::new(Self {
             inode: Inode::new(metadata),
             filesystem: Arc::downgrade(filesystem),
+            name_policy: filesystem.name_policy,
             data: SpinLock::new(data),
         });
         cache_insert(&node);
@@ -135,7 +223,11 @@ impl InodeOps for RamNode {
         validate_name(name)?;
         let data = self.data.lock();
         match &*data {
-            RamNodeData::Directory(entries) => entries.get(name).cloned().ok_or(FsError::NotFound),
+            RamNodeData::Directory(entries) => self
+                .name_policy
+                .lookup(entries, name)
+                .map(|entry| Arc::clone(&entry.node))
+                .ok_or(FsError::NotFound),
             _ => Err(FsError::NotDirectory),
         }
     }
@@ -148,11 +240,14 @@ impl InodeOps for RamNode {
             RamNodeData::Directory(entries) => entries,
             _ => return Err(FsError::NotDirectory),
         };
-        if entries.contains_key(name) {
+        if self.name_policy.lookup(entries, name).is_some() {
             return Err(FsError::AlreadyExists);
         }
         let node = Self::allocate(&filesystem, kind, mode);
-        entries.insert(name.to_string(), Arc::clone(&node));
+        entries.insert(self.name_policy.insertion_key(name), RamDirectoryEntry {
+            display_name: self.name_policy.display_name(name),
+            node: Arc::clone(&node),
+        });
         Ok(node)
     }
 
@@ -163,12 +258,18 @@ impl InodeOps for RamNode {
             RamNodeData::Directory(entries) => entries,
             _ => return Err(FsError::NotDirectory),
         };
-        let child = entries.get(name).cloned().ok_or(FsError::NotFound)?;
+        let child = self
+            .name_policy
+            .lookup(entries, name)
+            .map(|entry| Arc::clone(&entry.node))
+            .ok_or(FsError::NotFound)?;
         if child.metadata().kind == FileType::Directory && !child.read_dir()?.is_empty() {
             return Err(FsError::NotEmpty);
         }
         let released = child.metadata().size;
-        entries.remove(name);
+        self.name_policy
+            .remove(entries, name)
+            .ok_or(FsError::NotFound)?;
         if released != 0 {
             if let Some(filesystem) = self.filesystem.upgrade() {
                 filesystem.bytes.fetch_sub(released, Ordering::Relaxed);
@@ -185,10 +286,10 @@ impl InodeOps for RamNode {
         };
         Ok(entries
             .iter()
-            .map(|(name, node)| {
-                let metadata = node.metadata();
+            .map(|(key, entry)| {
+                let metadata = entry.node.metadata();
                 DirEntry {
-                    name: name.clone(),
+                    name: entry.display_name.clone().unwrap_or_else(|| key.clone()),
                     inode: metadata.id,
                     kind: metadata.kind,
                 }
@@ -261,7 +362,17 @@ pub struct RamFs {
 
 impl RamFs {
     pub fn new() -> Self {
-        let inner = Arc::new(RamFsInner::new());
+        Self::with_name_policy(NamePolicy::CaseSensitive)
+    }
+
+    /// Create a filesystem whose directory lookups fold ASCII case while
+    /// retaining the spelling supplied when each entry was created.
+    pub fn new_ascii_case_insensitive() -> Self {
+        Self::with_name_policy(NamePolicy::AsciiCaseInsensitive)
+    }
+
+    fn with_name_policy(name_policy: NamePolicy) -> Self {
+        let inner = Arc::new(RamFsInner::new(name_policy));
         let root = RamNode::allocate(&inner, FileType::Directory, 0o755);
         Self { inner, root }
     }
@@ -382,5 +493,50 @@ mod tests {
             (metadata.accessed, metadata.modified, metadata.changed),
             (11, 22, 22)
         );
+    }
+
+    #[test]
+    fn ascii_case_insensitive_instance_preserves_original_spelling() {
+        let fs = RamFs::new_ascii_case_insensitive();
+        fs.write_file("/Users/Xenith/Music/Track.WAV", b"audio", 0o644)
+            .unwrap();
+
+        let mut bytes = [0u8; 5];
+        let file = fs.node("/users/xENITH/music/track.wav").unwrap();
+        assert_eq!(file.read_at(0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"audio");
+
+        let entries = fs.node("/USERS/XENITH/MUSIC").unwrap().read_dir().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Track.WAV");
+    }
+
+    #[test]
+    fn ascii_case_insensitive_instance_rejects_duplicates_and_removes_by_folded_name() {
+        let fs = RamFs::new_ascii_case_insensitive();
+        let directory = fs.mkdir_all("/ProgramData", 0o755).unwrap();
+        directory
+            .create("Settings.ini", FileType::Regular, 0o644)
+            .unwrap();
+        assert!(matches!(
+            directory.create("SETTINGS.INI", FileType::Regular, 0o644),
+            Err(FsError::AlreadyExists)
+        ));
+
+        directory.remove("settings.INI").unwrap();
+        assert_eq!(
+            directory.lookup("Settings.ini").err(),
+            Some(FsError::NotFound)
+        );
+        assert!(directory.read_dir().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_instance_remains_case_sensitive() {
+        let fs = RamFs::new();
+        fs.write_file("/Case", b"upper", 0o644).unwrap();
+        fs.write_file("/case", b"lower", 0o644).unwrap();
+        assert!(fs.node("/CASE").is_err());
+        assert_eq!(fs.root().read_dir().unwrap().len(), 2);
     }
 }

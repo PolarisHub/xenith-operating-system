@@ -17,6 +17,7 @@ path = "src/main.rs"
 xenith-cc = { path = "../xenith-cc" }
 xenith-iso = { path = "../xenith-iso" }
 xenith-winhost = { path = "../../user/winhost" }
+xenith-winhost-core = { path = "../../user/winhost-core" }
 
 [lints]
 workspace = true

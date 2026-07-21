@@ -1,0 +1,24 @@
+[package]
+name = "xenith-explorer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "xenith_explorer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xenith-explorer"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libuser = { path = "../libuser" }
+libwindow = { path = "../libwindow" }
+xenith-abi = { path = "../../crates/xenith-abi" }
+xenith-winhost-core = { path = "../winhost-core" }
+
+[lints]
+workspace = true

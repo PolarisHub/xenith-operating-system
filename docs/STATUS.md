@@ -154,11 +154,19 @@ a boot result, and an internal firmware model is not a physical-machine result.
   mapped buffers per client, plus a 256 MiB global mapping quota. It validates
   generation-safe client/surface state, configure acknowledgements, damage,
   and read-only buffers; maintains scene order/focus; routes pointer capture,
-  keys, and UTF-8 text; and isolates malformed or stalled clients. One wait
-  covers UI plus all live channels without polling. The opt-in
-  `--window-smoke` path currently provisions the only live connection and uses
-  restricted spawn so the child receives exactly stdout, stderr, and one
-  client endpoint. Normal boot creates no channel and remains app-free.
+  keys, and UTF-8 text; and isolates malformed or stalled clients. Full
+  client queues receive at most 50 ms of bounded backpressure before
+  isolation. One wait covers UI plus all live channels without polling. The
+  on-demand Files path and the opt-in `--window-smoke` path each provision a
+  private live connection and use restricted spawn so the child receives
+  exactly stdout, stderr, and one client endpoint. Normal boot creates no
+  channel until Files is opened from the dock, launcher, or `Super+E`.
+- `/bin/xenith-explorer` is a native allocation-free graphical process with
+  two release-tracked shared buffers. It browses native absolute paths and the
+  `C:\` namespace, sorts folders first, exposes profile shortcuts, address and
+  history navigation, keyboard/mouse/wheel selection, new-folder creation,
+  and confirmed file or empty-folder deletion. Its fixed limits are 1024-byte
+  paths, 96 entries per directory read, and 12 history entries.
 - `xenith-pe`, `xenith-winhost-core`, and `xenith-winhost` implement a bounded
   PE32+ AMD64 console path. The host accepts regular files up to 16 MiB and
   images up to 64 MiB, paths up to 1024 bytes, at most 64 bootstrap imports,
@@ -185,6 +193,16 @@ a boot result, and an internal firmware model is not a physical-machine result.
   numeric Windows-build syscall table. Blocking/alertable waits, APCs, named
   objects, security descriptors, cross-process duplication, PEB/TEB
   materialization, and Windows thread semantics remain unsupported.
+- The kernel mounts a separate `/win` ramfs with O(log n) ASCII
+  case-insensitive keys and case-preserving directory entries while retaining
+  case-sensitive native filesystems. `C:\` maps to `/win/c`; initramfs seeds
+  modern Windows/system/program/profile folders plus a `Users\Xenith` profile,
+  and the PE host can open its packaged fixture through that drive path.
+  Win32 path normalization, known-folder defaults, redirection policy, and a
+  sorted UTF-16 environment-block builder share one bounded profile contract.
+  The mount is volatile, and known-folder/environment APIs are not guest-wired;
+  no NTFS, reparse, ACL, integrity-label, or full Unicode-case behavior is
+  claimed.
 - `xenith-windrv-core` implements allocation-free validation/state policy for
   WDM major-function and `CTL_CODE` values, generation-safe driver/device/
   request IDs, image-confined callbacks, bounded linear device stacks, request
@@ -210,12 +228,14 @@ the current build.
 | `kernel_reaches_userspace_shell` | Direct kernel/initramfs load reaches ring-3 init and `xenith$` | PASS (2026-07-20) |
 | `shell_executes_builtins_and_coreutils_via_ps2` | PS/2 input drives the shell, coreutils, filesystem mutations, VM/RNG, and the ring-3 signal smoke | PASS (2026-07-20) |
 | `ring3_ui_smoke_restores_framebuffer_terminal` | Ring 3 acquires scanout, presents full and damaged frames, polls input, releases/unmaps, and the kernel terminal resumes drawing | PASS (2026-07-20) |
-| `desktop_renders_stays_stable_and_falls_back_to_shell` | Init starts the desktop; it presents the photo-backed neutral shell, handles Super through partial damage, reaches repeated halted idle states, survives a bounded idle window, releases cleanly on recovery input, then restores the shell and terminal framebuffer | PASS (2026-07-20) |
-| External QEMU xHCI boot-HID gate | A q35 VM with `i8042=off` cold-boots the exact ISO on 3 vCPUs, binds `qemu-xhci` through MSI, enumerates `usb-kbd` and `usb-mouse`, opens the launcher from an injected Super key, moves the visible cursor, and records no QEMU guest error | PASS (2026-07-20) |
-| External VMware BIOS/UEFI hardware gate | VMware Workstation cold-boots the exact ISO with 512 MiB and 3 vCPUs under legacy BIOS and UEFI, brings 3/3 CPUs online, reaches the desktop, drives SVGA II FIFO damage updates, discovers the HDA codec through CORB/RIRB, and starts the xHCI MSI service worker | PASS (2026-07-20) |
-| `opt_in_window_client_completes_shared_buffer_protocol` | With three CPUs online, the explicit desktop smoke mode restricted-spawns one native client with only stdout/stderr/endpoint 3, maps its attenuated shared buffer, composites client pixels, completes configure/release/frame events, disconnects, and reaps the child | PASS (2026-07-20) |
+| `desktop_renders_stays_stable_and_falls_back_to_shell` | Init starts the desktop; it presents the photo-backed neutral shell, handles Super through partial damage, reaches repeated halted idle states, survives a bounded idle window, releases cleanly on recovery input, then restores the shell and terminal framebuffer | PASS (2026-07-21) |
+| `super_e_launches_a_visible_file_explorer_and_desktop_cleans_it_up` | Super+E restricted-spawns the packaged Files process, presents its native surface, enters `C:\Users\Xenith\AppData` through Ctrl+L, creates `New folder` with Ctrl+Shift+N, deletes it only after two distinct Delete presses, exits cleanly, and lets the desktop restore the shell | PASS (2026-07-21) |
+| External QEMU preceding-artifact xHCI boot-HID gate | A q35 VM with `i8042=off` cold-boots the preceding ISO on 3 vCPUs, binds `qemu-xhci` through MSI, enumerates `usb-kbd` and `usb-mouse`, opens the launcher from an injected Super key, moves the visible cursor, and records no QEMU guest error | PASS (2026-07-20) |
+| External VMware preceding-artifact BIOS/UEFI gate | VMware Workstation cold-boots the preceding ISO with 512 MiB and 3 vCPUs under legacy BIOS and UEFI, brings 3/3 CPUs online, reaches the desktop, drives SVGA II FIFO damage updates, discovers the HDA codec through CORB/RIRB, and starts the xHCI MSI service worker | PASS (2026-07-20) |
+| External VMware current-artifact UEFI gate | VMware Workstation 17.6.3 cold-boots the current ISO with 1096 MiB and 1 vCPU under UEFI, mounts the refreshed native/Windows initramfs, reaches `XENITH_DESKTOP_READY`, activates SVGA II FIFO damage, and leases IPv4 through e1000 MSI | PASS (2026-07-21) |
+| `opt_in_window_client_completes_shared_buffer_protocol` | With three CPUs online, the explicit desktop smoke mode restricted-spawns one native client with only stdout/stderr/endpoint 3, maps its attenuated shared buffer, composites client pixels, completes configure/release/frame events, disconnects, and reaps the child | PASS (2026-07-21) |
 | `userspace_threads_create_join_and_teardown_in_guest` | With three CPUs online, `/bin/thread-smoke` maps two private stacks, runs two simultaneous workers with distinct task IDs, joins exit codes 41/42, verifies shared atomic state, and unmaps both stacks | PASS (2026-07-20) |
-| `win64_console_fixture_executes_through_booted_host` | The packaged PE fixture is forced off its preferred base, validates the applied DIR64 relocation, enters through `/bin/xenith-winhost` on its guarded stack, calls the bootstrap console shim, exits, and returns to the shell | PASS (2026-07-20) |
+| `win64_console_fixture_executes_through_booted_host` | The same packaged PE bytes execute first by native path and then as `C:\Users\Xenith\Downloads\win64-console.exe`; the latter crosses drive translation and the case-insensitive `/win` mount. Both runs validate the forced DIR64 rebase, guarded stack, console shim, exit, and restored shell prompt | PASS (2026-07-21) |
 | `input_script_proves_shell_pipeline_and_redirection` | Multi-stage pipelines and `<`, `>`, `>>` work through real descriptors and syscalls | PASS (2026-07-20) |
 | `xenith_built_c_utility_executes_in_ring3` | C source compiled by Xenith's compiler/assembler/linker executes at CPL3 | PASS (2026-07-20) |
 | `manifest_image_reaches_userspace_shell` | The packaged manifest, checksums, kernel, initramfs, and attached ATA image reach the shell | PASS (2026-07-20) |
@@ -233,23 +253,33 @@ the current build.
 ## Validation and artifact identity
 
 The named runtime results above record the verified behavior boundary. Exact
-sizes below identify the fresh post-change build used by the runtime and
-external-firmware gates. `build/ARTIFACTS.txt` remains authoritative for the
-files currently in a local build directory. A parser/check-only result is never
+sizes below identify the fresh post-change build used by the repository-owned
+runtime gates. `build/ARTIFACTS.txt` remains authoritative for the files
+currently in a local build directory. A parser/check-only result is never
 promoted to a guest runtime result.
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `build/xenith.iso` | 25,704,448 | `8FCC3B663A6F6546403AE79BD2EE0C5C4897C431344FEE912D69F00BACC6E28C` |
-| `build/xenith.img` | 4,255,744 | `6F0B7D7AC78EA960E53ABEFB0BABA554AA8913EECFF395ED724AAF7CFCC14F4C` |
-| `build/kernel.elf` | 3,754,680 | `FD99888065C34FD9DBE118E99B7824FF51E9020448D412921038D47B2A0C4430` |
-| `build/initramfs.cpio` | 477,804 | `B0A563A23A00A870A7714C062ADB7F3CE8A8D6968E3E1C36FB369F5FDA417BED` |
-| `build/bootloader/BOOTX64.EFI` | 624,640 | `7E57B129424F47FF85BDA6164946BFA7D5A5E101768B0EFCD9E27A4C90649676` |
-| `build/user/xenith-desktop` | 225,712 | `B3E60F1530A75017E0956FFA8FA49923191634C1154F35BCB22DAA7547B8BA10` |
+| `build/xenith.iso` | 25,833,472 | `7BD79E62D21CBFA3ECAEDB7B824C0CB8CA50E33418AB8756143E66350D189577` |
+| `build/xenith.img` | 4,386,816 | `57015662AC6F220163A7286E76C46588603AFF9714FD3F15D68D714D1B964BF8` |
+| `build/kernel.elf` | 3,776,472 | `FE809E6789958FA42CDCEBA2D62A6D6DFF10B2398C01EDA97E30CF1B3D11F7EA` |
+| `build/initramfs.cpio` | 586,556 | `35C61B1C81CE6C40A092F923A9D105E1E37745972E667BC1D3CDD3C67FAC62D1` |
+| `build/bootloader/BOOTX64.EFI` | 624,640 | `6DC80BEA4ED048627618D7D5DCDDD8EA9238648C9BEB19458B40451124CECD0B` |
+| `build/user/xenith-desktop` | 230,320 | `74CEC8855F74C7B5B465F6741D2AE38AE2DF6D12A58B9E422EFBC6BCF80C77DB` |
+| `build/user/xenith-explorer` | 80,824 | `B640EBFD3146D24E275DB448AD1A5E1407635D6E84F9E7C82357167548111FA0` |
 
-The exact ISO above cold-booted in VMware Workstation 17.6.3 on 2026-07-20
-with 512 MiB RAM and 3 vCPUs under both legacy BIOS and UEFI with Secure Boot
-disabled. Both firmware paths brought all three CPUs online, initialized a
+The current ISO above cold-booted in VMware Workstation 17.6.3 on 2026-07-21
+using the existing 1096 MiB, 1-vCPU, UEFI/Secure-Boot-disabled VM. Its COM1
+log recorded the refreshed 137-entry initramfs, Windows namespace readiness,
+SVGA II FIFO damage, e1000 MSI networking with a DHCP lease, and
+`XENITH_DESKTOP_READY`. The VM was powered off after the gate. This refresh did
+not repeat the legacy-BIOS or wider-vCPU external matrices.
+
+The preceding ISO
+`8FCC3B663A6F6546403AE79BD2EE0C5C4897C431344FEE912D69F00BACC6E28C`
+cold-booted in VMware Workstation 17.6.3 on 2026-07-20 with 512 MiB RAM and
+3 vCPUs under both legacy BIOS and UEFI with Secure Boot disabled. Both
+firmware paths brought all three CPUs online, initialized a
 framebuffer, spawned `/init` and `/bin/xenith-desktop`, and reached
 `XENITH_DESKTOP_READY` on COM1. The legacy path additionally recorded packaged
 stage2 entering long mode and selecting VBE; the UEFI path executed the ISO's
@@ -281,15 +311,16 @@ ordering.
 
 - Repository-owned emulator gates prove the refreshed raw disk plus BIOS and
   UEFI ISO entries. VMware Workstation externally proves this exact ISO under
-  its BIOS and UEFI implementations at three vCPUs; the wider VMware and
-  QEMU/SeaBIOS CPU matrices belong to the preceding artifact. None establishes
+  UEFI at one vCPU; the legacy-BIOS, three-vCPU, wider VMware, and QEMU/SeaBIOS
+  CPU matrices belong to preceding artifacts. None establishes
   physical-PC compatibility or coverage across arbitrary firmware; physical
   AHCI/NVMe/USB boot, NICs, physical display/input/audio, ACPI quirks, and
   cache-flush behavior remain hardware-validation work.
 - The desktop coordinator implements bounded multi-client scene/focus/input
-  policy, but the packaged smoke is still its only live connection. There is no
-  service identity, rendezvous/admission protocol, booted two-client gate,
-  generic GPU acceleration, page flipping, vsync, or default application. The input ABI
+  policy, and Files plus the packaged smoke exercise private live connections.
+  There is no service identity, rendezvous/admission protocol, booted
+  simultaneous two-client application gate, generic GPU acceleration, page
+  flipping, vsync, or general third-party application launcher. The input ABI
   also lacks enter/leave, client-requested capture, IME/composition, distinct
   logical key codes, horizontal wheel, and a dedicated key-overflow marker.
   USB input is deliberately limited to xHCI direct-root-port boot keyboards
@@ -303,6 +334,14 @@ ordering.
   its Xenith syscall authority and inherited descriptors, so only trusted
   conformance images are supported. No broad Windows-application compatibility
   is claimed.
+- The seeded Windows folder hierarchy is not application compatibility by
+  itself. It resets on reboot and has no guest-wired Windows `CreateFile`,
+  directory, known-folder, environment, registry, loader, or shell API surface
+  yet. Files reaches the hierarchy through native Xenith filesystem syscalls.
+- Files currently caps one directory view at 96 entries because `read_dir`
+  has no pagination contract. Rename, copy, move, drag-and-drop, file previews,
+  file associations, persistent view settings, and storage persistence remain
+  future application/filesystem work.
 - Native Xenith threads share descriptors and an address space, but have no TLS,
   detach/cancellation API, or task-local signal state. A clean signal state is
   required before creating a second task; while multi-threaded, caught-handler,

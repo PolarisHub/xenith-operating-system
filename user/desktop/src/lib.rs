@@ -26,6 +26,7 @@ pub const MAX_DAMAGE_RECTS: usize = 12;
 const KEY_ESCAPE: u32 = 0x01;
 const KEY_BACKSPACE: u32 = 0x0e;
 const KEY_Q: u32 = 0x10;
+const KEY_E: u32 = 0x12;
 const KEY_F1: u32 = 0x3b;
 const KEY_LEFT_SUPER: u32 = 0xe05b;
 const KEY_RIGHT_SUPER: u32 = 0xe05c;
@@ -186,7 +187,10 @@ pub struct Layout {
     pub top_bar: Rect,
     pub dock: Rect,
     pub launcher_button: Rect,
+    pub files_button: Rect,
+    pub files_hit_target: Rect,
     pub launcher: Rect,
+    pub launcher_files: Rect,
 }
 
 impl Layout {
@@ -201,12 +205,29 @@ impl Layout {
         // Keep the legacy top-bar hit region as an alias of the sole shell bar.
         // This preserves shell pointer capture without an invisible region.
         let top_bar = dock;
-        let button_margin = 5.min(bar_height.saturating_sub(1) / 2);
-        let button_size = bar_height.saturating_sub(button_margin * 2).max(1);
+        let button_margin = 5
+            .min(bar_height.saturating_sub(1) / 2)
+            .min(width.saturating_sub(1) / 2);
+        let nominal_button_size = bar_height.saturating_sub(button_margin * 2).max(1);
+        let two_button_capacity = width.saturating_sub(button_margin * 2).saturating_sub(6) / 2;
+        let button_size = nominal_button_size.min(two_button_capacity.max(1));
         let launcher_button = Rect::new(
             button_margin as i32,
             (bar_y + button_margin) as i32,
             button_size,
+            button_size,
+        );
+        let files_x = (launcher_button.x.max(0) as u32)
+            .saturating_add(launcher_button.width)
+            .saturating_add(6)
+            .min(width.saturating_sub(button_size));
+        let files_button = Rect::new(files_x as i32, launcher_button.y, button_size, button_size);
+        let files_hit_target = Rect::new(
+            files_button.x,
+            files_button.y,
+            button_size
+                .saturating_add(38)
+                .min(width.saturating_sub(files_x)),
             button_size,
         );
 
@@ -224,13 +245,25 @@ impl Layout {
             launcher_width,
             launcher_height,
         );
+        let launcher_padding = 8
+            .min(launcher.width.saturating_sub(1) / 2)
+            .min(launcher.height.saturating_sub(1) / 2);
+        let launcher_files = Rect::new(
+            launcher.x.saturating_add(launcher_padding as i32),
+            launcher.y.saturating_add(launcher_padding as i32),
+            launcher.width.saturating_sub(launcher_padding * 2),
+            launcher.height.saturating_sub(launcher_padding * 2),
+        );
 
         Self {
             screen,
             top_bar,
             dock,
             launcher_button,
+            files_button,
+            files_hit_target,
             launcher,
+            launcher_files,
         }
     }
 }
@@ -239,6 +272,7 @@ impl Layout {
 pub enum EventAction {
     Continue,
     Consumed,
+    LaunchExplorer,
     Exit,
 }
 
@@ -364,6 +398,17 @@ impl DesktopState {
             self.shell_pointer_buttons = newly_pressed;
         }
         self.buttons = event.buttons;
+        let launcher_was_open = self.launcher_open;
+        let files_pressed = new_left
+            && !old_left
+            && ((self.layout.files_hit_target != self.layout.launcher_button
+                && self.layout.files_hit_target.contains(self.cursor))
+                || launcher_was_open && self.layout.launcher_files.contains(self.cursor));
+        if files_pressed {
+            self.close_launcher(damage);
+            damage.add(self.layout.files_button.expand(3));
+            return EventAction::LaunchExplorer;
+        }
         if new_left && !old_left && self.layout.launcher_button.contains(self.cursor) {
             self.toggle_launcher(damage);
         }
@@ -403,6 +448,12 @@ impl DesktopState {
         {
             return EventAction::Exit;
         }
+        if event.code == KEY_E && super_key && event.flags & UI_EVENT_FLAG_REPEAT == 0 {
+            self.suppressed_key = event.code;
+            self.close_launcher(damage);
+            damage.add(self.layout.files_button.expand(3));
+            return EventAction::LaunchExplorer;
+        }
         if event.code == KEY_ESCAPE && self.launcher_open {
             self.suppressed_key = event.code;
             self.toggle_launcher(damage);
@@ -415,6 +466,12 @@ impl DesktopState {
         self.launcher_open = !self.launcher_open;
         damage.add(self.layout.launcher.expand(10));
         damage.add(self.layout.launcher_button.expand(3));
+    }
+
+    fn close_launcher(&mut self, damage: &mut DamageTracker) {
+        if self.launcher_open {
+            self.toggle_launcher(damage);
+        }
     }
 }
 
@@ -665,6 +722,37 @@ mod tests {
     }
 
     #[test]
+    fn files_button_requests_the_explorer_without_leaking_the_click() {
+        let mut state = DesktopState::new(Size::new(1024, 768));
+        let button = state.layout().files_button;
+        place_cursor(&mut state, Point::new(button.x + 2, button.y + 2));
+        let mut damage = DamageTracker::new(state.layout().screen);
+        assert_eq!(
+            state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
+            EventAction::LaunchExplorer
+        );
+        assert!(!damage.is_empty());
+        assert_eq!(
+            state.handle_event(pointer(0, 0, 0), &mut damage),
+            EventAction::Consumed
+        );
+    }
+
+    #[test]
+    fn files_label_is_part_of_the_launch_target() {
+        let mut state = DesktopState::new(Size::new(1024, 768));
+        let button = state.layout().files_button;
+        let target = Point::new(button.x + button.width as i32 + 2, button.y + 2);
+        assert!(state.layout().files_hit_target.contains(target));
+        place_cursor(&mut state, target);
+        let mut damage = DamageTracker::new(state.layout().screen);
+        assert_eq!(
+            state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
+            EventAction::LaunchExplorer
+        );
+    }
+
+    #[test]
     fn emergency_chord_requests_exit() {
         let mut state = DesktopState::new(Size::new(800, 600));
         let mut damage = DamageTracker::new(state.layout().screen);
@@ -708,6 +796,38 @@ mod tests {
     }
 
     #[test]
+    fn super_e_closes_the_launcher_and_requests_the_explorer_once() {
+        let mut state = DesktopState::new(Size::new(800, 600));
+        let mut damage = DamageTracker::new(state.layout().screen);
+        let super_make = UiInputEvent {
+            kind: UI_EVENT_KEY,
+            flags: UI_EVENT_FLAG_PRESSED,
+            modifiers: UI_MODIFIER_LEFT_SUPER,
+            code: KEY_LEFT_SUPER,
+            ..UiInputEvent::default()
+        };
+        assert_eq!(
+            state.handle_event(super_make, &mut damage),
+            EventAction::Consumed
+        );
+        assert!(state.launcher_open());
+
+        let e_make = UiInputEvent {
+            code: KEY_E,
+            ..super_make
+        };
+        assert_eq!(
+            state.handle_event(e_make, &mut damage),
+            EventAction::LaunchExplorer
+        );
+        assert!(!state.launcher_open());
+        assert_eq!(
+            state.handle_event(UiInputEvent { flags: 0, ..e_make }, &mut damage,),
+            EventAction::Consumed
+        );
+    }
+
+    #[test]
     fn shell_pointer_capture_and_escape_release_do_not_leak_to_clients() {
         let mut state = DesktopState::new(Size::new(1024, 768));
         let button = state.layout().launcher_button;
@@ -746,16 +866,47 @@ mod tests {
 
     #[test]
     fn layout_stays_inside_tiny_and_normal_screens() {
-        for size in [Size::new(1, 1), Size::new(320, 200), Size::new(1024, 768)] {
+        for size in [
+            Size::new(1, 1),
+            Size::new(320, 56),
+            Size::new(320, 200),
+            Size::new(1024, 768),
+        ] {
             let layout = Layout::new(size);
             for rect in [
                 layout.top_bar,
                 layout.dock,
                 layout.launcher_button,
+                layout.files_button,
+                layout.files_hit_target,
                 layout.launcher,
+                layout.launcher_files,
             ] {
                 assert_eq!(rect, rect.intersect(layout.screen).unwrap());
             }
+            assert!(layout.launcher_files.width > 0);
+            assert!(layout.launcher_files.height > 0);
         }
+    }
+
+    #[test]
+    fn narrow_dock_buttons_do_not_overlap_or_trigger_two_actions() {
+        let mut state = DesktopState::new(Size::new(40, 200));
+        let layout = state.layout();
+        assert!(layout
+            .launcher_button
+            .intersect(layout.files_hit_target)
+            .is_none());
+
+        let mut damage = DamageTracker::new(layout.screen);
+        place_cursor(
+            &mut state,
+            Point::new(layout.launcher_button.x, layout.launcher_button.y),
+        );
+        assert_eq!(
+            state.handle_event(pointer(0, 0, UI_POINTER_BUTTON_LEFT), &mut damage),
+            EventAction::Consumed
+        );
+        assert!(state.launcher_open());
     }
 }

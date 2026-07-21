@@ -174,14 +174,14 @@ Desktop recovery shortcuts, launcher gestures, and shell chrome are consumed
 before client routing. Event delivery uses bounded zero-timeout sends; a full
 or hung client queue disconnects that client rather than stalling the desktop.
 
-The live path is exercised only by starting
-`/bin/xenith-desktop --window-smoke`. It creates a private channel and uses
-`spawn_restricted` to launch `/bin/xenith-window-smoke` with exactly stdout,
-stderr, and the client endpoint installed as descriptor 3. The parent retains
-only the server endpoint. The desktop composites the client's shared buffer,
-observes the release/frame completion lifecycle, disconnects cleanly, and reaps
-the child. Normal init starts `/bin/xenith-desktop` without that option; it
-allocates no channel and remains app-free.
+The normal live path launches `/bin/xenith-explorer` from the dock, launcher,
+or `Super+E`. The opt-in `/bin/xenith-desktop --window-smoke` path exercises the
+same private admission mechanism with a deterministic test client. Each path
+creates a private channel and uses `spawn_restricted` so the child receives
+exactly stdout, stderr, and its endpoint as descriptor 3; the parent retains
+only the server endpoint. The desktop composites shared buffers, observes the
+release/frame-completion lifecycle, disconnects cleanly, and reaps each child.
+Normal init creates no client channel until the user opens Files.
 
 The restricted launch removes the previous descriptor-inheritance leak, but it
 does not create a service namespace. There is no compositor service identity,
@@ -191,16 +191,16 @@ can obtain a connection.
 ## Current limits
 
 - Exactly one process owns the display and input seat; today that is the
-  desktop compositor. Its coordinator can isolate eight connections, but the
-  packaged opt-in smoke is currently the only live connection path and is not
-  a default application.
+  desktop compositor. Its coordinator can isolate eight connections, while
+  Files and the packaged protocol smoke currently use private desktop-owned
+  launch paths.
 - Presentation always uses the bounded CPU damage-copy path. When Limine's
   framebuffer is exactly the attached VMware SVGA II frontbuffer, those same
   rectangles are additionally published through FIFO `UPDATE` commands. There
   is no page-flip, vsync, 3D, cursor-plane, or generic-GPU contract.
 - Service discovery/brokering, general client admission, desktop window-close
-  policy, and a booted two-client integration gate remain to be implemented.
-  There are no default applications.
+  policy, move/resize chrome, and a booted two-client integration gate remain
+  to be implemented. Files is the first installed graphical application.
 - The input protocol has no pointer enter/leave events, client-requested
   capture, IME/composition, distinct logical key code, horizontal wheel, or
   dedicated key-overflow marker. The current key event repeats the raw Set-1
@@ -216,7 +216,7 @@ can obtain a connection.
 - VMware/emulator paths are covered separately; broad physical-hardware
   framebuffer and input validation remains pending.
 - The four UI syscall paths retain their ring-3 lifecycle gate. Separate
-  desktop gates prove the app-free rendered shell lifecycle and the opt-in
-  one-client shared-buffer protocol; the coordinator's eight-client capacity
-  and input isolation currently have host tests rather than a booted
-  multi-client artifact gate.
+  desktop gates prove the idle rendered shell lifecycle, the on-demand Files
+  client, and the opt-in one-client shared-buffer protocol; the coordinator's
+  eight-client capacity and input isolation currently have host tests rather
+  than a booted multi-client artifact gate.

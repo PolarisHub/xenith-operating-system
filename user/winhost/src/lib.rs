@@ -13,6 +13,8 @@
 
 /// Source-built PE32+ fixture shared by loader and booted conformance tests.
 pub mod fixture;
+/// Windows executable-path validation and native namespace routing.
+pub mod path_runtime;
 /// Pointer-free NT runtime adapter used by the console shims.
 pub mod runtime;
 

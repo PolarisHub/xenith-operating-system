@@ -40,6 +40,7 @@ members = [
     "user/winhost",
     "user/init",
     "user/desktop",
+    "user/explorer",
     "user/shell",
     "user/coreutils",
     "user/libc/xenith-libc",

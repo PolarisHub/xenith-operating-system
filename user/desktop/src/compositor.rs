@@ -52,6 +52,12 @@ const UI_MODIFIER_ALL: u16 = UI_MODIFIER_LEFT_SHIFT
     | UI_MODIFIER_CAPS_LOCK
     | UI_MODIFIER_NUM_LOCK
     | UI_MODIFIER_SCROLL_LOCK;
+const UI_MODIFIER_TEXT_SHORTCUT: u16 = UI_MODIFIER_LEFT_CTRL
+    | UI_MODIFIER_RIGHT_CTRL
+    | UI_MODIFIER_LEFT_ALT
+    | UI_MODIFIER_RIGHT_ALT
+    | UI_MODIFIER_LEFT_SUPER
+    | UI_MODIFIER_RIGHT_SUPER;
 const UI_POINTER_BUTTON_ALL: u16 = UI_POINTER_BUTTON_LEFT
     | UI_POINTER_BUTTON_RIGHT
     | UI_POINTER_BUTTON_MIDDLE
@@ -2216,7 +2222,8 @@ impl MultiClientCompositor {
     }
 
     /// Route one canonical key sample to the focused surface. Printable press
-    /// and repeat samples emit a following UTF-8 text event.
+    /// and repeat samples without Ctrl, Alt, or Super emit a following UTF-8
+    /// text event; shortcut chords remain key-only.
     pub fn route_key(
         &mut self,
         event: UiInputEvent,
@@ -2234,7 +2241,10 @@ impl MultiClientCompositor {
         } else {
             wire::COMPOSITOR_KEY_RELEASED
         };
-        let character = if state == wire::COMPOSITOR_KEY_RELEASED || event.value1 == 0 {
+        let character = if state == wire::COMPOSITOR_KEY_RELEASED
+            || event.value1 == 0
+            || event.modifiers & UI_MODIFIER_TEXT_SHORTCUT != 0
+        {
             None
         } else {
             u32::try_from(event.value1).ok().and_then(char::from_u32)
@@ -4392,15 +4402,24 @@ mod tests {
         assert_eq!(read_u16(text.message.as_bytes(), 40), Some(2));
         assert_eq!(&text.message.as_bytes()[48..50], "é".as_bytes());
 
+        let mut ctrl_l = key_input(4, 125, 0x26, UI_EVENT_FLAG_PRESSED, Some('l'));
+        ctrl_l.modifiers = UI_MODIFIER_LEFT_CTRL;
+        let shortcut = compositor.route_key(ctrl_l).unwrap();
+        assert_eq!(shortcut.len(), 1);
+        assert_eq!(
+            read_u16(shortcut.iter().next().unwrap().message.as_bytes(), 14,),
+            Some(wire::COMPOSITOR_EVENT_KEY)
+        );
+
         let release = compositor
-            .route_pointer(pointer_input(4, 130, 0, 0), 110, 20, 0, 0)
+            .route_pointer(pointer_input(5, 130, 0, 0), 110, 20, 0, 0)
             .unwrap();
         assert_eq!(release.len(), 1);
         assert_eq!(release.iter().next().unwrap().client, first_client);
         assert_eq!(compositor.pointer_capture(), None);
 
         let hover = compositor
-            .route_pointer(pointer_input(5, 140, 0, 0), 110, 20, 1, 0)
+            .route_pointer(pointer_input(6, 140, 0, 0), 110, 20, 1, 0)
             .unwrap();
         assert_eq!(hover.len(), 1);
         assert_eq!(hover.iter().next().unwrap().client, second_client);
@@ -4408,7 +4427,7 @@ mod tests {
 
         let second_press = compositor
             .route_pointer(
-                pointer_input(6, 150, UI_POINTER_BUTTON_LEFT, 0),
+                pointer_input(7, 150, UI_POINTER_BUTTON_LEFT, 0),
                 110,
                 20,
                 0,

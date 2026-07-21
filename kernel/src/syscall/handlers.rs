@@ -495,17 +495,11 @@ pub fn sys_open(ctx: &SyscallContext) -> i64 {
     let flags = ctx.arg(2) as u32;
     let mode = ctx.arg(3) as u32;
 
-    let mut path_buf = [0u8; 256];
-    if path_len == 0 || path_len >= path_buf.len() {
-        return Errno::Enametoolong.as_ret();
-    }
-    if let Err(error) = copy_from_user(path_ptr, &mut path_buf, path_len) {
-        return error.as_ret();
-    }
-    let Ok(path) = core::str::from_utf8(&path_buf[..path_len]) else {
-        return Errno::Einval.as_ret();
+    let path = match user_path(path_ptr, path_len) {
+        Ok(path) => path,
+        Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_open(path, flags, mode) {
+    match crate::fs::syscalls::sys_open(&path, flags, mode) {
         Ok(fd) => i64::from(fd),
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1033,8 +1027,7 @@ fn process_request_from_user(
     path_length: usize,
     argv: u64,
 ) -> Result<(String, Vec<String>), Errno> {
-    let mut path_storage = [0u8; 256];
-    let path = user_path(path_pointer, path_length, &mut path_storage)?.to_string();
+    let path = user_path(path_pointer, path_length)?;
     let mut owned_arguments = Vec::<String>::new();
     if argv != 0 {
         for index in 0..32usize {
@@ -1386,17 +1379,11 @@ pub fn sys_stat(ctx: &SyscallContext) -> i64 {
     let path_len = ctx.arg(1) as usize;
     let buf_ptr = ctx.arg(2);
 
-    let mut path_buf = [0u8; 256];
-    if path_len == 0 || path_len >= path_buf.len() {
-        return Errno::Enametoolong.as_ret();
-    }
-    if let Err(error) = copy_from_user(path_ptr, &mut path_buf, path_len) {
-        return error.as_ret();
-    }
-    let Ok(path) = core::str::from_utf8(&path_buf[..path_len]) else {
-        return Errno::Einval.as_ret();
+    let path = match user_path(path_ptr, path_len) {
+        Ok(path) => path,
+        Err(error) => return error.as_ret(),
     };
-    let metadata = match crate::fs::syscalls::sys_stat(path) {
+    let metadata = match crate::fs::syscalls::sys_stat(&path) {
         Ok(metadata) => metadata,
         Err(error) => return Errno::from(error).as_ret(),
     };
@@ -1740,17 +1727,11 @@ pub fn sys_sigaltstack(ctx: &SyscallContext) -> i64 {
 pub fn sys_chdir(ctx: &SyscallContext) -> i64 {
     let path_ptr = ctx.arg(0);
     let path_len = ctx.arg(1) as usize;
-    let mut path_buf = [0u8; 256];
-    if path_len == 0 || path_len >= path_buf.len() {
-        return Errno::Enametoolong.as_ret();
-    }
-    if let Err(error) = copy_from_user(path_ptr, &mut path_buf, path_len) {
-        return error.as_ret();
-    }
-    let Ok(path) = core::str::from_utf8(&path_buf[..path_len]) else {
-        return Errno::Einval.as_ret();
+    let path = match user_path(path_ptr, path_len) {
+        Ok(path) => path,
+        Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_chdir(path) {
+    match crate::fs::syscalls::sys_chdir(&path) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1760,10 +1741,9 @@ pub fn sys_chdir(ctx: &SyscallContext) -> i64 {
 ///
 /// Arguments: `args[0]` = buf pointer, `args[1]` = size.
 ///
-/// Returns the address of `buf` on success or `-errno` on failure. Until the
-/// per-process cwd lands, `getcwd` writes a single `/` (the conventional
-/// root) into the buffer and returns `buf`. This lets a shell's prompt show
-/// something sensible while the VFS is still pending.
+/// Returns the number of path bytes, excluding the trailing NUL, on success or
+/// `-errno` on failure. The temporary kernel buffer is bounded to one complete
+/// [`crate::fs::path::MAX_PATH`] path plus its NUL terminator.
 pub fn sys_getcwd(ctx: &SyscallContext) -> i64 {
     let buf = ctx.arg(0);
     let size = ctx.arg(1) as usize;
@@ -1771,8 +1751,12 @@ pub fn sys_getcwd(ctx: &SyscallContext) -> i64 {
     if let Err(e) = check_user_buf(buf, size as u64) {
         return e.as_ret();
     }
-    let mut path = [0u8; 256];
-    match crate::fs::syscalls::sys_getcwd(&mut path[..size.min(256)]) {
+    let capacity = size.min(crate::fs::path::MAX_PATH.saturating_add(1));
+    let mut path = match try_zeroed_buffer(capacity) {
+        Ok(path) => path,
+        Err(error) => return error.as_ret(),
+    };
+    match crate::fs::syscalls::sys_getcwd(&mut path) {
         Ok(length_with_nul) => match copy_to_user(buf, &path[..length_with_nul], length_with_nul) {
             Ok(_) => length_with_nul.saturating_sub(1) as i64,
             Err(error) => error.as_ret(),
@@ -1781,22 +1765,42 @@ pub fn sys_getcwd(ctx: &SyscallContext) -> i64 {
     }
 }
 
-fn user_path(pointer: u64, length: usize, storage: &mut [u8]) -> Result<&str, Errno> {
-    if length == 0 || length >= storage.len() {
-        return Err(Errno::Enametoolong);
+fn validate_user_path_length(length: usize) -> Result<usize, Errno> {
+    if length == 0 || length > crate::fs::path::MAX_PATH {
+        Err(Errno::Enametoolong)
+    } else {
+        Ok(length)
     }
-    copy_from_user(pointer, storage, length)?;
-    core::str::from_utf8(&storage[..length]).map_err(|_| Errno::Einval)
+}
+
+fn try_zeroed_buffer(length: usize) -> Result<Vec<u8>, Errno> {
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(length)
+        .map_err(|_| Errno::Enomem)?;
+    storage.resize(length, 0);
+    Ok(storage)
+}
+
+/// Copy one length-delimited UTF-8 path out of userspace.
+///
+/// Native paths may contain up to [`crate::fs::path::MAX_PATH`] bytes. The
+/// owned buffer keeps that upper bound off the syscall stack while preserving
+/// allocation failure as `ENOMEM` instead of panicking.
+fn user_path(pointer: u64, length: usize) -> Result<String, Errno> {
+    let length = validate_user_path_length(length)?;
+    let mut storage = try_zeroed_buffer(length)?;
+    copy_from_user(pointer, &mut storage, length)?;
+    String::from_utf8(storage).map_err(|_| Errno::Einval)
 }
 
 /// Create a directory in the mounted VFS.
 pub fn sys_mkdir(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_mkdir(path, ctx.arg(2) as u32) {
+    match crate::fs::syscalls::sys_mkdir(&path, ctx.arg(2) as u32) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1804,12 +1808,11 @@ pub fn sys_mkdir(ctx: &SyscallContext) -> i64 {
 
 /// Remove a non-root VFS entry.
 pub fn sys_unlink(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_unlink(path) {
+    match crate::fs::syscalls::sys_unlink(&path) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1817,21 +1820,40 @@ pub fn sys_unlink(ctx: &SyscallContext) -> i64 {
 
 /// Remove an empty directory without following the final symlink component.
 pub fn sys_rmdir(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_rmdir(path) {
+    match crate::fs::syscalls::sys_rmdir(&path) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
 }
 
+fn encode_directory_entry(entry: &crate::fs::DirEntry) -> xenith_abi::DirectoryEntry {
+    let mut wire = xenith_abi::DirectoryEntry {
+        inode: entry.inode.get(),
+        kind: match entry.kind {
+            crate::fs::FileType::Regular => xenith_abi::DIRECTORY_ENTRY_KIND_REGULAR,
+            crate::fs::FileType::Directory => xenith_abi::DIRECTORY_ENTRY_KIND_DIRECTORY,
+            crate::fs::FileType::Symlink => xenith_abi::DIRECTORY_ENTRY_KIND_SYMLINK,
+            crate::fs::FileType::CharacterDevice => {
+                xenith_abi::DIRECTORY_ENTRY_KIND_CHARACTER_DEVICE
+            },
+            crate::fs::FileType::BlockDevice => xenith_abi::DIRECTORY_ENTRY_KIND_BLOCK_DEVICE,
+        },
+        ..xenith_abi::DirectoryEntry::default()
+    };
+    let name = entry.name.as_bytes();
+    let length = name.len().min(wire.name.len());
+    wire.name[..length].copy_from_slice(&name[..length]);
+    wire.name_len = length as u16;
+    wire
+}
+
 /// Enumerate a directory into fixed-size shared-ABI records.
 pub fn sys_read_dir(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
@@ -1847,28 +1869,15 @@ pub fn sys_read_dir(ctx: &SyscallContext) -> i64 {
     ) {
         return error.as_ret();
     }
-    let entries = match crate::fs::vfs::read_dir(&crate::fs::Path::new(path)) {
+    let entries = match crate::fs::vfs::read_dir(&crate::fs::Path::new(&path)) {
         Ok(entries) => entries,
         Err(error) => return Errno::from(error).as_ret(),
     };
     let mut written = 0usize;
     for entry in entries.iter().take(capacity) {
-        let mut wire = xenith_abi::DirectoryEntry {
-            inode: entry.inode.get(),
-            kind: match entry.kind {
-                crate::fs::FileType::Regular => 1,
-                crate::fs::FileType::Directory => 2,
-                crate::fs::FileType::Symlink => 3,
-                crate::fs::FileType::CharacterDevice => 4,
-                crate::fs::FileType::BlockDevice => 5,
-            },
-            ..xenith_abi::DirectoryEntry::default()
-        };
-        let name = entry.name.as_bytes();
-        let length = name.len().min(wire.name.len());
-        wire.name[..length].copy_from_slice(&name[..length]);
-        wire.name_len = length as u16;
-        // SAFETY: DirectoryEntry is repr(C) and completely initialized.
+        let wire = encode_directory_entry(entry);
+        // SAFETY: DirectoryEntry is repr(C), and its explicit fields occupy
+        // and initialize every byte of the stable 272-byte wire record.
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 &wire as *const xenith_abi::DirectoryEntry as *const u8,
@@ -1887,12 +1896,11 @@ pub fn sys_read_dir(ctx: &SyscallContext) -> i64 {
 
 /// Mount a fresh anonymous ramfs at an existing directory.
 pub fn sys_mount_ramfs(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_mount_ramfs(path) {
+    match crate::fs::syscalls::sys_mount_ramfs(&path) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1900,12 +1908,11 @@ pub fn sys_mount_ramfs(ctx: &SyscallContext) -> i64 {
 
 /// Unmount a non-root filesystem by mount point.
 pub fn sys_unmount(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_unmount(path) {
+    match crate::fs::syscalls::sys_unmount(&path) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1913,17 +1920,15 @@ pub fn sys_unmount(ctx: &SyscallContext) -> i64 {
 
 /// Create a symbolic link. Hard links intentionally remain unsupported.
 pub fn sys_symlink(ctx: &SyscallContext) -> i64 {
-    let mut target_storage = [0u8; 256];
-    let target = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut target_storage) {
+    let target = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    let mut link_storage = [0u8; 256];
-    let link = match user_path(ctx.arg(2), ctx.arg(3) as usize, &mut link_storage) {
+    let link = match user_path(ctx.arg(2), ctx.arg(3) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_symlink(target, link) {
+    match crate::fs::syscalls::sys_symlink(&target, &link) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1931,12 +1936,11 @@ pub fn sys_symlink(ctx: &SyscallContext) -> i64 {
 
 /// Change the permission bits of a path.
 pub fn sys_chmod(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_chmod(path, ctx.arg(2) as u32) {
+    match crate::fs::syscalls::sys_chmod(&path, ctx.arg(2) as u32) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1944,12 +1948,11 @@ pub fn sys_chmod(ctx: &SyscallContext) -> i64 {
 
 /// Change the numeric owner and group of a path.
 pub fn sys_chown(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_chown(path, ctx.arg(2) as u32, ctx.arg(3) as u32) {
+    match crate::fs::syscalls::sys_chown(&path, ctx.arg(2) as u32, ctx.arg(3) as u32) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -1957,12 +1960,11 @@ pub fn sys_chown(ctx: &SyscallContext) -> i64 {
 
 /// Set access and modification times in Unix nanoseconds.
 pub fn sys_utimens(ctx: &SyscallContext) -> i64 {
-    let mut storage = [0u8; 256];
-    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize, &mut storage) {
+    let path = match user_path(ctx.arg(0), ctx.arg(1) as usize) {
         Ok(path) => path,
         Err(error) => return error.as_ret(),
     };
-    match crate::fs::syscalls::sys_utimens(path, ctx.arg(2), ctx.arg(3)) {
+    match crate::fs::syscalls::sys_utimens(&path, ctx.arg(2), ctx.arg(3)) {
         Ok(()) => 0,
         Err(error) => Errno::from(error).as_ret(),
     }
@@ -2591,6 +2593,66 @@ pub fn sys_ui_release(_ctx: &SyscallContext) -> i64 {
 #[cfg(test)]
 mod user_range_tests {
     use super::*;
+
+    #[test]
+    fn user_path_length_accepts_the_full_filesystem_limit() {
+        assert_eq!(validate_user_path_length(1), Ok(1));
+        assert_eq!(
+            validate_user_path_length(crate::fs::path::MAX_PATH),
+            Ok(crate::fs::path::MAX_PATH)
+        );
+    }
+
+    #[test]
+    fn user_path_length_rejects_empty_and_over_limit_inputs() {
+        assert_eq!(validate_user_path_length(0), Err(Errno::Enametoolong));
+        assert_eq!(
+            validate_user_path_length(crate::fs::path::MAX_PATH + 1),
+            Err(Errno::Enametoolong)
+        );
+    }
+
+    #[test]
+    fn directory_entry_encoding_uses_shared_kinds_and_zeroes_reserved_bytes() {
+        let cases = [
+            (
+                crate::fs::FileType::Regular,
+                xenith_abi::DIRECTORY_ENTRY_KIND_REGULAR,
+            ),
+            (
+                crate::fs::FileType::Directory,
+                xenith_abi::DIRECTORY_ENTRY_KIND_DIRECTORY,
+            ),
+            (
+                crate::fs::FileType::Symlink,
+                xenith_abi::DIRECTORY_ENTRY_KIND_SYMLINK,
+            ),
+            (
+                crate::fs::FileType::CharacterDevice,
+                xenith_abi::DIRECTORY_ENTRY_KIND_CHARACTER_DEVICE,
+            ),
+            (
+                crate::fs::FileType::BlockDevice,
+                xenith_abi::DIRECTORY_ENTRY_KIND_BLOCK_DEVICE,
+            ),
+        ];
+
+        for (file_type, expected_kind) in cases {
+            let source = crate::fs::DirEntry {
+                name: alloc::string::String::from("Mixed.Name"),
+                inode: crate::fs::InodeId::new(0x1234),
+                kind: file_type,
+            };
+            let wire = encode_directory_entry(&source);
+            assert_eq!(wire.inode, 0x1234);
+            assert_eq!(wire.kind, expected_kind);
+            assert_eq!(wire.reserved, 0);
+            assert_eq!(wire.tail_reserved, 0);
+            assert_eq!(wire.name_len, 10);
+            assert_eq!(&wire.name[..10], b"Mixed.Name");
+            assert!(wire.name[10..].iter().all(|byte| *byte == 0));
+        }
+    }
 
     #[test]
     fn realtime_signal_queue_exhaustion_maps_to_eagain() {

@@ -109,8 +109,9 @@ For deterministic final display artifacts, add:
 
 Supplying `--framebuffer` starts `xenith-desktop` instead of the terminal shell.
 It presents the embedded Sedat Bucan photo behind one neutral bottom bar,
-sleeps when idle, toggles its restrained empty launcher with Super, and has no
-bundled applications. `Ctrl+Alt+Backspace`, `Ctrl+Alt+F1`, or `Super+Shift+Q`
+sleeps when idle, toggles its restrained launcher with Super, and provides the
+bundled Files app through the launcher, dock, or `Super+E`.
+`Ctrl+Alt+Backspace`, `Ctrl+Alt+F1`, or `Super+Shift+Q`
 releases the session and enters the terminal fallback. These options capture
 final state; the emulator does not open a live window.
 
@@ -120,12 +121,13 @@ From that fallback shell, the explicit native-window proof is:
 /bin/xenith-desktop --window-smoke --smoke-exit
 ```
 
-This mode alone creates a private channel and launches
-`/bin/xenith-window-smoke`; normal desktop startup remains app-free. The launch
+This mode creates a private channel and launches `/bin/xenith-window-smoke`;
+normal desktop startup keeps the compositor idle
+until Files is opened from the dock, launcher, or `Super+E`. The launch
 uses `spawn_restricted`: the child starts with only stdout, stderr, and its
-client endpoint at descriptor 3. The current packaged mode still opens one
-connection; the compositor's eight-client coordinator has no general service
-rendezvous yet.
+client endpoint at descriptor 3. Files uses the same private admission pattern;
+the compositor's eight-client coordinator still has no general service
+rendezvous for independently launched third-party applications.
 
 The packaged native-thread proof is:
 
@@ -147,6 +149,18 @@ The packaged bounded Win64 console proof is:
 ```text
 /bin/xenith-winhost /tests/win64-console.exe
 ```
+
+The same generated image is also packaged through the Windows drive namespace:
+
+```text
+/bin/xenith-winhost 'C:\Users\Xenith\Downloads\win64-console.exe'
+```
+
+The quotes make the Xenith shell preserve the backslashes. Both commands load
+the same bytes; the second additionally proves Windows drive translation and
+the dedicated case-insensitive `/win` mount. The seeded namespace is writable
+but currently RAM-backed and resets on reboot. See
+[WINDOWS_FILESYSTEM](WINDOWS_FILESYSTEM.md) for its exact boundary.
 
 The fixture calls `KERNEL32.DLL!GetStdHandle`, `WriteFile`, and `ExitProcess`
 through the host's bootstrap IAT and returns to the Xenith shell. Its preferred

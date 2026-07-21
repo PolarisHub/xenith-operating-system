@@ -14,8 +14,9 @@ per client, with a 256 MiB global mapping quota. It validates and isolates each
 client, composites read-only shared buffers in z-order, routes pointer focus and
 implicit multi-button capture, sends keys/text only to the focused surface, and
 disconnects only a stalled nonblocking event recipient. Desktop shortcuts and
-chrome remain authoritative. There is no general service rendezvous yet, so
-the packaged smoke below is currently the only live connection path.
+chrome remain authoritative. There is no general service rendezvous yet; the
+desktop launches the packaged Files client on demand through one private,
+restricted inherited channel. The protocol smoke uses the same admission path.
 
 ## Runtime contract
 
@@ -37,9 +38,13 @@ the packaged smoke below is currently the only live connection path.
   runs the complete shared-buffer protocol gate and then returns to the shell.
 - Window smoke success markers: `XENITH_WINDOW_SMOKE_PRESENTED` and
   `XENITH_WINDOW_SMOKE_PASS`.
+- The Files app launches from the dock, launcher, or `Super+E`. Repeating the
+  launch request leaves the existing instance running.
+- Files readiness marker: `XENITH_EXPLORER_READY`.
 
 The launcher can be toggled with either Super key or the bottom-bar button and
-closed with Escape. The smoke client is a test utility, not a default app.
+closed with Escape. Files is the first installed graphical application; the
+smoke client remains a test utility.
 
 The kernel configures the PS/2 mouse for 4 counts/mm at 100 Hz, preserves
 in-flight framing across session changes, and resets corrupt packets reported

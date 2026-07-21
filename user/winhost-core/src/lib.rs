@@ -12,6 +12,7 @@
 mod handle;
 mod imports;
 mod layout;
+mod namespace;
 mod object;
 mod path;
 mod runtime;
@@ -38,6 +39,14 @@ pub use layout::{
     PROCESS_PARAMETERS64_IMAGE_PATH_OFFSET, PROCESS_PARAMETERS64_PREFIX_BYTES,
     RUNTIME_LAYOUT_PAGE_SIZE, RUNTIME_USER_ADDRESS_LIMIT, TEB64_BOOTSTRAP_BYTES, TEB64_PEB_OFFSET,
     TEB64_SELF_OFFSET,
+};
+pub use namespace::{
+    build_windows_environment_block, dos_path_to_native, normalize_dos_path, resolve_known_folder,
+    KnownFolder, KnownFolderError, KnownFolderRedirect, NativeWindowsPath, NormalizedDosPath,
+    ProfileContext, WindowsEnvironmentBlock, WindowsEnvironmentError, WindowsPathError,
+    DEFAULT_PROFILE_PATH, DEFAULT_PROFILE_USERNAME, MAX_WINDOWS_POLICY_PATH_BYTES,
+    WINDOWS_ENVIRONMENT_VARIABLE_COUNT, WINDOWS_INITRAMFS_ROOT, WINDOWS_NAMESPACE_DIRECTORIES,
+    WINDOWS_NATIVE_ROOT, WINDOWS_SYSTEM_DRIVE,
 };
 pub use object::{
     ConsoleObject, ObjectError, ObjectId, ObjectTable, RuntimeObject, MAX_OBJECT_ENTRIES,

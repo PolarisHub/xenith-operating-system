@@ -618,6 +618,19 @@ pub struct Stat {
     pub modified_ns: u64,
 }
 
+/// No filesystem object is represented by this sentinel value.
+pub const DIRECTORY_ENTRY_KIND_UNKNOWN: u8 = 0;
+/// A regular file.
+pub const DIRECTORY_ENTRY_KIND_REGULAR: u8 = 1;
+/// A directory.
+pub const DIRECTORY_ENTRY_KIND_DIRECTORY: u8 = 2;
+/// A symbolic link.
+pub const DIRECTORY_ENTRY_KIND_SYMLINK: u8 = 3;
+/// A character device.
+pub const DIRECTORY_ENTRY_KIND_CHARACTER_DEVICE: u8 = 4;
+/// A block device.
+pub const DIRECTORY_ENTRY_KIND_BLOCK_DEVICE: u8 = 5;
+
 /// Fixed-size directory record returned by `read_dir`.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -627,6 +640,10 @@ pub struct DirectoryEntry {
     pub reserved: u8,
     pub name_len: u16,
     pub name: [u8; 256],
+    /// Must be zero. Explicitly occupies the four-byte ABI tail so raw wire
+    /// copies never expose implicit, potentially uninitialized structure
+    /// padding.
+    pub tail_reserved: u32,
 }
 
 impl Default for DirectoryEntry {
@@ -637,6 +654,7 @@ impl Default for DirectoryEntry {
             reserved: 0,
             name_len: 0,
             name: [0; 256],
+            tail_reserved: 0,
         }
     }
 }
@@ -694,6 +712,39 @@ mod tests {
         assert_eq!(SyscallNumber::Gettid as u64, 67);
         assert_eq!(SyscallNumber::SpawnRestricted as u64, 68);
         assert_eq!(WNOHANG | WUNTRACED | WCONTINUED, 11);
+    }
+
+    #[test]
+    fn directory_entry_wire_layout_has_an_explicit_zeroed_tail() {
+        assert_eq!(core::mem::size_of::<DirectoryEntry>(), 272);
+        assert_eq!(core::mem::align_of::<DirectoryEntry>(), 8);
+        assert_eq!(core::mem::offset_of!(DirectoryEntry, inode), 0);
+        assert_eq!(core::mem::offset_of!(DirectoryEntry, kind), 8);
+        assert_eq!(core::mem::offset_of!(DirectoryEntry, reserved), 9);
+        assert_eq!(core::mem::offset_of!(DirectoryEntry, name_len), 10);
+        assert_eq!(core::mem::offset_of!(DirectoryEntry, name), 12);
+        assert_eq!(core::mem::offset_of!(DirectoryEntry, tail_reserved), 268);
+
+        let entry = DirectoryEntry::default();
+        // SAFETY: the layout assertions above prove that the fields occupy
+        // every byte of this repr(C) record, including its alignment tail.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(&entry).cast::<u8>(),
+                core::mem::size_of::<DirectoryEntry>(),
+            )
+        };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn directory_entry_kind_values_are_stable() {
+        assert_eq!(DIRECTORY_ENTRY_KIND_UNKNOWN, 0);
+        assert_eq!(DIRECTORY_ENTRY_KIND_REGULAR, 1);
+        assert_eq!(DIRECTORY_ENTRY_KIND_DIRECTORY, 2);
+        assert_eq!(DIRECTORY_ENTRY_KIND_SYMLINK, 3);
+        assert_eq!(DIRECTORY_ENTRY_KIND_CHARACTER_DEVICE, 4);
+        assert_eq!(DIRECTORY_ENTRY_KIND_BLOCK_DEVICE, 5);
     }
 
     #[test]

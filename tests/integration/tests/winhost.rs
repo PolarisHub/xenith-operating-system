@@ -33,31 +33,10 @@ fn run_until_prompt(machine: &mut Machine, start: usize) -> Result<String, Strin
     ))
 }
 
-#[test]
-#[ignore = "requires `xenith-build all`; explicit booted Win64 console-host gate"]
-fn win64_console_fixture_executes_through_booted_host() {
-    let mut machine = xenith_integration::load_built_kernel_with_framebuffer(
-        BOOT_LIMIT,
-        Some(FramebufferConfig {
-            width: 320,
-            height: 200,
-        }),
-    )
-    .unwrap();
-    let desktop =
-        xenith_integration::run_until_serial(&mut machine, "XENITH_DESKTOP_READY", 1, BOOT_LIMIT)
-            .unwrap();
-    assert!(!desktop.contains("XENITH_DESKTOP_FAIL"));
-
-    xenith_integration::request_desktop_exit(&mut machine).unwrap();
-    let shell = xenith_integration::run_until_serial(&mut machine, PROMPT, 1, SHELL_LIMIT).unwrap();
-    assert!(shell.ends_with(PROMPT));
-
+fn run_fixture(machine: &mut Machine, command: &str) {
     let start = machine.serial_output().len();
-    machine
-        .inject_keyboard_ascii("/bin/xenith-winhost /tests/win64-console.exe\n")
-        .unwrap();
-    let output = run_until_prompt(&mut machine, start).unwrap();
+    machine.inject_keyboard_ascii(command).unwrap();
+    let output = run_until_prompt(machine, start).unwrap();
 
     assert_eq!(
         output.lines().filter(|line| *line == FIXTURE_LINE).count(),
@@ -78,4 +57,34 @@ fn win64_console_fixture_executes_through_booted_host() {
         "foreground process-group transfer failed:\n{output}"
     );
     assert!(!output.contains("panic"), "guest panic:\n{output}");
+}
+
+#[test]
+#[ignore = "requires `xenith-build all`; explicit booted Win64 console-host gate"]
+fn win64_console_fixture_executes_through_booted_host() {
+    let mut machine = xenith_integration::load_built_kernel_with_framebuffer(
+        BOOT_LIMIT,
+        Some(FramebufferConfig {
+            width: 320,
+            height: 200,
+        }),
+    )
+    .unwrap();
+    let desktop =
+        xenith_integration::run_until_serial(&mut machine, "XENITH_DESKTOP_READY", 1, BOOT_LIMIT)
+            .unwrap();
+    assert!(!desktop.contains("XENITH_DESKTOP_FAIL"));
+
+    xenith_integration::request_desktop_exit(&mut machine).unwrap();
+    let shell = xenith_integration::run_until_serial(&mut machine, PROMPT, 1, SHELL_LIMIT).unwrap();
+    assert!(shell.ends_with(PROMPT));
+
+    run_fixture(
+        &mut machine,
+        "/bin/xenith-winhost /tests/win64-console.exe\n",
+    );
+    run_fixture(
+        &mut machine,
+        "/bin/xenith-winhost 'C:\\Users\\Xenith\\Downloads\\win64-console.exe'\n",
+    );
 }

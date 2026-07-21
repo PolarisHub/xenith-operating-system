@@ -285,42 +285,63 @@ impl Renderer {
             apply_tint_rounded(surface, button, 5, INK, 32, clip);
         }
         draw_mark(surface, button.inset((button.width / 4).max(3)), INK, clip);
-        draw_text(
-            surface,
-            Point::new(
-                button.right() as i32 + 10,
-                layout.dock.y + layout.dock.height as i32 / 2 - 3,
-            ),
-            1,
-            b"XENITH",
-            INK,
-            clip,
-        );
+        let files = layout.files_button;
+        if files != button {
+            apply_tint_rounded(surface, files, 5, INK, 20, clip);
+            draw_folder(
+                surface,
+                files.inset((files.width / 5).max(3)),
+                Rgb::new(245, 192, 78),
+                clip,
+            );
+            draw_text(
+                surface,
+                Point::new(
+                    files.right() as i32 + 8,
+                    layout.dock.y + layout.dock.height as i32 / 2 - 3,
+                ),
+                1,
+                b"FILES",
+                INK,
+                clip,
+            );
+        }
 
         if state.launcher_open() {
-            self.render_launcher(surface, layout.launcher, clip);
+            self.render_launcher(surface, layout.launcher, layout.launcher_files, clip);
         }
     }
 
-    fn render_launcher(&self, surface: &mut Surface<'_>, panel: Rect, clip: Rect) {
+    fn render_launcher(&self, surface: &mut Surface<'_>, panel: Rect, item: Rect, clip: Rect) {
         apply_tint_rounded(surface, panel, 8, PANEL_TINT, 230, clip);
         draw_rounded_outline(surface, panel, 8, Rgb::new(91, 91, 88), clip);
-        let padding = 16;
-        let icon = Rect::new(panel.x + padding, panel.y + padding, 22, 22);
-        draw_mark(surface, icon, INK, clip);
+        apply_tint_rounded(surface, item, 6, INK, 20, clip);
+        let icon_size = item.height.min(30).min(item.width).max(1);
+        let icon = Rect::new(
+            item.x + 10,
+            item.y + (item.height - icon_size) as i32 / 2,
+            icon_size,
+            icon_size,
+        );
+        draw_folder(
+            surface,
+            icon.inset((icon_size / 6).max(1)),
+            Rgb::new(245, 192, 78),
+            clip,
+        );
         draw_text(
             surface,
-            Point::new(icon.right() as i32 + 10, panel.y + padding + 7),
+            Point::new(icon.right() as i32 + 10, item.y + 12),
             1,
-            b"XENITH",
+            b"FILES",
             INK,
             clip,
         );
         draw_text(
             surface,
-            Point::new(panel.x + padding, panel.bottom() as i32 - padding - 7),
+            Point::new(icon.right() as i32 + 10, item.y + 28),
             1,
-            b"NO APPLICATIONS INSTALLED",
+            b"BROWSE C: AND YOUR FOLDERS",
             MUTED,
             clip,
         );
@@ -463,6 +484,31 @@ fn draw_mark(surface: &mut Surface<'_>, bounds: Rect, color: Rgb, clip: Rect) {
     for rect in tiles {
         fill_rect(surface, rect, color, clip);
     }
+}
+
+fn draw_folder(surface: &mut Surface<'_>, bounds: Rect, color: Rgb, clip: Rect) {
+    if bounds.width == 0 || bounds.height == 0 {
+        return;
+    }
+    let tab_width = (bounds.width / 2).max(1);
+    let tab_height = (bounds.height / 4).max(1);
+    fill_rect(
+        surface,
+        Rect::new(bounds.x, bounds.y, tab_width, tab_height.saturating_add(1)),
+        color,
+        clip,
+    );
+    fill_rect(
+        surface,
+        Rect::new(
+            bounds.x,
+            bounds.y.saturating_add(tab_height as i32),
+            bounds.width,
+            bounds.height.saturating_sub(tab_height),
+        ),
+        color,
+        clip,
+    );
 }
 
 fn draw_text(

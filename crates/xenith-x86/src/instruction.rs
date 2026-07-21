@@ -146,6 +146,7 @@ pub enum Mnemonic {
     Div,
     Idiv,
     Shl,
+    Shld,
     Shr,
     Sar,
     Rol,

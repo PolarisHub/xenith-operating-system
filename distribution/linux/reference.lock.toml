@@ -1,0 +1,36 @@
+# Canonical external Linux reference for Xenith Linux Edition.
+# The source checkout lives in WSL or an ignored build cache; it is not vendored.
+schema_version = 1
+edition = "xenith-linux"
+canonical_environment = "wsl"
+source_tree_vendored = false
+
+[linux]
+remote = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+commit = "b95f03f04d475aa6719d15a636ddf32222d55657"
+version = "7.2-rc4"
+license = "GPL-2.0-only"
+checkout = "detached"
+role = "external-reference-and-build-input"
+
+[boundary]
+native_kernel_imports_linux_source = false
+native_kernel_links_linux_objects = false
+linux_source_committed_to_repository = false
+linux_kernel_patches_license = "GPL-2.0-only"
+userspace_interface = "exported-linux-uapi"
+
+[artifacts]
+native_iso = "build/xenith.iso"
+native_raw_image = "build/xenith.img"
+linux_iso = "build/linux/xenith-linux.iso"
+linux_raw_image = "build/linux/xenith-linux.img"
+linux_corresponding_source = "build/linux/source"
+
+[ci]
+native_requires_linux_checkout = false
+linux_requires_pin_verification = true
+linux_requires_license_gate = true
+linux_requires_uefi_boot_gate = true
+linux_requires_bios_boot_gate = true
+linux_requires_hardware_matrix = true

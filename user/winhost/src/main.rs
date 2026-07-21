@@ -20,6 +20,7 @@ use libuser::args::Startup;
 use libuser::syscall::{self, Error as SyscallError};
 use xenith_abi::{OpenFlags, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 use xenith_pe::PeImage;
+use xenith_winhost::path_runtime::{resolve_executable_path, ExecutablePathError};
 use xenith_winhost::runtime::{decode_guest_handle, validate_console_write, BootstrapRuntime};
 use xenith_winhost::{
     build_loaded_image, plan_runtime_relocations, visit_final_section_protections,
@@ -103,6 +104,7 @@ static HOST_NT_RUNTIME: RuntimeCell = RuntimeCell::new();
 enum HostError {
     Usage,
     PathTooLong,
+    WindowsPath(ExecutablePathError),
     InvalidFileSize,
     FileChanged,
     InvalidStackSize,
@@ -118,6 +120,12 @@ enum HostError {
 impl From<LoaderError> for HostError {
     fn from(value: LoaderError) -> Self {
         Self::Loader(value)
+    }
+}
+
+impl From<ExecutablePathError> for HostError {
+    fn from(value: ExecutablePathError) -> Self {
+        Self::WindowsPath(value)
     }
 }
 
@@ -275,7 +283,9 @@ fn run_path(path: &[u8]) -> Result<u32, HostError> {
         return Err(HostError::PathTooLong);
     }
 
-    let (file_mapping, file_length) = read_bounded_file(path)?;
+    const NATIVE_PATH_CAPACITY: usize = MAX_PE_PATH_BYTES + 16;
+    let path = resolve_executable_path::<NATIVE_PATH_CAPACITY>(path)?;
+    let (file_mapping, file_length) = read_bounded_file(path.as_bytes())?;
     // SAFETY: `read_bounded_file` initialized exactly `file_length` bytes and
     // keeps the containing mapping alive through this borrow.
     let file_bytes = unsafe { file_mapping.initialized_prefix(file_length) };
@@ -602,6 +612,10 @@ pub extern "win64" fn ntdll_nt_close(raw_handle: isize) -> u32 {
 }
 
 fn report_error(error: &HostError) {
+    if let HostError::WindowsPath(path) = error {
+        libuser::println!("xenith-winhost: Windows path rejected: {:?}", path);
+        return;
+    }
     if let HostError::Loader(loader) = error {
         libuser::println!(
             "xenith-winhost: {:?} (NTSTATUS 0x{:08x})",

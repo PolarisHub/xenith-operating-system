@@ -526,6 +526,7 @@ impl Cpu {
             Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror => {
                 self.shift(bus, instruction.mnemonic, first, second)?;
             },
+            Mnemonic::Shld => self.shift_double_left(bus, first, second, third)?,
         }
         Ok(None)
     }
@@ -944,6 +945,50 @@ impl Cpu {
                 },
                 _ => {},
             }
+        }
+        self.write_operand(bus, destination, result)
+    }
+
+    fn shift_double_left(
+        &mut self,
+        bus: &mut MemoryBus,
+        destination: Option<Operand>,
+        source: Option<Operand>,
+        count: Option<Operand>,
+    ) -> Result<(), CpuFault> {
+        let destination = destination.ok_or(CpuFault::InvalidOperand)?;
+        let source = source.ok_or(CpuFault::InvalidOperand)?;
+        if destination.size() != source.size() {
+            return Err(CpuFault::InvalidOperand);
+        }
+
+        let size = destination.size();
+        let width = u32::from(size.bits());
+        if !matches!(width, 16 | 32 | 64) {
+            return Err(CpuFault::InvalidOperand);
+        }
+        let count_mask = if width == 64 { 0x3f } else { 0x1f };
+        let count =
+            (self.read_operand(bus, count.ok_or(CpuFault::InvalidOperand)?)? as u32) & count_mask;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let mask = size.mask();
+        let destination_value = self.read_operand(bus, destination)? & mask;
+        let source_value = self.read_operand(bus, source)? & mask;
+        let concatenated = (u128::from(destination_value) << width) | u128::from(source_value);
+        let result = ((concatenated << count) >> width) as u64 & mask;
+        let carry_position = width * 2 - count;
+        let carry = (concatenated >> carry_position) as u64 & 1;
+
+        self.common_flags(result, size);
+        self.state.rflags &= !(FLAG_CF | FLAG_OF);
+        if carry != 0 {
+            self.state.rflags |= FLAG_CF;
+        }
+        if count == 1 && ((result >> (width - 1)) & 1) ^ carry != 0 {
+            self.state.rflags |= FLAG_OF;
         }
         self.write_operand(bus, destination, result)
     }
@@ -1961,6 +2006,83 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), Ok(None));
         assert_eq!(cpu.state.register(Register::R14), 1 << 3);
         assert_eq!(cpu.state.rflags & FLAG_CF, 0);
+    }
+
+    #[test]
+    fn shld_qword_immediate_executes_the_explorer_faulting_sequence() {
+        let mut bus = MemoryBus::new(0x1000);
+        bus.write_physical(0, &[0x48, 0x0f, 0xa4, 0xfa, 0x20, 0xf4])
+            .expect("load SHLD test program");
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.set_register(Register::Rdx, 0x0123_4567_89ab_cdef);
+        cpu.state.set_register(Register::Rdi, 0xfedc_ba98_7654_3210);
+
+        assert_eq!(cpu.run(&mut bus, 2), ExitReason::Halted);
+        assert_eq!(cpu.state.register(Register::Rdx), 0x89ab_cdef_fedc_ba98);
+        assert_eq!(cpu.state.register(Register::Rdi), 0xfedc_ba98_7654_3210);
+        assert_ne!(cpu.state.rflags & FLAG_CF, 0);
+        assert_ne!(cpu.state.rflags & FLAG_SF, 0);
+        assert_eq!(cpu.state.rflags & (FLAG_ZF | FLAG_PF), 0);
+    }
+
+    #[test]
+    fn shld_masks_a_qword_count_to_zero_without_touching_flags() {
+        let mut bus = MemoryBus::new(0x1000);
+        bus.write_physical(0, &[0x48, 0x0f, 0xa4, 0xfa, 0x40])
+            .expect("load zero-count SHLD test program");
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.set_register(Register::Rdx, 0x0123_4567_89ab_cdef);
+        cpu.state.set_register(Register::Rdi, u64::MAX);
+        cpu.state.rflags = 2 | FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+        let flags = cpu.state.rflags;
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.state.register(Register::Rdx), 0x0123_4567_89ab_cdef);
+        assert_eq!(cpu.state.rflags, flags);
+    }
+
+    #[test]
+    fn shld_count_one_updates_defined_flags() {
+        let mut bus = MemoryBus::new(0x1000);
+        bus.write_physical(0, &[0x48, 0x0f, 0xa4, 0xfa, 0x01])
+            .expect("load one-bit SHLD test program");
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.set_register(Register::Rdx, 0x4000_0000_0000_0000);
+        cpu.state.set_register(Register::Rdi, 0x8000_0000_0000_0000);
+        cpu.state.rflags = 2 | FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF;
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.state.register(Register::Rdx), 0x8000_0000_0000_0001);
+        assert_eq!(cpu.state.rflags & FLAG_CF, 0);
+        assert_ne!(cpu.state.rflags & FLAG_OF, 0);
+        assert_ne!(cpu.state.rflags & FLAG_SF, 0);
+        assert_eq!(cpu.state.rflags & (FLAG_ZF | FLAG_PF), 0);
+        assert_ne!(cpu.state.rflags & FLAG_AF, 0);
+    }
+
+    #[test]
+    fn shld_writes_dword_and_word_destinations_with_x86_register_rules() {
+        let mut bus = MemoryBus::new(0x1000);
+        bus.write_physical(0, &[
+            0x0f, 0xa4, 0xfa, 0x08, // shld edx, edi, 8
+            0x66, 0x0f, 0xa4, 0xfa, 0x04, // shld dx, di, 4
+        ])
+        .expect("load sized SHLD test program");
+        let mut cpu = Cpu::new();
+        cpu.state.rip = 0;
+        cpu.state.set_register(Register::Rdx, 0xffff_ffff_8123_4567);
+        cpu.state.set_register(Register::Rdi, 0x89ab_cdef);
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.state.register(Register::Rdx), 0x2345_6789);
+
+        cpu.state.set_register(Register::Rdx, 0xaaaa_bbbb_cccc_1234);
+        cpu.state.set_register(Register::Rdi, 0xabcd);
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.state.register(Register::Rdx), 0xaaaa_bbbb_cccc_234a);
     }
 
     #[test]

@@ -591,6 +591,21 @@ impl<'a> Decoder<'a> {
             0x32 => Ok(Instruction::new(Mnemonic::Rdmsr)),
             0x30 => Ok(Instruction::new(Mnemonic::Wrmsr)),
             0xA2 => Ok(Instruction::new(Mnemonic::Cpuid)),
+            0xA4 => {
+                let size = self.operand_size(false);
+                let (destination, source, _) = self.modrm(size)?;
+                let count = Operand::Immediate {
+                    value: self.imm(OperandSize::Byte)?,
+                    size: OperandSize::Byte,
+                };
+                Ok(
+                    Instruction::new(Mnemonic::Shld).with_three_operands(
+                        destination,
+                        source,
+                        count,
+                    ),
+                )
+            },
             0xA3 | 0xAB | 0xB3 | 0xBB => {
                 let size = self.operand_size(false);
                 let (base, index, _) = self.modrm(size)?;
@@ -913,6 +928,44 @@ mod tests {
             Some(Operand::register(Register::Rcx, OperandSize::Qword)),
             None,
         ]);
+    }
+
+    #[test]
+    fn decodes_rex_w_shld_immediate_as_three_operands() {
+        let instruction = decode(&[0x48, 0x0f, 0xa4, 0xfa, 0x20]).unwrap();
+        assert_eq!(instruction.mnemonic, Mnemonic::Shld);
+        assert_eq!(instruction.length, 5);
+        assert_eq!(instruction.operands, [
+            Some(Operand::register(Register::Rdx, OperandSize::Qword)),
+            Some(Operand::register(Register::Rdi, OperandSize::Qword)),
+            Some(Operand::Immediate {
+                value: 32,
+                size: OperandSize::Byte,
+            }),
+        ]);
+    }
+
+    #[test]
+    fn shld_immediate_honors_legacy_operand_size_selection() {
+        let word = decode(&[0x66, 0x0f, 0xa4, 0xfa, 0x04]).unwrap();
+        assert_eq!(
+            word.operands[0].expect("word destination").size(),
+            OperandSize::Word
+        );
+        assert_eq!(
+            word.operands[1].expect("word source").size(),
+            OperandSize::Word
+        );
+
+        let dword = decode(&[0x0f, 0xa4, 0xfa, 0x08]).unwrap();
+        assert_eq!(
+            dword.operands[0].expect("dword destination").size(),
+            OperandSize::Dword
+        );
+        assert_eq!(
+            dword.operands[1].expect("dword source").size(),
+            OperandSize::Dword
+        );
     }
 
     #[test]
